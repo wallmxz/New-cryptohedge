@@ -1,0 +1,21 @@
+<div class="card">
+    <h2 class="text-sm font-medium text-gray-400 mb-3">ORDERBOOK</h2>
+    <div class="font-mono text-sm space-y-1">
+        <template x-for="ask in bookAsks" :key="ask.price">
+            <div class="flex justify-between text-accent-red/70">
+                <span x-text="ask.price.toFixed(4)"></span>
+                <span x-text="'[' + ask.size.toFixed(0) + ']'"></span>
+            </div>
+        </template>
+        <div class="border-t border-b border-gray-700 py-1 text-center text-xs text-gray-500">
+            spread: <span x-text="((state.best_ask - state.best_bid) * 10000).toFixed(1) + ' ticks'"></span>
+        </div>
+        <template x-for="bid in bookBids" :key="bid.price">
+            <div class="flex justify-between" :class="bid.isMine ? 'text-accent-blue font-bold' : 'text-accent-green/70'">
+                <span x-text="bid.price.toFixed(4)"></span>
+                <span x-text="'[' + bid.size.toFixed(0) + ']'"></span>
+                <span x-show="bid.isMine" class="text-accent-blue text-xs">MY</span>
+            </div>
+        </template>
+    </div>
+</div>

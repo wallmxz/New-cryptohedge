@@ -1,0 +1,14 @@
+<div class="card" hx-ext="sse" sse-connect="/sse/logs">
+    <h2 class="text-sm font-medium text-gray-400 mb-3">ACTIVITY LOG</h2>
+    <div id="log-list" class="font-mono text-xs space-y-1 max-h-64 overflow-y-auto" sse-swap="new-log" hx-swap="afterbegin">
+        {% for log in logs %}
+        <div class="flex gap-2">
+            <span class="text-gray-500">{{ log.timestamp|int }}</span>
+            <span class="{% if log.action == 'fill' %}text-accent-green{% elif log.action == 'cancel' %}text-accent-red{% else %}text-gray-300{% endif %}">
+                {{ log.action|upper }} {{ log.side or '' }} {{ log.size or '' }} @ {{ log.price or '' }}
+            </span>
+            {% if log.reason %}<span class="text-gray-600">{{ log.reason }}</span>{% endif %}
+        </div>
+        {% endfor %}
+    </div>
+</div>

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AutoMoney</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        dark: { 800: '#1a1a2e', 900: '#0f0f1a', 700: '#252547' },
+                        accent: { green: '#00d4aa', red: '#ff4757', blue: '#5b86e5', yellow: '#ffc048' }
+                    }
+                }
+            }
+        }
+    </script>
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+    <script src="https://unpkg.com/htmx-ext-sse@2.3.0/sse.js"></script>
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+    <script src="https://unpkg.com/uplot@1.6.30/dist/uPlot.iife.min.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/uplot@1.6.30/dist/uPlot.min.css">
+    <style>
+        body { background: #0f0f1a; color: #e0e0e0; font-family: 'Inter', system-ui, sans-serif; }
+        .card { background: #1a1a2e; border: 1px solid #252547; border-radius: 12px; padding: 1.25rem; }
+        .value-positive { color: #00d4aa; }
+        .value-negative { color: #ff4757; }
+        .badge-maker { background: #00d4aa22; color: #00d4aa; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
+        .badge-taker { background: #ff475722; color: #ff4757; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
+        .safe-mode-on { background: #ff4757; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+    </style>
+</head>
+<body class="min-h-screen p-4">
+    {% block content %}{% endblock %}
+    <script src="/static/app.js"></script>
+    <script src="/static/chart.js"></script>
+</body>
+</html>

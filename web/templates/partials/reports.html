@@ -1,0 +1,9 @@
+<div class="card">
+    <h2 class="text-sm font-medium text-gray-400 mb-3">REPORTS</h2>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+        <div><span class="text-gray-400">Maker fills</span><div class="text-white font-mono" x-text="state.total_maker_fills + ' ($' + state.total_maker_volume.toFixed(0) + ')'">0</div></div>
+        <div><span class="text-gray-400">Taker fills</span><div class="text-white font-mono" x-text="state.total_taker_fills + ' ($' + state.total_taker_volume.toFixed(0) + ')'">0</div></div>
+        <div><span class="text-gray-400">Maker rate</span><div class="text-accent-green font-mono" x-text="state.total_maker_fills + state.total_taker_fills > 0 ? (state.total_maker_fills / (state.total_maker_fills + state.total_taker_fills) * 100).toFixed(1) + '%' : '-'">-</div></div>
+        <div><span class="text-gray-400">Total fees</span><div class="text-white font-mono" x-text="'$' + state.total_fees_paid.toFixed(2)">$0.00</div></div>
+    </div>
+</div>

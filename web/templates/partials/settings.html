@@ -1,0 +1,10 @@
+<div class="card" x-data="{ saving: false }">
+    <h2 class="text-sm font-medium text-gray-400 mb-3">SETTINGS</h2>
+    <form hx-post="/settings" hx-target="#settings-status" hx-swap="innerHTML" @htmx:after-request="saving = false" @submit="saving = true" class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+        <label class="space-y-1"><span class="text-gray-400">Hedge ratio</span><input type="number" name="hedge_ratio" step="0.01" min="0" max="1" :value="state.hedge_ratio" class="w-full bg-dark-900 border border-gray-700 rounded px-2 py-1 text-white font-mono"></label>
+        <label class="space-y-1"><span class="text-gray-400">Max exposure</span><input type="number" name="max_exposure_pct" step="0.01" min="0" max="1" :value="state.max_exposure_pct" class="w-full bg-dark-900 border border-gray-700 rounded px-2 py-1 text-white font-mono"></label>
+        <label class="space-y-1"><span class="text-gray-400">Repost depth</span><input type="number" name="repost_depth" step="1" min="1" max="10" :value="state.repost_depth" class="w-full bg-dark-900 border border-gray-700 rounded px-2 py-1 text-white font-mono"></label>
+        <div class="flex items-end"><button type="submit" class="bg-accent-blue/20 text-accent-blue px-4 py-1 rounded hover:bg-accent-blue/30 transition" :disabled="saving" x-text="saving ? 'Saving...' : 'Save'">Save</button></div>
+    </form>
+    <div id="settings-status" class="text-xs text-accent-green mt-2"></div>
+</div>

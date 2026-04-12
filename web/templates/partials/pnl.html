@@ -1,0 +1,11 @@
+<div class="card">
+    <h2 class="text-sm font-medium text-gray-400 mb-3">PnL SUMMARY</h2>
+    <div class="space-y-2">
+        <div class="flex justify-between"><span class="text-gray-400">Pool PnL</span><span :class="pnl.pool >= 0 ? 'value-positive' : 'value-negative'" class="font-mono" x-text="(pnl.pool >= 0 ? '+' : '') + '$' + pnl.pool.toFixed(2)">$0.00</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Hedge PnL</span><span :class="pnl.hedge >= 0 ? 'value-positive' : 'value-negative'" class="font-mono" x-text="(pnl.hedge >= 0 ? '+' : '') + '$' + pnl.hedge.toFixed(2)">$0.00</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Funding</span><span :class="state.funding_total >= 0 ? 'value-positive' : 'value-negative'" class="font-mono" x-text="(state.funding_total >= 0 ? '+' : '') + '$' + state.funding_total.toFixed(2)">$0.00</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Fees Earned</span><span class="value-positive font-mono" x-text="'+$' + state.total_fees_earned.toFixed(2)">$0.00</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Fees Paid</span><span class="value-negative font-mono" x-text="'-$' + state.total_fees_paid.toFixed(2)">$0.00</span></div>
+        <div class="border-t border-gray-700 pt-2 flex justify-between"><span class="text-white font-medium">NET PnL</span><span :class="pnl.net >= 0 ? 'value-positive' : 'value-negative'" class="font-bold font-mono text-lg" x-text="(pnl.net >= 0 ? '+' : '') + '$' + pnl.net.toFixed(2)">$0.00</span></div>
+    </div>
+</div>

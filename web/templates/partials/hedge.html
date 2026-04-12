@@ -1,0 +1,10 @@
+<div class="card">
+    <h2 class="text-sm font-medium text-gray-400 mb-3">HEDGE</h2>
+    <div class="space-y-2">
+        <div class="flex justify-between"><span class="text-gray-400">Side</span><span class="text-accent-red font-mono" x-text="state.hedge_position ? state.hedge_position.side.toUpperCase() : 'NONE'">-</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Size</span><span class="text-white font-mono" x-text="state.hedge_position ? '$' + state.hedge_position.size.toFixed(2) : '-'">-</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Entry</span><span class="text-gray-300 font-mono" x-text="state.hedge_position ? state.hedge_position.entry.toFixed(4) : '-'">-</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">uPnL</span><span :class="state.hedge_unrealized_pnl >= 0 ? 'value-positive' : 'value-negative'" class="font-mono" x-text="'$' + state.hedge_unrealized_pnl.toFixed(2)">$0.00</span></div>
+        <div class="flex justify-between"><span class="text-gray-400">Exposure</span><span class="text-accent-yellow font-mono" x-text="(exposurePct * 100).toFixed(1) + '%'">0%</span></div>
+    </div>
+</div>
