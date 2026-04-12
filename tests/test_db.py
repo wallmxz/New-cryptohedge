@@ -1,0 +1,102 @@
+import pytest
+from db import Database
+
+
+@pytest.fixture
+async def db(tmp_path):
+    database = Database(str(tmp_path / "test.db"))
+    await database.initialize()
+    yield database
+    await database.close()
+
+
+async def test_initialize_creates_tables(db):
+    tables = await db.list_tables()
+    assert "config" in tables
+    assert "deposits" in tables
+    assert "fills" in tables
+    assert "funding" in tables
+    assert "pool_snapshots" in tables
+    assert "order_log" in tables
+
+
+async def test_insert_and_get_fill(db):
+    await db.insert_fill(
+        timestamp=1000.0,
+        exchange="hyperliquid",
+        symbol="ARB",
+        side="sell",
+        size=100.0,
+        price=1.05,
+        fee=0.015,
+        fee_currency="USDC",
+        liquidity="maker",
+        realized_pnl=0.0,
+        order_id="ord-1",
+    )
+    fills = await db.get_fills(exchange="hyperliquid", symbol="ARB")
+    assert len(fills) == 1
+    assert fills[0]["side"] == "sell"
+    assert fills[0]["liquidity"] == "maker"
+
+
+async def test_insert_pool_snapshot(db):
+    await db.insert_pool_snapshot(
+        timestamp=1000.0,
+        pool_value_usd=204.0,
+        token0_amount=1500.0,
+        token1_amount=0.3,
+        hedge_value_usd=190.0,
+        hedge_pnl=-3.8,
+        pool_pnl=4.0,
+        net_pnl=1.75,
+        funding_cumulative=0.15,
+        fees_earned_cumulative=1.50,
+        fees_paid_cumulative=0.30,
+    )
+    snaps = await db.get_pool_snapshots(limit=10)
+    assert len(snaps) == 1
+    assert snaps[0]["pool_value_usd"] == 204.0
+
+
+async def test_insert_order_log(db):
+    await db.insert_order_log(
+        timestamp=1000.0,
+        exchange="hyperliquid",
+        action="place",
+        side="sell",
+        size=50.0,
+        price=1.06,
+        reason="exposure_rebalance",
+    )
+    logs = await db.get_order_logs(limit=10)
+    assert len(logs) == 1
+    assert logs[0]["action"] == "place"
+
+
+async def test_config_set_and_get(db):
+    await db.set_config("hedge_ratio", "0.90")
+    val = await db.get_config("hedge_ratio")
+    assert val == "0.90"
+
+    await db.set_config("hedge_ratio", "0.85")
+    val = await db.get_config("hedge_ratio")
+    assert val == "0.85"
+
+
+async def test_get_fill_stats(db):
+    await db.insert_fill(
+        timestamp=1000.0, exchange="hyperliquid", symbol="ARB",
+        side="sell", size=100.0, price=1.05, fee=0.015,
+        fee_currency="USDC", liquidity="maker", realized_pnl=0.0, order_id="o1",
+    )
+    await db.insert_fill(
+        timestamp=1001.0, exchange="hyperliquid", symbol="ARB",
+        side="buy", size=50.0, price=1.04, fee=0.045,
+        fee_currency="USDC", liquidity="taker", realized_pnl=0.5, order_id="o2",
+    )
+    stats = await db.get_fill_stats()
+    assert stats["maker_count"] == 1
+    assert stats["taker_count"] == 1
+    assert stats["maker_volume"] == 100.0
+    assert stats["taker_volume"] == 50.0
