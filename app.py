@@ -34,8 +34,13 @@ def create_app(start_engine: bool = True) -> Starlette:
         app.state.hub = state
         app.state.db = db
         if start_engine:
-            pass  # Engine wiring added in Task 15
+            from engine import Engine
+            engine = Engine(settings, state, db)
+            await engine.start()
+            app.state.engine = engine
         yield
+        if start_engine and hasattr(app.state, 'engine'):
+            await app.state.engine.stop()
         await db.close()
 
     routes = [
