@@ -125,8 +125,8 @@ class Database:
         self, *, timestamp: float, exchange: str, symbol: str, side: str,
         size: float, price: float, fee: float, fee_currency: str,
         liquidity: str, realized_pnl: float, order_id: str,
-    ) -> None:
-        await self._conn.execute(
+    ) -> int:
+        cursor = await self._conn.execute(
             """INSERT INTO fills
             (timestamp, exchange, symbol, side, size, price, fee, fee_currency,
              liquidity, realized_pnl, order_id)
@@ -135,6 +135,7 @@ class Database:
              liquidity, realized_pnl, order_id),
         )
         await self._conn.commit()
+        return cursor.lastrowid
 
     async def get_fills(
         self, exchange: str | None = None, symbol: str | None = None,

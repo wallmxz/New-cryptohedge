@@ -69,6 +69,8 @@ class GridMakerEngine:
             )
             self._hub.connected_chain = True
 
+        await self._exchange.subscribe_fills(self._settings.dydx_symbol, self._on_fill)
+
         self._running = True
         self._task = asyncio.create_task(self._main_loop())
         logger.info("GridMakerEngine started")
@@ -251,6 +253,39 @@ class GridMakerEngine:
             logger.warning(f"Aggressive correction: {side} {size} @ {price}")
         except Exception as e:
             logger.exception(f"Aggressive order failed: {e}")
+
+    async def _on_fill(self, fill):
+        """Handle a fill event from the exchange WS."""
+        fill_id = await self._db.insert_fill(
+            timestamp=fill.timestamp, exchange=self._exchange.name,
+            symbol=fill.symbol, side=fill.side, size=fill.size, price=fill.price,
+            fee=fill.fee, fee_currency=fill.fee_currency, liquidity=fill.liquidity,
+            realized_pnl=fill.realized_pnl, order_id=fill.order_id,
+        )
+
+        # Update grid order if matches
+        if fill.order_id:
+            try:
+                await self._db.mark_grid_order_filled(fill.order_id, fill_id)
+            except Exception:
+                pass
+
+        # Update aggregates in state
+        if fill.liquidity == "maker":
+            self._hub.total_maker_fills += 1
+            self._hub.total_maker_volume += fill.size
+        else:
+            self._hub.total_taker_fills += 1
+            self._hub.total_taker_volume += fill.size
+        self._hub.total_fees_paid += fill.fee
+        self._hub.hedge_realized_pnl += fill.realized_pnl
+        self._hub.last_update = time.time()
+
+        await self._db.insert_order_log(
+            timestamp=time.time(), exchange=self._exchange.name,
+            action="fill", side=fill.side, size=fill.size, price=fill.price,
+            reason=fill.liquidity,
+        )
 
     async def _handle_out_of_range_upper(self):
         """Price > p_b: pool is 100% USDC, target short = 0. Cancel grid."""

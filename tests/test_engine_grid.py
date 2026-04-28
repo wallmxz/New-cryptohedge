@@ -61,3 +61,38 @@ async def test_engine_iteration_in_range_builds_grid():
     assert state.range_lower > 0
     assert state.range_upper > state.range_lower
     assert state.liquidity_l > 0
+
+
+@pytest.mark.asyncio
+async def test_engine_fill_updates_db_and_state():
+    """When a fill arrives via WS, engine inserts to fills table and marks grid_order filled."""
+    from engine import GridMakerEngine
+    from exchanges.base import Fill
+
+    state = StateHub()
+    settings = MagicMock()
+    settings.dydx_symbol = "ETH-USD"
+
+    db = MagicMock()
+    db.insert_fill = AsyncMock(return_value=42)
+    db.mark_grid_order_filled = AsyncMock()
+    db.insert_order_log = AsyncMock()
+
+    exchange = MagicMock()
+    exchange.name = "dydx"
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=exchange, pool_reader=MagicMock(), beefy_reader=MagicMock(),
+    )
+
+    fill = Fill(
+        fill_id="f1", order_id="100",  # cloid as order_id
+        symbol="ETH-USD", side="sell", size=0.001, price=2999.0,
+        fee=0.001, fee_currency="USDC", liquidity="maker",
+        realized_pnl=0.0, timestamp=1000.0,
+    )
+    await engine._on_fill(fill)
+    db.insert_fill.assert_called_once()
+    db.mark_grid_order_filled.assert_called_once_with("100", 42)
+    assert state.total_maker_fills == 1
