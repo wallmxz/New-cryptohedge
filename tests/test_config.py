@@ -39,7 +39,7 @@ def test_settings_defaults(monkeypatch):
 
     s = Settings.from_env()
 
-    assert s.hedge_ratio == 0.95
+    assert s.hedge_ratio == 1.0
     assert s.max_exposure_pct == 0.05
     assert s.repost_depth == 3
     assert s.active_exchange == "hyperliquid"

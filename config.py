@@ -25,8 +25,11 @@ class Settings:
     hedge_ratio: float
     max_exposure_pct: float
     repost_depth: int
+    # max grid orders open at once on dYdX (caps grid density)
     max_open_orders: int
+    # exposure pct above which bot uses taker (bypass grid)
     threshold_aggressive: float
+    # exposure pct below which bot resumes grid (hysteresis)
     threshold_recovery: float
     active_exchange: str
     pool_token0_symbol: str
@@ -54,7 +57,7 @@ class Settings:
             dydx_subaccount=int(os.environ.get("DYDX_SUBACCOUNT", "0")),
             dydx_symbol=os.environ.get("DYDX_SYMBOL", "ARB-USD"),
             alert_webhook_url=os.environ.get("ALERT_WEBHOOK_URL", ""),
-            hedge_ratio=float(os.environ.get("HEDGE_RATIO", "0.95")),
+            hedge_ratio=float(os.environ.get("HEDGE_RATIO", "1.0")),
             max_exposure_pct=float(os.environ.get("MAX_EXPOSURE_PCT", "0.05")),
             repost_depth=int(os.environ.get("REPOST_DEPTH", "3")),
             max_open_orders=int(os.environ.get("MAX_OPEN_ORDERS", "200")),
