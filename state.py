@@ -38,6 +38,19 @@ class StateHub:
     total_fees_paid: float = 0.0
     total_fees_earned: float = 0.0
 
+    # Grid state
+    range_lower: float = 0.0
+    range_upper: float = 0.0
+    liquidity_l: float = 0.0
+    current_grid: list = field(default_factory=list)  # list[GridLevel]
+
+    # Margin
+    dydx_collateral: float = 0.0
+    margin_ratio: float = 999.0  # margin_ratio = collateral / required_collateral. See engine/margin.py for thresholds.
+
+    # Out-of-range flag
+    out_of_range: bool = False
+
     # System
     connected_exchange: bool = False
     connected_chain: bool = False

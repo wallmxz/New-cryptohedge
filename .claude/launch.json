@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "automoney",
+      "runtimeExecutable": "C:\\Users\\walla\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe",
+      "runtimeArgs": ["-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", "8000"],
+      "port": 8000
+    }
+  ]
+}

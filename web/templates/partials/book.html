@@ -1,21 +1,35 @@
 <div class="card">
-    <h2 class="text-sm font-medium text-gray-400 mb-3">ORDERBOOK</h2>
-    <div class="font-mono text-sm space-y-1">
-        <template x-for="ask in bookAsks" :key="ask.price">
-            <div class="flex justify-between text-accent-red/70">
-                <span x-text="ask.price.toFixed(4)"></span>
-                <span x-text="'[' + ask.size.toFixed(0) + ']'"></span>
-            </div>
-        </template>
-        <div class="border-t border-b border-gray-700 py-1 text-center text-xs text-gray-500">
-            spread: <span x-text="((state.best_ask - state.best_bid) * 10000).toFixed(1) + ' ticks'"></span>
+    <p class="card-title">Livro de ofertas</p>
+    <div x-show="hasBook">
+        <div class="book-row book-ask">
+            <span x-text="state.best_ask.toFixed(4)"></span>
+            <span class="text-slate-400 text-xs">best ask</span>
         </div>
-        <template x-for="bid in bookBids" :key="bid.price">
-            <div class="flex justify-between" :class="bid.isMine ? 'text-accent-blue font-bold' : 'text-accent-green/70'">
-                <span x-text="bid.price.toFixed(4)"></span>
-                <span x-text="'[' + bid.size.toFixed(0) + ']'"></span>
-                <span x-show="bid.isMine" class="text-accent-blue text-xs">MY</span>
+        <template x-if="myAsk">
+            <div class="book-row book-mine">
+                <span x-text="myAsk.price.toFixed(4)"></span>
+                <div class="flex items-center gap-2">
+                    <span class="text-slate-400" x-text="myAsk.size.toFixed(2)"></span>
+                    <span class="text-xs bg-indigo-100 text-indigo-600 px-2 py-0.5 rounded-full font-semibold">minha</span>
+                </div>
             </div>
         </template>
+        <div class="book-spread">
+            spread: <span x-text="spreadTicks.toFixed(1)"></span> ticks
+        </div>
+        <template x-if="myBid">
+            <div class="book-row book-mine">
+                <span x-text="myBid.price.toFixed(4)"></span>
+                <div class="flex items-center gap-2">
+                    <span class="text-slate-400" x-text="myBid.size.toFixed(2)"></span>
+                    <span class="text-xs bg-indigo-100 text-indigo-600 px-2 py-0.5 rounded-full font-semibold">minha</span>
+                </div>
+            </div>
+        </template>
+        <div class="book-row book-bid">
+            <span x-text="state.best_bid.toFixed(4)"></span>
+            <span class="text-slate-400 text-xs">best bid</span>
+        </div>
     </div>
+    <div x-show="!hasBook" class="text-center py-8 text-slate-400 text-sm">Sem conexao com a exchange</div>
 </div>

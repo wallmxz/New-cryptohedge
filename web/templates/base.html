@@ -1,42 +1,133 @@
 <!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>AutoMoney</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
-            darkMode: 'class',
             theme: {
+                fontFamily: { sans: ['Inter', 'system-ui', 'sans-serif'] },
                 extend: {
                     colors: {
-                        dark: { 800: '#1a1a2e', 900: '#0f0f1a', 700: '#252547' },
-                        accent: { green: '#00d4aa', red: '#ff4757', blue: '#5b86e5', yellow: '#ffc048' }
+                        surface: { 50: '#f8fafc', 100: '#f1f5f9', 200: '#e2e8f0', 300: '#cbd5e1', 400: '#94a3b8' },
+                        brand: { 500: '#6366f1', 600: '#4f46e5' },
+                        up: '#10b981',
+                        down: '#ef4444',
+                        warn: '#f59e0b',
                     }
                 }
             }
         }
     </script>
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
-    <script src="https://unpkg.com/htmx-ext-sse@2.3.0/sse.js"></script>
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
     <script src="https://unpkg.com/uplot@1.6.30/dist/uPlot.iife.min.js"></script>
     <link rel="stylesheet" href="https://unpkg.com/uplot@1.6.30/dist/uPlot.min.css">
     <style>
-        body { background: #0f0f1a; color: #e0e0e0; font-family: 'Inter', system-ui, sans-serif; }
-        .card { background: #1a1a2e; border: 1px solid #252547; border-radius: 12px; padding: 1.25rem; }
-        .value-positive { color: #00d4aa; }
-        .value-negative { color: #ff4757; }
-        .badge-maker { background: #00d4aa22; color: #00d4aa; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
-        .badge-taker { background: #ff475722; color: #ff4757; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; }
-        .safe-mode-on { background: #ff4757; animation: pulse 1.5s infinite; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        body { background: #f1f5f9; min-height: 100vh; }
+
+        .card {
+            background: white;
+            border-radius: 16px;
+            padding: 1.5rem;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 1px 2px rgba(0,0,0,0.06);
+            border: 1px solid #e2e8f0;
+        }
+
+        .card-title {
+            font-size: 0.7rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: #94a3b8;
+            margin-bottom: 1rem;
+        }
+
+        .metric-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 6px 0;
+        }
+        .metric-label { font-size: 0.85rem; color: #64748b; }
+        .metric-value { font-size: 0.9rem; font-weight: 600; color: #1e293b; font-family: 'SF Mono', 'Cascadia Code', monospace; }
+        .metric-up { color: #10b981; }
+        .metric-down { color: #ef4444; }
+        .metric-warn { color: #f59e0b; }
+        .metric-big { font-size: 1.25rem; font-weight: 700; }
+
+        /* Tabs */
+        .tab-bar { display: flex; gap: 4px; background: #e2e8f0; padding: 4px; border-radius: 12px; }
+        .tab-btn {
+            padding: 8px 20px; border-radius: 10px; font-size: 0.8rem; font-weight: 600;
+            color: #64748b; cursor: pointer; transition: all 0.2s;
+        }
+        .tab-btn:hover { color: #334155; }
+        .tab-active { background: white !important; color: #1e293b !important; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+
+        /* Status badge */
+        .badge-active { background: #d1fae5; color: #059669; padding: 4px 14px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; }
+        .badge-safe { background: #fee2e2; color: #dc2626; padding: 4px 14px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; animation: pulse 1.5s infinite; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+
+        /* Gear */
+        .gear-btn {
+            width: 36px; height: 36px; display: flex; align-items: center; justify-content: center;
+            border-radius: 10px; cursor: pointer; transition: all 0.2s; color: #94a3b8;
+        }
+        .gear-btn:hover { background: #e2e8f0; color: #475569; transform: rotate(30deg); }
+
+        /* Modal */
+        .modal-overlay { position: fixed; inset: 0; background: rgba(15,23,42,0.5); backdrop-filter: blur(8px); z-index: 50; display: flex; align-items: center; justify-content: center; }
+        .modal-box {
+            background: white; border-radius: 20px; width: 90%; max-width: 560px; max-height: 85vh;
+            overflow-y: auto; padding: 2rem; box-shadow: 0 25px 50px rgba(0,0,0,0.15);
+        }
+        .modal-tab { padding: 6px 14px; border-radius: 8px; font-size: 0.75rem; font-weight: 600; cursor: pointer; color: #94a3b8; transition: all 0.15s; }
+        .modal-tab:hover { color: #475569; background: #f1f5f9; }
+        .modal-tab-active { background: #6366f1 !important; color: white !important; }
+
+        .cfg-group { margin-bottom: 1.25rem; }
+        .cfg-label { font-size: 0.8rem; font-weight: 500; color: #334155; margin-bottom: 6px; display: block; }
+        .cfg-input {
+            width: 100%; background: #f8fafc; border: 1.5px solid #e2e8f0; border-radius: 10px;
+            padding: 10px 14px; color: #1e293b; font-family: monospace; font-size: 0.85rem; transition: border 0.2s;
+        }
+        .cfg-input:focus { outline: none; border-color: #6366f1; box-shadow: 0 0 0 3px rgba(99,102,241,0.1); }
+        .cfg-input:disabled { background: #f1f5f9; color: #94a3b8; cursor: not-allowed; }
+        .cfg-hint { font-size: 0.7rem; color: #94a3b8; margin-top: 4px; }
+
+        /* Orderbook */
+        .book-ask { color: #ef4444; }
+        .book-bid { color: #10b981; }
+        .book-mine { color: #6366f1; font-weight: 700; }
+        .book-row { display: flex; justify-content: space-between; padding: 3px 0; font-family: monospace; font-size: 0.8rem; }
+        .book-spread { text-align: center; padding: 6px 0; font-size: 0.7rem; color: #94a3b8; border-top: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; margin: 4px 0; }
+
+        /* Log */
+        .log-entry { display: flex; gap: 8px; padding: 4px 0; font-family: monospace; font-size: 0.75rem; color: #64748b; }
+
+        /* Separator */
+        .divider { height: 1px; background: #e2e8f0; margin: 8px 0; }
+
+        /* Chart */
+        #chart-container { position: relative; overflow: hidden; }
+        #chart-container .uplot { position: relative !important; }
+        #chart-container .u-wrap { position: relative !important; }
+        .u-legend { font-size: 0.7rem; color: #94a3b8; }
+        .u-legend .u-series td { padding: 2px 6px; }
+        .u-legend .u-series:first-child { display: none; }
+
+        [x-cloak] { display: none !important; }
     </style>
 </head>
-<body class="min-h-screen p-4">
+<body class="p-4 md:p-6">
     {% block content %}{% endblock %}
-    <script src="/static/app.js"></script>
-    <script src="/static/chart.js"></script>
+    <script src="/static/app.js?v={{ range(100000, 999999) | random }}"></script>
+    <script src="/static/chart.js?v={{ range(100000, 999999) | random }}"></script>
 </body>
 </html>

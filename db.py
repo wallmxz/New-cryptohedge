@@ -69,6 +69,19 @@ CREATE TABLE IF NOT EXISTS order_log (
     price REAL,
     reason TEXT
 );
+
+CREATE TABLE IF NOT EXISTS grid_orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cloid TEXT UNIQUE NOT NULL,
+    side TEXT NOT NULL,
+    target_price REAL NOT NULL,
+    size REAL NOT NULL,
+    placed_at REAL NOT NULL,
+    cancelled_at REAL,
+    fill_id INTEGER REFERENCES fills(id)
+);
+CREATE INDEX IF NOT EXISTS idx_grid_orders_active ON grid_orders(cloid)
+    WHERE cancelled_at IS NULL AND fill_id IS NULL;
 """
 
 
@@ -112,8 +125,8 @@ class Database:
         self, *, timestamp: float, exchange: str, symbol: str, side: str,
         size: float, price: float, fee: float, fee_currency: str,
         liquidity: str, realized_pnl: float, order_id: str,
-    ) -> None:
-        await self._conn.execute(
+    ) -> int:
+        cursor = await self._conn.execute(
             """INSERT INTO fills
             (timestamp, exchange, symbol, side, size, price, fee, fee_currency,
              liquidity, realized_pnl, order_id)
@@ -122,6 +135,7 @@ class Database:
              liquidity, realized_pnl, order_id),
         )
         await self._conn.commit()
+        return cursor.lastrowid
 
     async def get_fills(
         self, exchange: str | None = None, symbol: str | None = None,
@@ -227,3 +241,37 @@ class Database:
              cow_tokens, tx_hash),
         )
         await self._conn.commit()
+
+    async def insert_grid_order(
+        self, *, cloid: str, side: str, target_price: float,
+        size: float, placed_at: float,
+    ) -> None:
+        await self._conn.execute(
+            """INSERT INTO grid_orders (cloid, side, target_price, size, placed_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (cloid, side, target_price, size, placed_at),
+        )
+        await self._conn.commit()
+
+    async def mark_grid_order_cancelled(self, cloid: str, ts: float) -> None:
+        await self._conn.execute(
+            "UPDATE grid_orders SET cancelled_at = ? WHERE cloid = ?",
+            (ts, cloid),
+        )
+        await self._conn.commit()
+
+    async def mark_grid_order_filled(self, cloid: str, fill_id: int) -> None:
+        await self._conn.execute(
+            "UPDATE grid_orders SET fill_id = ? WHERE cloid = ?",
+            (fill_id, cloid),
+        )
+        await self._conn.commit()
+
+    async def get_active_grid_orders(self) -> list[dict]:
+        cursor = await self._conn.execute(
+            """SELECT * FROM grid_orders
+               WHERE cancelled_at IS NULL AND fill_id IS NULL
+               ORDER BY placed_at ASC"""
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]

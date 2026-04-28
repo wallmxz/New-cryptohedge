@@ -2,6 +2,9 @@ from __future__ import annotations
 import asyncio
 import os
 import logging
+from dotenv import load_dotenv
+
+load_dotenv()
 from contextlib import asynccontextmanager
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
@@ -11,7 +14,7 @@ from config import Settings
 from state import StateHub
 from db import Database
 from web.auth import BasicAuthMiddleware
-from web.routes import dashboard, sse_state, sse_logs, update_settings
+from web.routes import dashboard, sse_state, sse_logs, update_settings, get_config
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -26,16 +29,31 @@ def create_app(start_engine: bool = True) -> Starlette:
     db_path = os.environ.get("DB_PATH", "automoney.db")
     db = Database(db_path)
 
+    async def _load_persisted_config():
+        for key, caster, attr in [
+            ("hedge_ratio", float, "hedge_ratio"),
+            ("max_exposure_pct", float, "max_exposure_pct"),
+            ("repost_depth", int, "repost_depth"),
+            ("pool_deposited_usd", float, "pool_deposited_usd"),
+        ]:
+            raw = await db.get_config(key)
+            if raw is not None:
+                try:
+                    setattr(state, attr, caster(raw))
+                except ValueError:
+                    pass
+
     @asynccontextmanager
     async def lifespan(app):
         if db._conn is None:
             await db.initialize()
+        await _load_persisted_config()
         app.state.settings = settings
         app.state.hub = state
         app.state.db = db
         if start_engine:
             from engine import Engine
-            engine = Engine(settings, state, db)
+            engine = Engine(settings=settings, hub=state, db=db)
             await engine.start()
             app.state.engine = engine
         yield
@@ -48,6 +66,7 @@ def create_app(start_engine: bool = True) -> Starlette:
         Route("/", dashboard),
         Route("/sse/state", sse_state),
         Route("/sse/logs", sse_logs),
+        Route("/config", get_config),
         Route("/settings", update_settings, methods=["POST"]),
         Mount("/static", StaticFiles(directory="web/static"), name="static"),
     ]
@@ -72,4 +91,4 @@ def create_app(start_engine: bool = True) -> Starlette:
     return app
 
 
-app = create_app()
+app = create_app(start_engine=os.environ.get("START_ENGINE", "false").lower() == "true")

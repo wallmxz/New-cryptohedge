@@ -1,9 +1,22 @@
 <div class="card">
-    <h2 class="text-sm font-medium text-gray-400 mb-3">POOL</h2>
-    <div class="space-y-2">
-        <div class="flex justify-between"><span class="text-gray-400">Value</span><span class="text-white font-mono" x-text="'$' + state.pool_value_usd.toFixed(2)">$0.00</span></div>
-        <div class="flex justify-between"><span class="text-gray-400">Deposited</span><span class="text-gray-300 font-mono" x-text="'$' + state.pool_deposited_usd.toFixed(2)">$0.00</span></div>
-        <div class="flex justify-between"><span class="text-gray-400">ARB</span><span class="text-white font-mono" x-text="(state.pool_tokens.ARB || 0).toFixed(2)">0</span></div>
-        <div class="flex justify-between"><span class="text-gray-400">WETH</span><span class="text-white font-mono" x-text="(state.pool_tokens.WETH || 0).toFixed(4)">0</span></div>
+    <p class="card-title">Pool</p>
+    <div>
+        <div class="metric-row">
+            <span class="metric-label">Valor atual</span>
+            <span class="metric-value" x-text="'$' + state.pool_value_usd.toFixed(2)">$0.00</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">Depositado</span>
+            <span class="metric-value" style="color:#94a3b8" x-text="'$' + state.pool_deposited_usd.toFixed(2)">$0.00</span>
+        </div>
+        <div class="divider"></div>
+        <div class="metric-row">
+            <span class="metric-label">ARB</span>
+            <span class="metric-value" x-text="(state.pool_tokens.ARB || 0).toFixed(2)">0</span>
+        </div>
+        <div class="metric-row">
+            <span class="metric-label">WETH</span>
+            <span class="metric-value" x-text="(state.pool_tokens.WETH || 0).toFixed(4)">0</span>
+        </div>
     </div>
 </div>
