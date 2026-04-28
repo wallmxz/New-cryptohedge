@@ -69,6 +69,9 @@ async def get_config(request: Request):
         "alert_webhook_url": settings.alert_webhook_url,
         "pool_token0_symbol": settings.pool_token0_symbol,
         "pool_token1_symbol": settings.pool_token1_symbol,
+        "max_open_orders": settings.max_open_orders,
+        "threshold_aggressive": settings.threshold_aggressive,
+        "threshold_recovery": settings.threshold_recovery,
     })
 
 
@@ -95,5 +98,11 @@ async def update_settings(request: Request):
         await db.set_config("symbol", form["symbol"])
     if "alert_webhook_url" in form:
         await db.set_config("alert_webhook_url", form["alert_webhook_url"])
+    if "max_open_orders" in form:
+        await db.set_config("max_open_orders", str(int(form["max_open_orders"])))
+    if "threshold_aggressive" in form:
+        await db.set_config("threshold_aggressive", str(float(form["threshold_aggressive"])))
+    if "threshold_recovery" in form:
+        await db.set_config("threshold_recovery", str(float(form["threshold_recovery"])))
 
     return HTMLResponse('<div id="settings-status">Configuracoes salvas (reinicie o engine para aplicar mudancas de exchange/symbol)</div>')

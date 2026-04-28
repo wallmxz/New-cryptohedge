@@ -27,6 +27,9 @@ function dashboard() {
             alert_webhook_url: '',
             pool_token0_symbol: 'ARB',
             pool_token1_symbol: 'USDC',
+            max_open_orders: 200,
+            threshold_aggressive: 0.05,
+            threshold_recovery: 0.02,
         },
 
         logs: [],

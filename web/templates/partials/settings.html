@@ -34,6 +34,24 @@
                         <p class="cfg-hint">Cancela e recoloca se a ordem cair para este nivel no book</p>
                     </div>
                     <div class="cfg-group">
+                        <label class="cfg-label">Maximo open orders na exchange</label>
+                        <input type="number" name="max_open_orders" step="1" min="20" max="500"
+                               :value="config.max_open_orders" class="cfg-input">
+                        <p class="cfg-hint">Limite de ordens da grade. Default 200</p>
+                    </div>
+                    <div class="cfg-group">
+                        <label class="cfg-label">Threshold escalada (taker)</label>
+                        <input type="number" name="threshold_aggressive" step="0.01" min="0.01" max="0.20"
+                               :value="config.threshold_aggressive" class="cfg-input">
+                        <p class="cfg-hint">Acima deste % de exposure, ordens taker</p>
+                    </div>
+                    <div class="cfg-group">
+                        <label class="cfg-label">Threshold de recovery (volta para grade)</label>
+                        <input type="number" name="threshold_recovery" step="0.005" min="0.005" max="0.10"
+                               :value="config.threshold_recovery" class="cfg-input">
+                        <p class="cfg-hint">Quando exposure cai abaixo deste %, retoma grade</p>
+                    </div>
+                    <div class="cfg-group">
                         <label class="cfg-label">Valor depositado na pool (USD)</label>
                         <input type="number" name="pool_deposited_usd" step="0.01" min="0" :value="state.pool_deposited_usd" class="cfg-input" placeholder="0.00">
                         <p class="cfg-hint">Valor inicial depositado — usado como baseline do PnL da pool</p>
