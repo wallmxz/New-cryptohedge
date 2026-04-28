@@ -40,3 +40,33 @@ async def test_pool_reader_slot0(monkeypatch):
     sqrt_p, tick = await reader.read_slot0()
     assert sqrt_p == int(1.0 * 2**96)
     assert tick == 0
+
+
+@pytest.mark.asyncio
+async def test_pool_reader_read_price_eth_usdc():
+    """read_price returns display price for ETH/USDC pool layout (token0=WETH 18, token1=USDC 6)."""
+    Q96 = 2**96
+    p_raw = 3000 * (10**6) / (10**18)  # 3000 USDC per WETH in raw units
+    sqrt_price_x96 = int((p_raw ** 0.5) * Q96)
+    fake_slot0 = (sqrt_price_x96, 0, 0, 0, 0, 0, True)
+
+    contract = MagicMock()
+    contract.functions.slot0.return_value.call = AsyncMock(return_value=fake_slot0)
+    w3 = MagicMock()
+    w3.eth.contract.return_value = contract
+    w3.to_checksum_address = lambda a: a
+
+    reader = UniswapV3PoolReader(w3, "0xpool", decimals0=18, decimals1=6)
+    price = await reader.read_price()
+    assert abs(price - 3000.0) < 0.01
+
+
+def test_sqrt_price_x96_to_price_with_different_decimals():
+    """For (token0=WETH 18, token1=USDC 6) at $3000 ETH:
+    raw price = 3000 * 10^6 / 10^18; sqrt_price_x96 = sqrt(raw) * 2^96.
+    sqrt_price_x96_to_price should recover ~3000.
+    """
+    p_raw = 3000 * (10**6) / (10**18)
+    sqrt_price_x96 = int((p_raw ** 0.5) * (2**96))
+    price = sqrt_price_x96_to_price(sqrt_price_x96, decimals0=18, decimals1=6)
+    assert abs(price - 3000.0) < 0.01
