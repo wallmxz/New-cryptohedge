@@ -46,7 +46,7 @@ class StateHub:
 
     # Margin
     dydx_collateral: float = 0.0
-    margin_ratio: float = 0.0  # 1.0 = healthy, <0.4 = warning, <0.2 = critical
+    margin_ratio: float = 999.0  # margin_ratio = collateral / required_collateral. See engine/margin.py for thresholds.
 
     # Out-of-range flag
     out_of_range: bool = False
