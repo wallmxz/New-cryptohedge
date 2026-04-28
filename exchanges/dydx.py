@@ -9,6 +9,7 @@ SDK deviations from the task reference code:
    We supply those URLs ourselves with documented mainnet defaults.
 """
 from __future__ import annotations
+import asyncio
 import logging
 import time
 from dataclasses import dataclass
@@ -151,8 +152,52 @@ class DydxAdapter(ExchangeAdapter):
             symbol=symbol, side=side, size=size, price=price, cloid_int=cloid,
         )
 
-    async def cancel_order(self, order_id):
-        raise NotImplementedError("Implementado em Task 11")
+    async def cancel_long_term_order(self, *, symbol: str, cloid_int: int) -> None:
+        """Cancel a long-term order by its client_id."""
+        market_data = await self._indexer.markets.get_perpetual_markets(symbol)
+        market = Market(market_data["markets"][symbol])
+        order_id = market.order_id(
+            self._wallet_address, self._subaccount, cloid_int, OrderFlags.LONG_TERM,
+        )
+        good_til_block_time = int(time.time()) + 60
+        await self._node.cancel_order(
+            wallet=self._wallet,
+            order_id=order_id,
+            good_til_block_time=good_til_block_time,
+        )
+        if hasattr(self._wallet, "sequence"):
+            self._wallet.sequence += 1
+
+    async def cancel_order(self, order_id: str) -> None:
+        """Generic cancel by string id (assumes default symbol)."""
+        raise NotImplementedError("Use cancel_long_term_order for long-term orders")
+
+    async def batch_place(self, orders: list[dict]) -> list[Order]:
+        """Place multiple orders sequentially with small delay to avoid rate limits.
+
+        orders: list of dicts with keys symbol, side, size, price, cloid_int (and optional ttl_seconds).
+        """
+        placed = []
+        for spec in orders:
+            try:
+                o = await self.place_long_term_order(**spec)
+                placed.append(o)
+            except Exception as e:
+                logger.error(f"Batch place failed for cloid {spec.get('cloid_int')}: {e}")
+            await asyncio.sleep(0.05)  # rate limit safety
+        return placed
+
+    async def batch_cancel(self, items: list[dict]) -> int:
+        """Cancel multiple orders. items: list of dicts with symbol + cloid_int."""
+        cancelled = 0
+        for spec in items:
+            try:
+                await self.cancel_long_term_order(**spec)
+                cancelled += 1
+            except Exception as e:
+                logger.error(f"Batch cancel failed for cloid {spec.get('cloid_int')}: {e}")
+            await asyncio.sleep(0.05)
+        return cancelled
 
     async def get_position(self, symbol):
         raise NotImplementedError("Implementado em Task 12")
