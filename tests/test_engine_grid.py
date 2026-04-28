@@ -140,3 +140,41 @@ async def test_engine_reconcile_runs_periodically():
     engine.RECONCILE_EVERY_N_ITERATIONS = 1
     await engine._iterate()
     exchange.get_open_orders_cloids.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_engine_recovery_reconciles_on_start():
+    """On start(), reconciler runs once before main loop."""
+    import time
+    from engine import GridMakerEngine
+
+    state = StateHub()
+    settings = MagicMock()
+    settings.dydx_symbol = "ETH-USD"
+
+    db = MagicMock()
+    db.get_active_grid_orders = AsyncMock(return_value=[
+        {"cloid": "999", "side": "sell"}  # stale from previous run
+    ])
+    db.mark_grid_order_cancelled = AsyncMock()
+
+    exchange = MagicMock()
+    exchange.connect = AsyncMock()
+    exchange.disconnect = AsyncMock()
+    exchange.subscribe_fills = AsyncMock()
+    exchange.get_open_orders_cloids = AsyncMock(return_value=[])  # nothing on exchange
+    exchange.name = "dydx"
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=exchange, pool_reader=MagicMock(), beefy_reader=MagicMock(),
+    )
+    engine._iterate = AsyncMock()  # don't run main loop
+    await engine.start()
+
+    # The 999 should have been marked cancelled (it was in DB but not on exchange)
+    db.mark_grid_order_cancelled.assert_called()
+    cancelled_args = [c.args for c in db.mark_grid_order_cancelled.call_args_list]
+    assert any("999" in args for args in cancelled_args)
+
+    await engine.stop()

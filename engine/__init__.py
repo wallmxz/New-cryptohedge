@@ -89,6 +89,17 @@ class GridMakerEngine:
             )
             self._hub.connected_chain = True
 
+        # Initial reconciliation on startup, BEFORE main loop begins.
+        # Recovers from crashes: cancels orphan orders on exchange, marks
+        # lost DB orders as cancelled.
+        rec = self._ensure_reconciler()
+        if rec is not None:
+            try:
+                await rec.reconcile()
+                logger.info("Initial reconciliation complete")
+            except Exception as e:
+                logger.error(f"Initial reconciliation failed: {e}")
+
         await self._exchange.subscribe_fills(self._settings.dydx_symbol, self._on_fill)
 
         self._running = True
