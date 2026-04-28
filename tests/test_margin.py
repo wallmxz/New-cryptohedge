@@ -15,7 +15,8 @@ def test_margin_ratio_zero_when_required_zero():
 
 def test_classify_margin_healthy_warning_critical():
     assert classify_margin(2.0) == "healthy"
-    assert classify_margin(0.85) == "info"
-    assert classify_margin(0.55) == "warning"
-    assert classify_margin(0.35) == "urgent"
-    assert classify_margin(0.15) == "critical"
+    assert classify_margin(0.9) == "info"      # 0.8 <= r < 1.0
+    assert classify_margin(0.7) == "warning"   # 0.6 <= r < 0.8
+    assert classify_margin(0.5) == "urgent"    # 0.4 <= r < 0.6
+    assert classify_margin(0.3) == "critical"  # 0.2 <= r < 0.4
+    assert classify_margin(0.1) == "emergency" # < 0.2

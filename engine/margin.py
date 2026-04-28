@@ -27,10 +27,10 @@ def classify_margin(ratio: float) -> str:
         return "healthy"
     if ratio >= 0.8:
         return "info"
-    if ratio >= 0.5:
+    if ratio >= 0.6:
         return "warning"
-    if ratio >= 0.3:
+    if ratio >= 0.4:
         return "urgent"
-    if ratio >= 0.1:
+    if ratio >= 0.2:
         return "critical"
     return "emergency"
