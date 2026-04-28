@@ -119,3 +119,106 @@ async def test_engine_full_loop_in_range(tmp_path):
     assert len(active_after) == len(placed_orders) - 1
 
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_out_of_range_upper_cancels_grid(tmp_path):
+    """Price > p_b: bot cancels grid, sets out_of_range = True."""
+    from db import Database
+    from engine import GridMakerEngine
+
+    db = Database(str(tmp_path / "t2.db"))
+    await db.initialize()
+    # Insert a stale grid order
+    await db.insert_grid_order(
+        cloid="500", side="buy", target_price=3010.0, size=0.001, placed_at=1000.0,
+    )
+
+    state = StateHub(hedge_ratio=1.0)
+    settings = MagicMock()
+    settings.dydx_symbol = "ETH-USD"
+    settings.alert_webhook_url = ""
+    settings.threshold_aggressive = 0.05
+    settings.threshold_recovery = 0.02
+    settings.max_open_orders = 200
+    settings.pool_token0_symbol = "WETH"
+    settings.pool_token1_symbol = "USDC"
+
+    cancelled_calls = []
+
+    async def fake_cancel(specs):
+        cancelled_calls.extend(specs)
+        return len(specs)
+
+    exchange = MagicMock()
+    exchange.name = "dydx"
+    exchange.batch_cancel = AsyncMock(side_effect=fake_cancel)
+    exchange.get_position = AsyncMock(return_value=None)
+    exchange.get_collateral = AsyncMock(return_value=130.0)
+    exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+
+    pool_reader = MagicMock()
+    # ETH at $3500 — above the [$2700, $3300] range
+    pool_reader.read_price = AsyncMock(return_value=3500.0)
+    beefy_reader = MagicMock()
+    beefy_reader.read_position = AsyncMock(return_value=MagicMock(
+        # Same tick values as Task 25 (~$2700-$3300 for ETH/USDC 18/6)
+        tick_lower=-197310, tick_upper=-195303,
+        amount0=0.0, amount1=300.0, share=0.01, raw_balance=10**16,
+    ))
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=exchange, pool_reader=pool_reader, beefy_reader=beefy_reader,
+    )
+    await engine._iterate()
+    assert state.out_of_range is True
+    assert len(cancelled_calls) >= 1  # the stale order 500 was cancelled
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_out_of_range_lower_holds_short(tmp_path):
+    """Price < p_a: bot holds short at boundary."""
+    from db import Database
+    from engine import GridMakerEngine
+
+    db = Database(str(tmp_path / "t3.db"))
+    await db.initialize()
+
+    state = StateHub(hedge_ratio=1.0)
+    settings = MagicMock()
+    settings.dydx_symbol = "ETH-USD"
+    settings.alert_webhook_url = ""
+    settings.threshold_aggressive = 0.05
+    settings.threshold_recovery = 0.02
+    settings.max_open_orders = 200
+    settings.pool_token0_symbol = "WETH"
+    settings.pool_token1_symbol = "USDC"
+
+    exchange = MagicMock()
+    exchange.name = "dydx"
+    exchange.batch_cancel = AsyncMock(return_value=0)
+    exchange.get_position = AsyncMock(return_value=MagicMock(
+        side="short", size=0.103, entry_price=2982, unrealized_pnl=30.0,
+    ))
+    exchange.get_collateral = AsyncMock(return_value=130.0)
+    exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+
+    pool_reader = MagicMock()
+    # ETH at $2500 — below the [$2700, $3300] range
+    pool_reader.read_price = AsyncMock(return_value=2500.0)
+    beefy_reader = MagicMock()
+    beefy_reader.read_position = AsyncMock(return_value=MagicMock(
+        tick_lower=-197310, tick_upper=-195303,
+        amount0=0.103, amount1=0.0, share=0.01, raw_balance=10**16,
+    ))
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=exchange, pool_reader=pool_reader, beefy_reader=beefy_reader,
+    )
+    await engine._iterate()
+    assert state.out_of_range is True
+    # short stays at 0.103 (not closed)
+    await db.close()
