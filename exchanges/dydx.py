@@ -249,6 +249,32 @@ class DydxAdapter(ExchangeAdapter):
             unrealized_pnl=float(pos.get("unrealizedPnl", "0")),
         )
 
+    async def get_open_orders_cloids(self, symbol: str) -> list[str]:
+        """Returns list of cloid strings for currently-open orders on this market.
+
+        Used by the Reconciler to compare exchange-side state against DB. The
+        SDK's `get_subaccount_orders` returns the raw `/v4/orders` payload —
+        either a list directly or a dict wrapping `orders`. We tolerate both.
+        """
+        resp = await self._indexer.account.get_subaccount_orders(
+            address=self._wallet_address,
+            subaccount_number=self._subaccount,
+            ticker=symbol,
+            status="OPEN",
+        )
+        # The /v4/orders endpoint normally returns a list; some versions wrap
+        # the result in {"orders": [...]} — handle both shapes.
+        if isinstance(resp, dict):
+            orders_iter = resp.get("orders", [])
+        else:
+            orders_iter = resp or []
+        cloids: list[str] = []
+        for o in orders_iter:
+            cid = o.get("clientId")
+            if cid is not None:
+                cloids.append(str(cid))
+        return cloids
+
     async def get_collateral(self) -> float:
         """Total collateral (equity) in subaccount, in quote (USDC)."""
         sub = await self._indexer.account.get_subaccount(
