@@ -100,3 +100,36 @@ async def test_get_fill_stats(db):
     assert stats["taker_count"] == 1
     assert stats["maker_volume"] == 100.0
     assert stats["taker_volume"] == 50.0
+
+
+@pytest.mark.asyncio
+async def test_insert_and_get_grid_order(tmp_path):
+    from db import Database
+    db = Database(str(tmp_path / "t.db"))
+    await db.initialize()
+    await db.insert_grid_order(
+        cloid="hb-r1-l5-1",
+        side="sell",
+        target_price=2800.0,
+        size=0.001,
+        placed_at=1000.0,
+    )
+    rows = await db.get_active_grid_orders()
+    assert len(rows) == 1
+    assert rows[0]["cloid"] == "hb-r1-l5-1"
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_mark_grid_order_cancelled(tmp_path):
+    from db import Database
+    db = Database(str(tmp_path / "t.db"))
+    await db.initialize()
+    await db.insert_grid_order(
+        cloid="hb-r1-l1-1", side="buy", target_price=3010.0,
+        size=0.001, placed_at=1000.0,
+    )
+    await db.mark_grid_order_cancelled("hb-r1-l1-1", 1010.0)
+    active = await db.get_active_grid_orders()
+    assert len(active) == 0
+    await db.close()
