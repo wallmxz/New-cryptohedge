@@ -13,6 +13,7 @@ from exchanges.base import ExchangeAdapter
 from engine.curve import compute_l_from_value, compute_x, compute_target_grid, GridLevel
 from engine.grid import GridManager
 from engine.hedge import compute_hedge_action
+from engine.reconciler import Reconciler
 from web3 import AsyncWeb3, AsyncHTTPProvider
 
 logger = logging.getLogger(__name__)
@@ -46,6 +47,25 @@ class GridMakerEngine:
         self._running = False
         self._cloid_seq = 0
         self._run_id = int(time.time())  # unique per process run
+        self._reconciler: Reconciler | None = None
+        self._iter_count = 0
+        self.RECONCILE_EVERY_N_ITERATIONS = 30  # ~30s
+
+    def _ensure_reconciler(self):
+        if self._reconciler is None and self._exchange is not None:
+            self._reconciler = Reconciler(
+                db=self._db, exchange=self._exchange, settings=self._settings,
+            )
+        return self._reconciler
+
+    async def _maybe_reconcile(self):
+        if self._iter_count % self.RECONCILE_EVERY_N_ITERATIONS == 0:
+            rec = self._ensure_reconciler()
+            if rec is not None:
+                try:
+                    await rec.reconcile()
+                except Exception as e:
+                    logger.error(f"Reconciler error: {e}")
 
     async def start(self):
         if self._exchange is None:
@@ -104,6 +124,9 @@ class GridMakerEngine:
 
     async def _iterate(self):
         """One cycle of the main loop."""
+        self._iter_count += 1
+        # Periodic reconciliation (runs regardless of in-range/out-of-range path).
+        await self._maybe_reconcile()
         # 1. Read on-chain state
         beefy_pos = await self._beefy_reader.read_position()
         p_now = await self._pool_reader.read_price()
