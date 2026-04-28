@@ -10,6 +10,7 @@ These hold for p in [p_a, p_b]. Outside the range, position is 100% one token.
 from __future__ import annotations
 from dataclasses import dataclass
 from math import sqrt
+from typing import Literal
 
 
 def compute_x(L: float, p: float, p_b: float) -> float:
@@ -37,7 +38,8 @@ def compute_v(L: float, p_a: float, p_b: float, p: float) -> float:
 
     Caller must ensure p_a <= p <= p_b. Outside the range, this function
     does NOT return the correct clamped LP value -- it returns the formula
-    extrapolated. Use guards in the caller (e.g., compute_target_grid does).
+    extrapolated. Use guards in the caller; this function will return
+    extrapolated values if p is outside [p_a, p_b].
     """
     return compute_x(L, p, p_b) * p + compute_y(L, p, p_a)
 
@@ -57,8 +59,9 @@ def compute_l_from_value(value: float, p_a: float, p_b: float, p: float) -> floa
 class GridLevel:
     price: float           # USD price of token0 at this level
     size: float            # base units of token0 (e.g., WETH amount)
-    side: str              # "buy" (close short) or "sell" (open short)
-    target_short: float    # cumulative target short at this level (base units)
+    side: Literal["buy", "sell"]  # "buy" (close short) or "sell" (open short)
+    target_short: float    # cumulative target short (base units). Used by engine
+                           # for accounting/fills, not by GridManager.diff.
 
 
 def inverse_x_to_p(L: float, x: float, p_b: float) -> float:
@@ -71,6 +74,8 @@ def inverse_x_to_p(L: float, x: float, p_b: float) -> float:
     if L <= 0:
         raise ValueError("L must be positive")
     inv_sqrt_p = x / L + 1.0 / sqrt(p_b)
+    if inv_sqrt_p <= 0:
+        raise ValueError(f"invalid x: produces non-positive 1/sqrt(p) (x={x}, L={L})")
     return 1.0 / (inv_sqrt_p * inv_sqrt_p)
 
 
@@ -79,10 +84,14 @@ def compute_target_grid(
     L: float, p_a: float, p_b: float, p_now: float,
     hedge_ratio: float, min_notional_usd: float, max_orders: int,
 ) -> list[GridLevel]:
-    """Build a grid of orders covering [p_a, p_b] with each order = min_notional_usd.
+    """Build a grid of orders covering [p_a, p_b] with each order ~ min_notional_usd.
 
-    If grid would exceed max_orders, doubles step size until fits.
+    If the raw level count would exceed max_orders, recomputes step as
+    total_x_range/max_orders so the result is at most ~max_orders levels
+    (may be one or two short due to open-interval traversal — see I2).
+
     Levels above p_now are buys (close short), below are sells (add short).
+    Returned levels are sorted by ascending price.
     """
     if not (p_a < p_now < p_b):
         return []  # out of range, no grid
@@ -95,9 +104,8 @@ def compute_target_grid(
 
     # How many levels fit in the full range [p_a, p_b]?
     total_x_range = x_at_a - 0.0  # x decreases from x_at_a (at p_a) to 0 (at p_b)
-    raw_count = int(total_x_range / step_x)
 
-    if raw_count > max_orders:
+    if total_x_range / step_x > max_orders:
         # Increase step to fit max_orders
         step_x = total_x_range / max_orders
 
@@ -131,4 +139,4 @@ def compute_target_grid(
         ))
         target_x += step_x
 
-    return levels
+    return sorted(levels, key=lambda lv: lv.price)

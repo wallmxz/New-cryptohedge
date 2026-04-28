@@ -82,7 +82,7 @@ def test_target_grid_density():
         hedge_ratio=1.0, min_notional_usd=3.0, max_orders=200,
     )
     # Expected ~100 levels covering full range x: 0 to 0.103
-    assert 80 < len(levels) < 120
+    assert 100 <= len(levels) <= 102
 
 
 def test_target_grid_bounded_by_max_orders():
@@ -105,3 +105,51 @@ def test_target_grid_sides():
             assert level.side == "buy", f"price {level.price} should be buy"
         elif level.price < 3000:
             assert level.side == "sell", f"price {level.price} should be sell"
+
+
+def test_grid_target_short_monotonic():
+    """Cumulative target_short is monotonic in price within each side."""
+    levels = compute_target_grid(
+        L=56.0, p_a=2700, p_b=3300, p_now=3000,
+        hedge_ratio=1.0, min_notional_usd=3.0, max_orders=200,
+    )
+    buys = sorted([lv for lv in levels if lv.side == "buy"], key=lambda lv: lv.price)
+    sells = sorted([lv for lv in levels if lv.side == "sell"], key=lambda lv: lv.price)
+    # Buys: as price increases, target_short decreases
+    for i in range(len(buys) - 1):
+        assert buys[i].target_short > buys[i+1].target_short
+    # Sells: as price decreases, target_short increases (so reverse-sorted by price, target_short increases)
+    for i in range(len(sells) - 1):
+        assert sells[i].target_short > sells[i+1].target_short
+
+
+def test_grid_with_hedge_ratio_half():
+    levels_full = compute_target_grid(
+        L=56.0, p_a=2700, p_b=3300, p_now=3000,
+        hedge_ratio=1.0, min_notional_usd=3.0, max_orders=200,
+    )
+    levels_half = compute_target_grid(
+        L=56.0, p_a=2700, p_b=3300, p_now=3000,
+        hedge_ratio=0.5, min_notional_usd=3.0, max_orders=200,
+    )
+    assert len(levels_full) == len(levels_half)
+    for full, half in zip(levels_full, levels_half):
+        assert isclose(half.size, full.size * 0.5, rel_tol=1e-9)
+        assert isclose(half.target_short, full.target_short * 0.5, rel_tol=1e-9)
+
+
+def test_grid_levels_sorted_by_price():
+    levels = compute_target_grid(
+        L=56.0, p_a=2700, p_b=3300, p_now=3000,
+        hedge_ratio=1.0, min_notional_usd=3.0, max_orders=200,
+    )
+    prices = [lv.price for lv in levels]
+    assert prices == sorted(prices)
+
+
+def test_inverse_x_negative_raises():
+    """Negative x produces non-positive 1/sqrt(p), should raise."""
+    import pytest
+    with pytest.raises(ValueError, match="non-positive"):
+        # large negative x makes inv_sqrt_p negative
+        inverse_x_to_p(56.0, -10.0, 3300)
