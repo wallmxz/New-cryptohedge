@@ -60,6 +60,35 @@
             {% include "partials/pnl.html" %}
         </div>
 
+        <!-- Status da grade + margem -->
+        <div class="card">
+            <p class="card-title">Status da grade</p>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                <div>
+                    <p class="text-xs text-slate-400 mb-1">Range Beefy</p>
+                    <p class="text-sm font-semibold text-slate-700"
+                       x-text="state.range_lower > 0 ? '$' + state.range_lower.toFixed(0) + ' - $' + state.range_upper.toFixed(0) : '—'"></p>
+                </div>
+                <div>
+                    <p class="text-xs text-slate-400 mb-1">Out of range?</p>
+                    <p class="text-sm font-semibold"
+                       :class="state.out_of_range ? 'text-amber-600' : 'text-emerald-600'"
+                       x-text="state.out_of_range ? 'Sim' : 'Não'"></p>
+                </div>
+                <div>
+                    <p class="text-xs text-slate-400 mb-1">Margin ratio</p>
+                    <p class="text-sm font-semibold"
+                       :class="state.margin_ratio > 1 ? 'text-emerald-600' : state.margin_ratio > 0.6 ? 'text-amber-600' : 'text-red-500'"
+                       x-text="state.margin_ratio > 0 && state.margin_ratio < 999 ? state.margin_ratio.toFixed(2) + 'x' : '—'"></p>
+                </div>
+                <div>
+                    <p class="text-xs text-slate-400 mb-1">Collateral dYdX</p>
+                    <p class="text-sm font-semibold text-slate-700"
+                       x-text="'$' + state.dydx_collateral.toFixed(2)"></p>
+                </div>
+            </div>
+        </div>
+
         <!-- Chart -->
         {% include "partials/chart.html" %}
     </div>

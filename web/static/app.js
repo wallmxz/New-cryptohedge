@@ -14,6 +14,9 @@ function dashboard() {
             total_fees_paid: 0, total_fees_earned: 0,
             connected_exchange: false, connected_chain: false,
             last_update: 0,
+            range_lower: 0, range_upper: 0, liquidity_l: 0,
+            dydx_collateral: 0, margin_ratio: 999, out_of_range: false,
+            current_grid: [],
         },
 
         config: {
