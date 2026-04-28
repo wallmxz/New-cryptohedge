@@ -82,6 +82,26 @@ CREATE TABLE IF NOT EXISTS grid_orders (
 );
 CREATE INDEX IF NOT EXISTS idx_grid_orders_active ON grid_orders(cloid)
     WHERE cancelled_at IS NULL AND fill_id IS NULL;
+
+CREATE TABLE IF NOT EXISTS operations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    status TEXT NOT NULL,
+    baseline_eth_price REAL,
+    baseline_pool_value_usd REAL,
+    baseline_amount0 REAL,
+    baseline_amount1 REAL,
+    baseline_collateral REAL,
+    perp_fees_paid REAL DEFAULT 0,
+    funding_paid REAL DEFAULT 0,
+    lp_fees_earned REAL DEFAULT 0,
+    bootstrap_slippage REAL DEFAULT 0,
+    final_net_pnl REAL,
+    close_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_operations_active ON operations(status)
+    WHERE status IN ('starting', 'active', 'stopping');
 """
 
 
@@ -94,6 +114,17 @@ class Database:
         self._conn = await aiosqlite.connect(self._path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(SCHEMA)
+        await self._conn.commit()
+        # Migrations: add operation_id column if missing
+        for stmt in (
+            "ALTER TABLE fills ADD COLUMN operation_id INTEGER",
+            "ALTER TABLE grid_orders ADD COLUMN operation_id INTEGER",
+            "ALTER TABLE order_log ADD COLUMN operation_id INTEGER",
+        ):
+            try:
+                await self._conn.execute(stmt)
+            except Exception:
+                pass  # column already exists
         await self._conn.commit()
 
     async def close(self) -> None:
@@ -125,14 +156,15 @@ class Database:
         self, *, timestamp: float, exchange: str, symbol: str, side: str,
         size: float, price: float, fee: float, fee_currency: str,
         liquidity: str, realized_pnl: float, order_id: str,
+        operation_id: int | None = None,
     ) -> int:
         cursor = await self._conn.execute(
             """INSERT INTO fills
             (timestamp, exchange, symbol, side, size, price, fee, fee_currency,
-             liquidity, realized_pnl, order_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+             liquidity, realized_pnl, order_id, operation_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (timestamp, exchange, symbol, side, size, price, fee, fee_currency,
-             liquidity, realized_pnl, order_id),
+             liquidity, realized_pnl, order_id, operation_id),
         )
         await self._conn.commit()
         return cursor.lastrowid
@@ -210,12 +242,13 @@ class Database:
         self, *, timestamp: float, exchange: str, action: str,
         side: str | None = None, size: float | None = None,
         price: float | None = None, reason: str | None = None,
+        operation_id: int | None = None,
     ) -> None:
         await self._conn.execute(
             """INSERT INTO order_log
-            (timestamp, exchange, action, side, size, price, reason)
-            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (timestamp, exchange, action, side, size, price, reason),
+            (timestamp, exchange, action, side, size, price, reason, operation_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (timestamp, exchange, action, side, size, price, reason, operation_id),
         )
         await self._conn.commit()
 
@@ -244,12 +277,12 @@ class Database:
 
     async def insert_grid_order(
         self, *, cloid: str, side: str, target_price: float,
-        size: float, placed_at: float,
+        size: float, placed_at: float, operation_id: int | None = None,
     ) -> None:
         await self._conn.execute(
-            """INSERT INTO grid_orders (cloid, side, target_price, size, placed_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (cloid, side, target_price, size, placed_at),
+            """INSERT INTO grid_orders (cloid, side, target_price, size, placed_at, operation_id)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (cloid, side, target_price, size, placed_at, operation_id),
         )
         await self._conn.commit()
 
@@ -275,3 +308,71 @@ class Database:
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+
+    async def insert_operation(
+        self, *, started_at: float, status: str,
+        baseline_eth_price: float, baseline_pool_value_usd: float,
+        baseline_amount0: float, baseline_amount1: float, baseline_collateral: float,
+    ) -> int:
+        cursor = await self._conn.execute(
+            """INSERT INTO operations
+               (started_at, status, baseline_eth_price, baseline_pool_value_usd,
+                baseline_amount0, baseline_amount1, baseline_collateral)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (started_at, status, baseline_eth_price, baseline_pool_value_usd,
+             baseline_amount0, baseline_amount1, baseline_collateral),
+        )
+        await self._conn.commit()
+        return cursor.lastrowid
+
+    async def update_operation_status(self, op_id: int, status: str) -> None:
+        await self._conn.execute(
+            "UPDATE operations SET status = ? WHERE id = ?", (status, op_id),
+        )
+        await self._conn.commit()
+
+    async def close_operation(
+        self, op_id: int, *, ended_at: float, final_net_pnl: float, close_reason: str,
+    ) -> None:
+        await self._conn.execute(
+            """UPDATE operations
+               SET status = 'closed', ended_at = ?, final_net_pnl = ?, close_reason = ?
+               WHERE id = ?""",
+            (ended_at, final_net_pnl, close_reason, op_id),
+        )
+        await self._conn.commit()
+
+    async def get_operation(self, op_id: int) -> dict | None:
+        cursor = await self._conn.execute(
+            "SELECT * FROM operations WHERE id = ?", (op_id,),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_active_operation(self) -> dict | None:
+        cursor = await self._conn.execute(
+            """SELECT * FROM operations
+               WHERE status IN ('starting', 'active', 'stopping')
+               ORDER BY started_at DESC LIMIT 1"""
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_operations(self, limit: int = 20) -> list[dict]:
+        cursor = await self._conn.execute(
+            "SELECT * FROM operations ORDER BY started_at DESC LIMIT ?", (limit,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def add_to_operation_accumulator(self, op_id: int, field: str, delta: float) -> None:
+        """Atomically add `delta` to one of: perp_fees_paid, funding_paid,
+        lp_fees_earned, bootstrap_slippage."""
+        allowed = {"perp_fees_paid", "funding_paid", "lp_fees_earned", "bootstrap_slippage"}
+        if field not in allowed:
+            raise ValueError(f"field must be one of {allowed}, got {field}")
+        await self._conn.execute(
+            f"UPDATE operations SET {field} = {field} + ? WHERE id = ?",
+            (delta, op_id),
+        )
+        await self._conn.commit()
