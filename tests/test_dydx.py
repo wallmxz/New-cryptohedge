@@ -1,3 +1,6 @@
+import time
+from decimal import Decimal
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from exchanges.dydx import DydxAdapter, MarketMeta
@@ -29,3 +32,36 @@ async def test_dydx_get_market_meta_eth_usd(monkeypatch):
         assert meta.tick_size == 0.1
         assert meta.step_size == 0.001
         assert meta.atomic_resolution == -9
+
+
+@pytest.mark.asyncio
+async def test_dydx_place_long_term_order():
+    """place_long_term_order returns Order with cloid mapped."""
+    node = MagicMock()
+    node.latest_block_height = AsyncMock(return_value=100)
+    node.place_order = AsyncMock(return_value={"hash": "0xtxhash"})
+
+    adapter = DydxAdapter(mnemonic="m", wallet_address="dydx1test")
+    adapter._node = node
+    adapter._wallet = MagicMock()
+    adapter._market_metas = {"ETH-USD": MarketMeta("ETH-USD", 0.1, 0.001, -9, 1000000)}
+
+    with patch("exchanges.dydx.Market") as MockMarket:
+        market_instance = MagicMock()
+        market_instance.order_id = MagicMock(return_value="oid123")
+        market_instance.order = MagicMock(return_value="order_obj")
+        MockMarket.return_value = market_instance
+        adapter._indexer = MagicMock()
+        adapter._indexer.markets.get_perpetual_markets = AsyncMock(
+            return_value={"markets": {"ETH-USD": {"ticker": "ETH-USD"}}}
+        )
+
+        order = await adapter.place_long_term_order(
+            symbol="ETH-USD", side="sell", size=0.001, price=3050.0,
+            cloid_int=42, ttl_seconds=86400,
+        )
+        assert order.symbol == "ETH-USD"
+        assert order.side == "sell"
+        assert order.size == 0.001
+        assert order.price == 3050.0
+        assert order.status == "open"

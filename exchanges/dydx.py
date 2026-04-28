@@ -10,14 +10,19 @@ SDK deviations from the task reference code:
 """
 from __future__ import annotations
 import logging
+import time
 from dataclasses import dataclass
 from typing import Callable
 
+from dydx_v4_client import OrderFlags
 from dydx_v4_client.network import make_mainnet, make_testnet
 from dydx_v4_client.node.client import NodeClient
+from dydx_v4_client.node.market import Market
+from dydx_v4_client.indexer.rest.constants import OrderType
 from dydx_v4_client.indexer.rest.indexer_client import IndexerClient
 from dydx_v4_client.indexer.socket.websocket import IndexerSocket
 from dydx_v4_client.wallet import Wallet
+from v4_proto.dydxprotocol.clob.order_pb2 import Order as ProtoOrder
 
 from exchanges.base import ExchangeAdapter, Order, Fill, Position
 
@@ -97,8 +102,54 @@ class DydxAdapter(ExchangeAdapter):
     # The remaining methods on ExchangeAdapter ABC are placeholder stubs.
     # They will be implemented in Tasks 10-13.
 
+    async def place_long_term_order(
+        self, *, symbol: str, side: str, size: float, price: float,
+        cloid_int: int, ttl_seconds: int = 86400,
+    ) -> Order:
+        """Place a long-term limit order on dYdX v4.
+
+        cloid_int: int 0..2^32-1 used as client_id. Must be unique per (subaccount, market).
+        """
+        # Need market data from indexer
+        market_data = await self._indexer.markets.get_perpetual_markets(symbol)
+        market = Market(market_data["markets"][symbol])
+
+        order_id = market.order_id(
+            self._wallet_address, self._subaccount, cloid_int, OrderFlags.LONG_TERM,
+        )
+
+        proto_side = ProtoOrder.Side.SIDE_SELL if side == "sell" else ProtoOrder.Side.SIDE_BUY
+        good_til_block_time = int(time.time()) + ttl_seconds
+
+        new_order = market.order(
+            order_id=order_id,
+            order_type=OrderType.LIMIT,
+            side=proto_side,
+            size=size,
+            price=price,
+            time_in_force=ProtoOrder.TimeInForce.TIME_IN_FORCE_UNSPECIFIED,
+            reduce_only=False,
+            good_til_block_time=good_til_block_time,
+        )
+        tx = await self._node.place_order(wallet=self._wallet, order=new_order)
+        if hasattr(self._wallet, "sequence"):
+            self._wallet.sequence += 1
+
+        return Order(
+            order_id=str(cloid_int),
+            symbol=symbol,
+            side=side,
+            size=size,
+            price=price,
+            status="open",
+        )
+
     async def place_limit_order(self, symbol, side, size, price):
-        raise NotImplementedError("Implementado em Task 10")
+        """ABC-required compat. Delegates to place_long_term_order with auto-generated cloid."""
+        cloid = int(time.time() * 1000) % (2**31)
+        return await self.place_long_term_order(
+            symbol=symbol, side=side, size=size, price=price, cloid_int=cloid,
+        )
 
     async def cancel_order(self, order_id):
         raise NotImplementedError("Implementado em Task 11")
