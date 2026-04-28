@@ -53,7 +53,7 @@ def create_app(start_engine: bool = True) -> Starlette:
         app.state.db = db
         if start_engine:
             from engine import Engine
-            engine = Engine(settings, state, db)
+            engine = Engine(settings=settings, hub=state, db=db)
             await engine.start()
             app.state.engine = engine
         yield
