@@ -106,3 +106,44 @@ async def test_dydx_batch_place():
     assert len(placed) == 2
     assert placed[0].order_id == "1"
     assert placed[1].order_id == "2"
+
+
+@pytest.mark.asyncio
+async def test_dydx_get_position_open():
+    """When subaccount has open position in ETH-USD, returns Position."""
+    indexer = MagicMock()
+    indexer.account.get_subaccount = AsyncMock(return_value={
+        "subaccount": {
+            "openPerpetualPositions": {
+                "ETH-USD": {
+                    "market": "ETH-USD",
+                    "size": "-0.05",  # negative = short
+                    "entryPrice": "3000",
+                    "unrealizedPnl": "5.0",
+                    "status": "OPEN",
+                }
+            }
+        }
+    })
+    adapter = DydxAdapter(mnemonic="m", wallet_address="dydx1test")
+    adapter._indexer = indexer
+
+    pos = await adapter.get_position("ETH-USD")
+    assert pos is not None
+    assert pos.symbol == "ETH-USD"
+    assert pos.side == "short"
+    assert abs(pos.size - 0.05) < 1e-9
+    assert pos.entry_price == 3000.0
+    assert pos.unrealized_pnl == 5.0
+
+
+@pytest.mark.asyncio
+async def test_dydx_get_position_none_when_empty():
+    indexer = MagicMock()
+    indexer.account.get_subaccount = AsyncMock(return_value={
+        "subaccount": {"openPerpetualPositions": {}}
+    })
+    adapter = DydxAdapter(mnemonic="m", wallet_address="dydx1test")
+    adapter._indexer = indexer
+    pos = await adapter.get_position("ETH-USD")
+    assert pos is None

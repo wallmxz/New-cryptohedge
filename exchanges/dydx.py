@@ -13,6 +13,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable
 
 from dydx_v4_client import OrderFlags
@@ -33,6 +34,27 @@ logger = logging.getLogger(__name__)
 MAINNET_REST_INDEXER = "https://indexer.dydx.trade"
 MAINNET_WEBSOCKET_INDEXER = "wss://indexer.dydx.trade/v4/ws"
 MAINNET_NODE_URL = "dydx-grpc.publicnode.com:443"
+
+
+def _parse_created_at(value) -> float:
+    """Parse indexer `createdAt` to unix seconds; tolerate ISO 8601, numeric, or missing."""
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        # Numeric string fallback
+        try:
+            return float(value)
+        except ValueError:
+            pass
+        # ISO 8601 (e.g. "2024-05-01T12:34:56.789Z")
+        try:
+            iso = value.replace("Z", "+00:00")
+            return datetime.fromisoformat(iso).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
 @dataclass
@@ -199,11 +221,70 @@ class DydxAdapter(ExchangeAdapter):
             await asyncio.sleep(0.05)
         return cancelled
 
-    async def get_position(self, symbol):
-        raise NotImplementedError("Implementado em Task 12")
+    async def get_position(self, symbol: str) -> Position | None:
+        """Read current open position for symbol via indexer subaccount endpoint."""
+        sub = await self._indexer.account.get_subaccount(
+            address=self._wallet_address,
+            subaccount_number=self._subaccount,
+        )
+        positions = sub.get("subaccount", {}).get("openPerpetualPositions", {})
+        pos = positions.get(symbol)
+        if not pos or pos.get("status") != "OPEN":
+            return None
+        raw_size = float(pos["size"])
+        if raw_size == 0:
+            return None
+        return Position(
+            symbol=symbol,
+            side="long" if raw_size > 0 else "short",
+            size=abs(raw_size),
+            entry_price=float(pos.get("entryPrice", "0")),
+            unrealized_pnl=float(pos.get("unrealizedPnl", "0")),
+        )
 
-    async def get_fills(self, symbol, since=None):
-        raise NotImplementedError("Implementado em Task 12")
+    async def get_collateral(self) -> float:
+        """Total collateral (equity) in subaccount, in quote (USDC)."""
+        sub = await self._indexer.account.get_subaccount(
+            address=self._wallet_address,
+            subaccount_number=self._subaccount,
+        )
+        return float(sub.get("subaccount", {}).get("equity", "0"))
+
+    async def get_fills(self, symbol: str, since: float | None = None) -> list[Fill]:
+        """Fetch recent fills for symbol from indexer; filter by timestamp if since set.
+
+        SDK note: indexer returns `createdAt` as an ISO 8601 string. We convert to
+        a unix timestamp (float seconds) for the Fill dataclass and the `since`
+        comparison; if parsing fails we fall back to 0.0.
+        """
+        resp = await self._indexer.account.get_subaccount_fills(
+            address=self._wallet_address,
+            subaccount_number=self._subaccount,
+            ticker=symbol,
+            limit=100,
+        )
+        fills: list[Fill] = []
+        for f in resp.get("fills", []):
+            ts = _parse_created_at(f.get("createdAt"))
+            if since is not None and ts < since:
+                continue
+            liquidity = str(f.get("liquidity", "TAKER")).lower()
+            if liquidity not in ("maker", "taker"):
+                liquidity = "taker"
+            fills.append(Fill(
+                fill_id=str(f.get("id", "")),
+                order_id=str(f.get("orderId", "")),
+                symbol=f.get("market", symbol),
+                side=str(f.get("side", "BUY")).lower(),
+                size=float(f.get("size", "0")),
+                price=float(f.get("price", "0")),
+                fee=float(f.get("fee", "0")),
+                fee_currency="USDC",
+                liquidity=liquidity,
+                realized_pnl=float(f.get("realizedPnl", "0")),
+                timestamp=ts,
+            ))
+        return fills
 
     async def subscribe_orderbook(self, symbol, callback):
         raise NotImplementedError("Implementado em Task 13")
