@@ -2,7 +2,7 @@ from __future__ import annotations
 import asyncio
 import json
 from starlette.requests import Request
-from starlette.responses import HTMLResponse
+from starlette.responses import HTMLResponse, JSONResponse
 from starlette.templating import Jinja2Templates
 from sse_starlette.sse import EventSourceResponse
 
@@ -20,6 +20,7 @@ async def dashboard(request: Request):
         "hub": hub,
         "stats": stats,
         "snapshots_json": json.dumps(snapshots),
+        "logs_json": json.dumps(logs),
         "logs": logs,
     })
 
@@ -55,6 +56,22 @@ async def sse_logs(request: Request):
     return EventSourceResponse(event_generator())
 
 
+async def get_config(request: Request):
+    settings = request.app.state.settings
+    return JSONResponse({
+        "arbitrum_rpc_url": settings.arbitrum_rpc_url,
+        "arbitrum_rpc_fallback": settings.arbitrum_rpc_fallback,
+        "clm_vault_address": settings.clm_vault_address,
+        "clm_pool_address": settings.clm_pool_address,
+        "wallet_address": settings.wallet_address,
+        "active_exchange": settings.active_exchange,
+        "symbol": settings.hyperliquid_symbol if settings.active_exchange == "hyperliquid" else settings.dydx_symbol,
+        "alert_webhook_url": settings.alert_webhook_url,
+        "pool_token0_symbol": settings.pool_token0_symbol,
+        "pool_token1_symbol": settings.pool_token1_symbol,
+    })
+
+
 async def update_settings(request: Request):
     hub = request.app.state.hub
     db = request.app.state.db
@@ -69,5 +86,14 @@ async def update_settings(request: Request):
     if "repost_depth" in form:
         hub.repost_depth = int(form["repost_depth"])
         await db.set_config("repost_depth", str(hub.repost_depth))
+    if "pool_deposited_usd" in form:
+        hub.pool_deposited_usd = float(form["pool_deposited_usd"])
+        await db.set_config("pool_deposited_usd", str(hub.pool_deposited_usd))
+    if "active_exchange" in form:
+        await db.set_config("active_exchange", form["active_exchange"])
+    if "symbol" in form:
+        await db.set_config("symbol", form["symbol"])
+    if "alert_webhook_url" in form:
+        await db.set_config("alert_webhook_url", form["alert_webhook_url"])
 
-    return HTMLResponse('<div id="settings-status">Settings saved</div>')
+    return HTMLResponse('<div id="settings-status">Configuracoes salvas (reinicie o engine para aplicar mudancas de exchange/symbol)</div>')

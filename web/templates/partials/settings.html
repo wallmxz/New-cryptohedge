@@ -1,10 +1,100 @@
-<div class="card" x-data="{ saving: false }">
-    <h2 class="text-sm font-medium text-gray-400 mb-3">SETTINGS</h2>
-    <form hx-post="/settings" hx-target="#settings-status" hx-swap="innerHTML" @htmx:after-request="saving = false" @submit="saving = true" class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-        <label class="space-y-1"><span class="text-gray-400">Hedge ratio</span><input type="number" name="hedge_ratio" step="0.01" min="0" max="1" :value="state.hedge_ratio" class="w-full bg-dark-900 border border-gray-700 rounded px-2 py-1 text-white font-mono"></label>
-        <label class="space-y-1"><span class="text-gray-400">Max exposure</span><input type="number" name="max_exposure_pct" step="0.01" min="0" max="1" :value="state.max_exposure_pct" class="w-full bg-dark-900 border border-gray-700 rounded px-2 py-1 text-white font-mono"></label>
-        <label class="space-y-1"><span class="text-gray-400">Repost depth</span><input type="number" name="repost_depth" step="1" min="1" max="10" :value="state.repost_depth" class="w-full bg-dark-900 border border-gray-700 rounded px-2 py-1 text-white font-mono"></label>
-        <div class="flex items-end"><button type="submit" class="bg-accent-blue/20 text-accent-blue px-4 py-1 rounded hover:bg-accent-blue/30 transition" :disabled="saving" x-text="saving ? 'Saving...' : 'Save'">Save</button></div>
-    </form>
-    <div id="settings-status" class="text-xs text-accent-green mt-2"></div>
-</div>
+<template x-if="showSettings">
+    <div class="modal-overlay" @click.self="showSettings = false">
+        <div class="modal-box" @click.stop>
+            <div class="flex items-center justify-between mb-6">
+                <h2 class="text-lg font-bold text-slate-800">Configuracoes</h2>
+                <button @click="showSettings = false" class="text-slate-400 hover:text-slate-600 transition p-1 rounded-lg hover:bg-slate-100">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                </button>
+            </div>
+
+            <div class="flex gap-2 mb-6">
+                <button class="modal-tab" :class="settingsTab === 'trading' && 'modal-tab-active'" @click="settingsTab = 'trading'">Trading</button>
+                <button class="modal-tab" :class="settingsTab === 'rede' && 'modal-tab-active'" @click="settingsTab = 'rede'">Rede</button>
+                <button class="modal-tab" :class="settingsTab === 'exchange' && 'modal-tab-active'" @click="settingsTab = 'exchange'">Exchange</button>
+                <button class="modal-tab" :class="settingsTab === 'alertas' && 'modal-tab-active'" @click="settingsTab = 'alertas'">Alertas</button>
+            </div>
+
+            <form hx-post="/settings" hx-target="#settings-status" hx-swap="innerHTML">
+
+                <div x-show="settingsTab === 'trading'" class="space-y-4">
+                    <div class="cfg-group">
+                        <label class="cfg-label">Ratio do hedge</label>
+                        <input type="number" name="hedge_ratio" step="0.01" min="0" max="1" :value="state.hedge_ratio" class="cfg-input">
+                        <p class="cfg-hint">Percentual da posicao hedgeado. 0.95 = 95%</p>
+                    </div>
+                    <div class="cfg-group">
+                        <label class="cfg-label">Exposicao maxima</label>
+                        <input type="number" name="max_exposure_pct" step="0.01" min="0" max="1" :value="state.max_exposure_pct" class="cfg-input">
+                        <p class="cfg-hint">Acima deste limite, ordens agressivas sao usadas. 0.05 = 5%</p>
+                    </div>
+                    <div class="cfg-group">
+                        <label class="cfg-label">Reposicionar no nivel</label>
+                        <input type="number" name="repost_depth" step="1" min="1" max="10" :value="state.repost_depth" class="cfg-input">
+                        <p class="cfg-hint">Cancela e recoloca se a ordem cair para este nivel no book</p>
+                    </div>
+                    <div class="cfg-group">
+                        <label class="cfg-label">Valor depositado na pool (USD)</label>
+                        <input type="number" name="pool_deposited_usd" step="0.01" min="0" :value="state.pool_deposited_usd" class="cfg-input" placeholder="0.00">
+                        <p class="cfg-hint">Valor inicial depositado — usado como baseline do PnL da pool</p>
+                    </div>
+                </div>
+
+                <div x-show="settingsTab === 'rede'" x-cloak class="space-y-4">
+                    <div class="cfg-group">
+                        <label class="cfg-label">RPC URL (Arbitrum)</label>
+                        <input type="text" :value="config.arbitrum_rpc_url" class="cfg-input" disabled>
+                    </div>
+                    <div class="cfg-group">
+                        <label class="cfg-label">RPC Fallback</label>
+                        <input type="text" :value="config.arbitrum_rpc_fallback" class="cfg-input" disabled>
+                    </div>
+                    <div class="cfg-group">
+                        <label class="cfg-label">Vault CLM (Beefy)</label>
+                        <input type="text" :value="config.clm_vault_address" class="cfg-input" disabled>
+                    </div>
+                    <div class="cfg-group">
+                        <label class="cfg-label">Pool (Uniswap V3)</label>
+                        <input type="text" :value="config.clm_pool_address" class="cfg-input" disabled>
+                    </div>
+                    <p class="cfg-hint">Valores definidos no .env — reinicie o bot para alterar</p>
+                </div>
+
+                <div x-show="settingsTab === 'exchange'" x-cloak class="space-y-4">
+                    <div class="cfg-group">
+                        <label class="cfg-label">Exchange ativa</label>
+                        <select name="active_exchange" class="cfg-input">
+                            <option value="hyperliquid" :selected="config.active_exchange === 'hyperliquid'">Hyperliquid</option>
+                            <option value="dydx" :selected="config.active_exchange === 'dydx'">dYdX v4</option>
+                        </select>
+                    </div>
+                    <div class="cfg-group">
+                        <label class="cfg-label">Simbolo</label>
+                        <input type="text" name="symbol" :value="config.symbol" class="cfg-input">
+                    </div>
+                    <div class="cfg-group">
+                        <label class="cfg-label">Wallet</label>
+                        <input type="text" :value="config.wallet_address" class="cfg-input" disabled>
+                        <p class="cfg-hint">Definido no .env</p>
+                    </div>
+                </div>
+
+                <div x-show="settingsTab === 'alertas'" x-cloak class="space-y-4">
+                    <div class="cfg-group">
+                        <label class="cfg-label">Webhook URL</label>
+                        <input type="text" name="alert_webhook_url" :value="config.alert_webhook_url" class="cfg-input" placeholder="https://hooks.slack.com/...">
+                        <p class="cfg-hint">Receba alertas quando o bot entrar em modo seguro (Telegram, Discord, Slack)</p>
+                    </div>
+                </div>
+
+                <div class="flex items-center justify-between mt-6 pt-5 border-t border-slate-200">
+                    <div id="settings-status" class="text-xs text-emerald-600 font-medium"></div>
+                    <div class="flex gap-3">
+                        <button type="button" @click="showSettings = false" class="px-4 py-2 text-sm text-slate-500 hover:text-slate-700 hover:bg-slate-100 rounded-10 transition">Fechar</button>
+                        <button type="submit" class="px-5 py-2 text-sm bg-indigo-600 text-white rounded-10 hover:bg-indigo-700 transition font-medium" style="border-radius:10px">Salvar</button>
+                    </div>
+                </div>
+            </form>
+        </div>
+    </div>
+</template>

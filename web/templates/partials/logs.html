@@ -1,14 +1,16 @@
-<div class="card" hx-ext="sse" sse-connect="/sse/logs">
-    <h2 class="text-sm font-medium text-gray-400 mb-3">ACTIVITY LOG</h2>
-    <div id="log-list" class="font-mono text-xs space-y-1 max-h-64 overflow-y-auto" sse-swap="new-log" hx-swap="afterbegin">
-        {% for log in logs %}
-        <div class="flex gap-2">
-            <span class="text-gray-500">{{ log.timestamp|int }}</span>
-            <span class="{% if log.action == 'fill' %}text-accent-green{% elif log.action == 'cancel' %}text-accent-red{% else %}text-gray-300{% endif %}">
-                {{ log.action|upper }} {{ log.side or '' }} {{ log.size or '' }} @ {{ log.price or '' }}
-            </span>
-            {% if log.reason %}<span class="text-gray-600">{{ log.reason }}</span>{% endif %}
-        </div>
-        {% endfor %}
+<div class="card">
+    <p class="card-title">Registro de atividade</p>
+    <div class="max-h-64 overflow-y-auto space-y-1">
+        <template x-for="log in logs" :key="log.id || (log.timestamp + '-' + log.action)">
+            <div class="log-entry">
+                <span class="text-slate-400" x-text="new Date((log.timestamp||0)*1000).toLocaleTimeString()"></span>
+                <span class="font-medium"
+                      :class="log.action === 'fill' ? 'text-emerald-600' : log.action === 'cancel' ? 'text-red-500' : 'text-slate-500'"
+                      x-text="(log.action||'').toUpperCase()"></span>
+                <span x-text="(log.side || '') + ' ' + (log.size ? Number(log.size).toFixed(2) : '') + (log.price ? ' @ ' + Number(log.price).toFixed(4) : '')"></span>
+                <span x-show="log.reason" class="text-slate-400" x-text="log.reason"></span>
+            </div>
+        </template>
+        <div x-show="logs.length === 0" class="text-center py-8 text-slate-400 text-sm">Nenhuma atividade ainda</div>
     </div>
 </div>

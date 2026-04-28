@@ -23,6 +23,10 @@ class Settings:
     max_exposure_pct: float
     repost_depth: int
     active_exchange: str
+    pool_token0_symbol: str
+    pool_token1_symbol: str
+    pool_token1_is_stable: bool
+    pool_token1_usd_price: float
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -45,4 +49,8 @@ class Settings:
             max_exposure_pct=float(os.environ.get("MAX_EXPOSURE_PCT", "0.05")),
             repost_depth=int(os.environ.get("REPOST_DEPTH", "3")),
             active_exchange=os.environ.get("ACTIVE_EXCHANGE", "hyperliquid"),
+            pool_token0_symbol=os.environ.get("POOL_TOKEN0_SYMBOL", os.environ.get("HYPERLIQUID_SYMBOL", "ARB")),
+            pool_token1_symbol=os.environ.get("POOL_TOKEN1_SYMBOL", "USDC"),
+            pool_token1_is_stable=os.environ.get("POOL_TOKEN1_IS_STABLE", "true").lower() == "true",
+            pool_token1_usd_price=float(os.environ.get("POOL_TOKEN1_USD_PRICE", "1.0")),
         )

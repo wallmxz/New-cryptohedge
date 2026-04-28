@@ -12,18 +12,21 @@ class HedgeDecision:
 
 
 def compute_hedge_action(
-    *, pool_value_usd: float, token_exposure_ratio: float,
+    *, token_exposure_base: float,
     hedge_ratio: float, current_hedge_size: float,
     max_exposure_pct: float, safe_mode: bool = False,
 ) -> HedgeDecision:
-    if safe_mode or pool_value_usd <= 0:
+    # token_exposure_base: amount of the hedged token currently held in the pool
+    # (base units, e.g. ARB). target_hedge and current_hedge_size must be in the
+    # same base units so delta is unit-consistent.
+    if safe_mode or token_exposure_base <= 0:
         return HedgeDecision(action="HOLD", side=None, delta=0.0, exposure_pct=0.0, target_hedge=0.0)
 
-    target_hedge = pool_value_usd * token_exposure_ratio * hedge_ratio
+    target_hedge = token_exposure_base * hedge_ratio
     delta = target_hedge - current_hedge_size
-    exposure_pct = abs(delta) / pool_value_usd if pool_value_usd > 0 else 0.0
+    exposure_pct = abs(delta) / token_exposure_base
 
-    if abs(delta) < 0.01:
+    if abs(delta) < 1e-6:
         return HedgeDecision(action="HOLD", side=None, delta=0.0, exposure_pct=exposure_pct, target_hedge=target_hedge)
 
     side = "sell" if delta > 0 else "buy"

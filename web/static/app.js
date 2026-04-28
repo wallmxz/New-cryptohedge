@@ -1,5 +1,9 @@
 function dashboard() {
     return {
+        activeTab: 'painel',
+        showSettings: false,
+        settingsTab: 'trading',
+
         state: {
             pool_value_usd: 0, pool_deposited_usd: 0, pool_tokens: {},
             hedge_position: null, hedge_unrealized_pnl: 0, hedge_realized_pnl: 0,
@@ -9,16 +13,51 @@ function dashboard() {
             total_maker_volume: 0, total_taker_volume: 0,
             total_fees_paid: 0, total_fees_earned: 0,
             connected_exchange: false, connected_chain: false,
+            last_update: 0,
         },
-        lastUpdate: '-',
-        bookAsks: [],
-        bookBids: [],
+
+        config: {
+            arbitrum_rpc_url: '',
+            arbitrum_rpc_fallback: '',
+            clm_vault_address: '',
+            clm_pool_address: '',
+            wallet_address: '',
+            active_exchange: 'hyperliquid',
+            symbol: 'ARB',
+            alert_webhook_url: '',
+            pool_token0_symbol: 'ARB',
+            pool_token1_symbol: 'USDC',
+        },
+
+        logs: [],
+        lastUpdate: '—',
+
+        get hasBook() {
+            return this.state.best_bid > 0 && this.state.best_ask > 0;
+        },
+
+        get spreadTicks() {
+            if (!this.hasBook) return 0;
+            return (this.state.best_ask - this.state.best_bid) * 10000;
+        },
+
+        get myBid() {
+            return this.state.my_order && this.state.my_order.side === 'buy' ? this.state.my_order : null;
+        },
+
+        get myAsk() {
+            return this.state.my_order && this.state.my_order.side === 'sell' ? this.state.my_order : null;
+        },
+
+        get tokenBase() {
+            return this.state.pool_tokens[this.config.pool_token0_symbol] || 0;
+        },
 
         get exposurePct() {
-            if (this.state.pool_value_usd <= 0) return 0;
-            const target = this.state.pool_value_usd * 0.5 * this.state.hedge_ratio;
+            if (this.tokenBase <= 0) return 0;
+            const target = this.tokenBase * this.state.hedge_ratio;
             const current = this.state.hedge_position ? this.state.hedge_position.size : 0;
-            return Math.abs(target - current) / this.state.pool_value_usd;
+            return Math.abs(target - current) / this.tokenBase;
         },
 
         get pnl() {
@@ -29,14 +68,33 @@ function dashboard() {
         },
 
         init() {
+            fetch('/config')
+                .then(r => r.json())
+                .then(data => Object.assign(this.config, data))
+                .catch(() => {});
+
             const es = new EventSource('/sse/state');
             es.addEventListener('state-update', (e) => {
                 const data = JSON.parse(e.data);
-                Object.assign(this.state, data);
-                this.lastUpdate = new Date().toLocaleTimeString();
+                for (const key of Object.keys(this.state)) {
+                    if (key in data) this.state[key] = data[key];
+                }
+                this.lastUpdate = new Date(this.state.last_update * 1000).toLocaleTimeString();
                 if (window.updateChart) window.updateChart(data);
             });
-            if (typeof initialSnapshots !== 'undefined' && window.initChart) window.initChart(initialSnapshots);
+
+            const esLogs = new EventSource('/sse/logs');
+            esLogs.addEventListener('new-log', (e) => {
+                const entry = JSON.parse(e.data);
+                this.logs.unshift(entry);
+                if (this.logs.length > 100) this.logs.pop();
+            });
+
+            if (typeof initialLogs !== 'undefined') this.logs = initialLogs.slice(0, 100);
+
+            if (typeof initialSnapshots !== 'undefined' && window.initChart) {
+                window.initChart(initialSnapshots);
+            }
         }
     };
 }

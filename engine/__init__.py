@@ -73,17 +73,25 @@ class Engine:
         self._hub.cow_balance = data["cow_balance"]
         self._hub.cow_total_supply = data["total_supply"]
         self._hub.vault_balances = (data["vault_token0"], data["vault_token1"])
-        price_token0 = self._hub.best_bid if self._hub.best_bid > 0 else 1.0
+        price_token0 = self._hub.best_bid if self._hub.best_bid > 0 else 0.0
+        if price_token0 <= 0:
+            # No live quote yet — defer valuation until exchange book arrives.
+            self._hub.last_update = time.time()
+            return
+        price_token1 = 1.0 if self._settings.pool_token1_is_stable else self._settings.pool_token1_usd_price
         pos = calc_pool_position(
             cow_balance=data["cow_balance"],
             total_supply=data["total_supply"],
             vault_token0=data["vault_token0"],
             vault_token1=data["vault_token1"],
             price_token0_usd=price_token0,
-            price_token1_usd=1.0,
+            price_token1_usd=price_token1,
         )
         self._hub.pool_value_usd = pos["value_usd"]
-        self._hub.pool_tokens = {"ARB": pos["my_token0"], "WETH": pos["my_token1"]}
+        self._hub.pool_tokens = {
+            self._settings.pool_token0_symbol: pos["my_token0"],
+            self._settings.pool_token1_symbol: pos["my_token1"],
+        }
         self._hub.last_update = time.time()
 
     async def _on_book_update(self, data: dict) -> None:
@@ -146,8 +154,9 @@ class Engine:
             self._hub.hedge_position = {"side": pos.side, "size": pos.size, "entry": pos.entry_price}
             self._hub.hedge_unrealized_pnl = pos.unrealized_pnl
 
+        token_exposure_base = self._hub.pool_tokens.get(self._settings.pool_token0_symbol, 0.0)
         decision = compute_hedge_action(
-            pool_value_usd=self._hub.pool_value_usd, token_exposure_ratio=0.5,
+            token_exposure_base=token_exposure_base,
             hedge_ratio=self._hub.hedge_ratio, current_hedge_size=current_hedge,
             max_exposure_pct=self._hub.max_exposure_pct, safe_mode=self._hub.safe_mode,
         )
