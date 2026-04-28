@@ -36,3 +36,15 @@ def test_statehub_snapshot():
     assert snap["pool_value_usd"] == 204.0
     assert snap["best_bid"] == 1.06
     assert "last_update" in snap
+
+
+def test_statehub_grid_fields_default():
+    from state import StateHub
+    s = StateHub()
+    assert s.range_lower == 0.0
+    assert s.range_upper == 0.0
+    assert s.liquidity_l == 0.0
+    assert s.current_grid == []
+    assert s.dydx_collateral == 0.0
+    assert s.margin_ratio == 0.0
+    assert s.out_of_range is False
