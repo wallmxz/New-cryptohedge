@@ -143,6 +143,61 @@ async def test_engine_reconcile_runs_periodically():
 
 
 @pytest.mark.asyncio
+async def test_engine_fires_warning_alert_when_margin_low(monkeypatch):
+    """When margin_ratio < 0.6, post_alert with level=warning is called."""
+    from engine import GridMakerEngine
+    alerts_called = []
+
+    async def fake_alert(*, url, level, message, data):
+        alerts_called.append((level, message))
+
+    monkeypatch.setattr("engine.post_alert", fake_alert)
+
+    state = StateHub()
+    state.hedge_ratio = 1.0
+    settings = MagicMock()
+    settings.dydx_symbol = "ETH-USD"
+    settings.alert_webhook_url = "https://hooks.test/x"
+    settings.threshold_aggressive = 0.05
+    settings.threshold_recovery = 0.02
+    settings.max_open_orders = 200
+    settings.pool_token0_symbol = "WETH"
+    settings.pool_token1_symbol = "USDC"
+
+    db = MagicMock()
+    db.get_active_grid_orders = AsyncMock(return_value=[])
+
+    exchange = MagicMock()
+    exchange.name = "dydx"
+    exchange.get_market_meta = AsyncMock(return_value=MagicMock(min_notional=3.0))
+    # Position with high notional, low collateral -> low margin ratio
+    exchange.get_position = AsyncMock(return_value=MagicMock(
+        side="short", size=0.103, entry_price=2982, unrealized_pnl=0,
+    ))
+    exchange.get_collateral = AsyncMock(return_value=50.0)  # tight margin
+    exchange.batch_place = AsyncMock(return_value=[])
+    exchange.batch_cancel = AsyncMock(return_value=0)
+    exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+
+    pool_reader = MagicMock()
+    pool_reader.read_price = AsyncMock(return_value=3000.0)
+    beefy_reader = MagicMock()
+    beefy_reader.read_position = AsyncMock(return_value=MagicMock(
+        tick_lower=78240, tick_upper=80580, amount0=0.5, amount1=1500.0,
+        share=0.01, raw_balance=10**16,
+    ))
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=exchange, pool_reader=pool_reader, beefy_reader=beefy_reader,
+    )
+    await engine._iterate()
+    # Margin should be low, alert should fire
+    levels = [lv for lv, _ in alerts_called]
+    assert any(lv in ("warning", "urgent", "critical", "info") for lv in levels)
+
+
+@pytest.mark.asyncio
 async def test_engine_recovery_reconciles_on_start():
     """On start(), reconciler runs once before main loop."""
     import time

@@ -14,6 +14,8 @@ from engine.curve import compute_l_from_value, compute_x, compute_target_grid, G
 from engine.grid import GridManager
 from engine.hedge import compute_hedge_action
 from engine.reconciler import Reconciler
+from engine.margin import compute_required_collateral, compute_margin_ratio, classify_margin
+from web.alerts import post_alert
 from web3 import AsyncWeb3, AsyncHTTPProvider
 
 logger = logging.getLogger(__name__)
@@ -50,6 +52,7 @@ class GridMakerEngine:
         self._reconciler: Reconciler | None = None
         self._iter_count = 0
         self.RECONCILE_EVERY_N_ITERATIONS = 30  # ~30s
+        self._last_alert_level: str | None = None
 
     def _ensure_reconciler(self):
         if self._reconciler is None and self._exchange is not None:
@@ -57,6 +60,25 @@ class GridMakerEngine:
                 db=self._db, exchange=self._exchange, settings=self._settings,
             )
         return self._reconciler
+
+    async def _check_margin_and_alert(self, peak_short_size: float, p_now: float):
+        required = compute_required_collateral(
+            peak_short_size=peak_short_size, current_price=p_now,
+        )
+        ratio = compute_margin_ratio(collateral=self._hub.dydx_collateral, required=required)
+        self._hub.margin_ratio = ratio
+        level = classify_margin(ratio)
+
+        if level != "healthy" and level != self._last_alert_level:
+            await post_alert(
+                url=self._settings.alert_webhook_url,
+                level=level,
+                message=f"Margin ratio is {ratio:.2f} (collateral=${self._hub.dydx_collateral:.2f}, required=${required:.2f})",
+                data={"ratio": ratio, "collateral": self._hub.dydx_collateral, "required": required},
+            )
+            self._last_alert_level = level
+        if level == "healthy":
+            self._last_alert_level = None
 
     async def _maybe_reconcile(self):
         if self._iter_count % self.RECONCILE_EVERY_N_ITERATIONS == 0:
@@ -179,6 +201,21 @@ class GridMakerEngine:
             denom = (1.0 / sqrt(p_a)) - (1.0 / sqrt(p_b))
             L_oor = my_amount0 / denom if denom > 0 else 0.0
             self._hub.liquidity_l = L_oor
+            # Refresh collateral so the margin check below sees current value.
+            try:
+                self._hub.dydx_collateral = await self._exchange.get_collateral()
+            except Exception:
+                pass
+            # Peak short = max(LP-implied peak at p_a, current actual short).
+            # Captures risk whether driven by LP needs or already-open position.
+            peak_lp = compute_x(L_oor, p_a, p_b) * self._hub.hedge_ratio
+            try:
+                pos_now = await self._exchange.get_position(self._settings.dydx_symbol)
+                cur_short = abs(pos_now.size) if pos_now else 0.0
+            except Exception:
+                cur_short = 0.0
+            peak_short = max(peak_lp, cur_short)
+            await self._check_margin_and_alert(peak_short, p_now)
             await self._handle_out_of_range_lower(p_a, p_b, L_oor)
             self._hub.last_update = time.time()
             return
@@ -186,6 +223,22 @@ class GridMakerEngine:
         self._hub.out_of_range = False
         L_user = compute_l_from_value(my_value, p_a, p_b, p_now)
         self._hub.liquidity_l = L_user
+
+        # Refresh collateral so margin check sees current exchange value.
+        try:
+            self._hub.dydx_collateral = await self._exchange.get_collateral()
+        except Exception:
+            pass
+        # Peak short = max(LP-implied peak at p_a, current actual short).
+        # Captures risk whether driven by LP needs or already-open position.
+        peak_lp = compute_x(L_user, p_a, p_b) * self._hub.hedge_ratio
+        try:
+            pos_pre = await self._exchange.get_position(self._settings.dydx_symbol)
+            cur_short = abs(pos_pre.size) if pos_pre else 0.0
+        except Exception:
+            cur_short = 0.0
+        peak_short = max(peak_lp, cur_short)
+        await self._check_margin_and_alert(peak_short, p_now)
 
         # 3. Compute target grid
         meta = await self._exchange.get_market_meta(self._settings.dydx_symbol)
