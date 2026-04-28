@@ -224,6 +224,11 @@ class GridMakerEngine:
         L_user = compute_l_from_value(my_value, p_a, p_b, p_now)
         self._hub.liquidity_l = L_user
 
+        # 2.5. If no active operation, stop here — read state but skip grid
+        if self._hub.operation_state != "active":
+            self._hub.last_update = time.time()
+            return
+
         # Refresh collateral so margin check sees current exchange value.
         try:
             self._hub.dydx_collateral = await self._exchange.get_collateral()

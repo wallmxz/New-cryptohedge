@@ -5,6 +5,61 @@ from engine.curve import GridLevel
 
 
 @pytest.mark.asyncio
+async def test_engine_skips_grid_when_operation_state_none():
+    """When operation_state == 'none', engine reads chain but does NOT place a grid."""
+    from engine import GridMakerEngine
+    from state import StateHub
+
+    state = StateHub(hedge_ratio=1.0)
+    state.operation_state = "none"
+
+    settings = MagicMock()
+    settings.dydx_symbol = "ETH-USD"
+    settings.alert_webhook_url = ""
+    settings.threshold_aggressive = 0.05
+    settings.threshold_recovery = 0.02
+    settings.max_open_orders = 50
+    settings.pool_token0_symbol = "WETH"
+    settings.pool_token1_symbol = "USDC"
+
+    db = MagicMock()
+    db.get_active_grid_orders = AsyncMock(return_value=[])
+
+    exchange = MagicMock()
+    exchange.name = "dydx"
+    exchange.get_market_meta = AsyncMock(return_value=MagicMock(min_notional=0.001))
+    # Existing short matches target so aggressive path is NOT taken; without
+    # the operation_state guard, the engine would proceed to place a grid.
+    exchange.get_position = AsyncMock(return_value=MagicMock(
+        symbol="ETH-USD", side="short", size=0.00476,
+        entry_price=3000.0, unrealized_pnl=0.0,
+    ))
+    exchange.get_collateral = AsyncMock(return_value=130.0)
+    exchange.batch_place = AsyncMock(return_value=[])
+    exchange.batch_cancel = AsyncMock(return_value=0)
+    exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+
+    pool_reader = MagicMock()
+    pool_reader.read_price = AsyncMock(return_value=3000.0)
+    beefy_reader = MagicMock()
+    beefy_reader.read_position = AsyncMock(return_value=MagicMock(
+        tick_lower=-197310, tick_upper=-195303,
+        amount0=0.5, amount1=1500.0, share=0.01, raw_balance=10**16,
+    ))
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=exchange, pool_reader=pool_reader, beefy_reader=beefy_reader,
+    )
+    await engine._iterate()
+
+    # Chain state read happened
+    assert state.range_lower > 0
+    # But NO grid placement
+    exchange.batch_place.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_engine_iteration_in_range_builds_grid():
     """One iteration: reader returns position in range; engine builds + places grid."""
     from engine import GridMakerEngine
@@ -12,6 +67,7 @@ async def test_engine_iteration_in_range_builds_grid():
     state = StateHub()
     state.hedge_ratio = 1.0
     state.max_exposure_pct = 0.05
+    state.operation_state = "active"
 
     settings = MagicMock()
     settings.active_exchange = "dydx"

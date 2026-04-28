@@ -26,6 +26,7 @@ async def test_engine_full_loop_in_range(tmp_path):
     db = Database(str(tmp_path / "t.db"))
     await db.initialize()
     state = StateHub(hedge_ratio=1.0)
+    state.operation_state = "active"
 
     settings = MagicMock()
     settings.dydx_symbol = "ETH-USD"
