@@ -269,7 +269,8 @@ class Database:
     async def get_active_grid_orders(self) -> list[dict]:
         cursor = await self._conn.execute(
             """SELECT * FROM grid_orders
-               WHERE cancelled_at IS NULL AND fill_id IS NULL"""
+               WHERE cancelled_at IS NULL AND fill_id IS NULL
+               ORDER BY placed_at ASC"""
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]

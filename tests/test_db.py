@@ -18,6 +18,7 @@ async def test_initialize_creates_tables(db):
     assert "funding" in tables
     assert "pool_snapshots" in tables
     assert "order_log" in tables
+    assert "grid_orders" in tables
 
 
 async def test_insert_and_get_fill(db):
@@ -102,29 +103,17 @@ async def test_get_fill_stats(db):
     assert stats["taker_volume"] == 50.0
 
 
-@pytest.mark.asyncio
-async def test_insert_and_get_grid_order(tmp_path):
-    from db import Database
-    db = Database(str(tmp_path / "t.db"))
-    await db.initialize()
+async def test_insert_and_get_grid_order(db):
     await db.insert_grid_order(
-        cloid="hb-r1-l5-1",
-        side="sell",
-        target_price=2800.0,
-        size=0.001,
-        placed_at=1000.0,
+        cloid="hb-r1-l5-1", side="sell", target_price=2800.0,
+        size=0.001, placed_at=1000.0,
     )
     rows = await db.get_active_grid_orders()
     assert len(rows) == 1
     assert rows[0]["cloid"] == "hb-r1-l5-1"
-    await db.close()
 
 
-@pytest.mark.asyncio
-async def test_mark_grid_order_cancelled(tmp_path):
-    from db import Database
-    db = Database(str(tmp_path / "t.db"))
-    await db.initialize()
+async def test_mark_grid_order_cancelled(db):
     await db.insert_grid_order(
         cloid="hb-r1-l1-1", side="buy", target_price=3010.0,
         size=0.001, placed_at=1000.0,
@@ -132,4 +121,21 @@ async def test_mark_grid_order_cancelled(tmp_path):
     await db.mark_grid_order_cancelled("hb-r1-l1-1", 1010.0)
     active = await db.get_active_grid_orders()
     assert len(active) == 0
-    await db.close()
+
+
+async def test_mark_grid_order_filled(db):
+    """Insert grid order, mark as filled with fill_id, assert no longer active."""
+    await db.insert_fill(
+        timestamp=1000.0, exchange="dydx", symbol="ETH-USD",
+        side="sell", size=0.001, price=2800.0, fee=0.0, fee_currency="USDC",
+        liquidity="maker", realized_pnl=0.0, order_id="hb-r1-l5-1",
+    )
+    fills = await db.get_fills()
+    fill_id = fills[0]["id"]
+    await db.insert_grid_order(
+        cloid="hb-r1-l5-1", side="sell", target_price=2800.0,
+        size=0.001, placed_at=1000.0,
+    )
+    await db.mark_grid_order_filled("hb-r1-l5-1", fill_id)
+    active = await db.get_active_grid_orders()
+    assert len(active) == 0
