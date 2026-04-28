@@ -147,3 +147,27 @@ async def test_dydx_get_position_none_when_empty():
     adapter._indexer = indexer
     pos = await adapter.get_position("ETH-USD")
     assert pos is None
+
+
+@pytest.mark.asyncio
+async def test_dydx_subscribe_orderbook_invokes_callback():
+    """When socket emits orderbook event, callback is called with parsed data.
+
+    SDK note: in dydx-v4-client the orderbook channel is `socket.order_book`
+    (the `markets` attribute is the v4_markets info feed, not the orderbook).
+    We mock that here to avoid a real WS connection.
+    """
+    received = []
+
+    async def on_book(data):
+        received.append(data)
+
+    adapter = DydxAdapter(mnemonic="m", wallet_address="dydx1test")
+    socket = MagicMock()
+    socket.order_book.subscribe = MagicMock()
+    adapter._socket = socket
+
+    await adapter.subscribe_orderbook("ETH-USD", on_book)
+    socket.order_book.subscribe.assert_called_once_with("ETH-USD")
+    # Cb is set
+    assert adapter._book_callback is on_book

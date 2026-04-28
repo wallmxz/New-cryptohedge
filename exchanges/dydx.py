@@ -7,6 +7,13 @@ SDK deviations from the task reference code:
 2. `make_mainnet` is a `partial` that does NOT pre-bind rest_indexer /
    websocket_indexer / node_url (only `make_testnet` and `make_local` do).
    We supply those URLs ourselves with documented mainnet defaults.
+3. `IndexerSocket` orderbook channel is `socket.order_book`, not
+   `socket.markets` (the latter is the v4_markets info channel).
+4. `IndexerSocket(url, on_message=...)` takes the URL positionally; its
+   `on_message` is a SYNC callback receiving `(ws, parsed_dict)`. We bridge
+   to async user callbacks via `asyncio.create_task`.
+5. `IndexerSocket.connect()` invokes `run_forever`, which blocks. We launch
+   it as a background task in `_ensure_socket`.
 """
 from __future__ import annotations
 import asyncio
@@ -286,11 +293,74 @@ class DydxAdapter(ExchangeAdapter):
             ))
         return fills
 
-    async def subscribe_orderbook(self, symbol, callback):
-        raise NotImplementedError("Implementado em Task 13")
+    async def _ensure_socket(self) -> None:
+        """Lazily create + connect the IndexerSocket.
 
-    async def subscribe_fills(self, symbol, callback):
-        raise NotImplementedError("Implementado em Task 13")
+        SDK note: dydx-v4-client `IndexerSocket.__init__` takes (url, header,
+        on_open, on_message, ...) — there is no `websocket_indexer` keyword.
+        Its `on_message` receives `(ws, parsed_dict)` thanks to the SDK's
+        internal `as_json` wrapper. `connect()` calls `run_forever`, so we
+        spawn it as a background task to avoid blocking the event loop.
+        """
+        if self._socket is None:
+            self._socket = IndexerSocket(
+                self._network.websocket_indexer,
+                on_message=self._on_message,
+            )
+            asyncio.create_task(self._socket.connect())
+
+    def _on_message(self, ws, msg: dict) -> None:
+        """Synchronous WS callback (websocket-client style).
+
+        Schedules async work onto the running loop so that user-supplied
+        async callbacks can do real I/O (DB writes, hedge re-evaluation, ...).
+        """
+        channel = msg.get("channel")
+        if channel == "v4_orderbook" and self._book_callback:
+            asyncio.create_task(self._book_callback(msg.get("contents", {})))
+        elif channel == "v4_subaccounts" and self._fill_callback:
+            contents = msg.get("contents", {})
+            for f in contents.get("fills", []):
+                ts = _parse_created_at(f.get("createdAt"))
+                liquidity = str(f.get("liquidity", "TAKER")).lower()
+                if liquidity not in ("maker", "taker"):
+                    liquidity = "taker"
+                fill = Fill(
+                    fill_id=str(f.get("id", "")),
+                    order_id=str(f.get("orderId", "")),
+                    symbol=f.get("market", ""),
+                    side=str(f.get("side", "BUY")).lower(),
+                    size=float(f.get("size", "0")),
+                    price=float(f.get("price", "0")),
+                    fee=float(f.get("fee", "0")),
+                    fee_currency="USDC",
+                    liquidity=liquidity,
+                    realized_pnl=float(f.get("realizedPnl", "0")),
+                    timestamp=ts,
+                )
+                asyncio.create_task(self._fill_callback(fill))
+
+    async def subscribe_orderbook(self, symbol: str, callback) -> None:
+        """Subscribe to v4_orderbook for `symbol`; callback awaited per book event.
+
+        SDK note: orderbook lives on `IndexerSocket.order_book` (the `markets`
+        attribute is the v4_markets info channel, not the orderbook).
+        """
+        self._book_callback = callback
+        await self._ensure_socket()
+        self._socket.order_book.subscribe(symbol)
+
+    async def subscribe_fills(self, symbol: str, callback) -> None:
+        """Subscribe to v4_subaccounts; fills are extracted in `_on_message`.
+
+        SDK note: dYdX does not expose a per-market fill stream — fills are
+        delivered through the subaccount channel, scoped by (address, sub#).
+        We filter by `market == symbol` server-side via the channel itself
+        only loosely; the message handler iterates `contents.fills`.
+        """
+        self._fill_callback = callback
+        await self._ensure_socket()
+        self._socket.subaccounts.subscribe(self._wallet_address, self._subaccount)
 
     def get_tick_size(self, symbol):
         meta = self._market_metas.get(symbol)
