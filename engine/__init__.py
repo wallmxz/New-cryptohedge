@@ -195,6 +195,7 @@ class GridMakerEngine:
         )
         ratio = compute_margin_ratio(collateral=self._hub.dydx_collateral, required=required)
         self._hub.margin_ratio = ratio
+        metrics.margin_ratio.set(ratio)
         level = classify_margin(ratio)
 
         if level != "healthy" and level != self._last_alert_level:
@@ -316,6 +317,8 @@ class GridMakerEngine:
             if my_value <= 0:
                 return
 
+            metrics.pool_value_usd.set(my_value)
+
             # Update range state before any out-of-range short-circuit so dashboard sees current bounds.
             self._hub.range_lower = p_a
             self._hub.range_upper = p_b
@@ -332,12 +335,14 @@ class GridMakerEngine:
             # has a non-zero value to display.
             if p_now >= p_b:
                 self._hub.out_of_range = True
+                metrics.out_of_range.set(1)
                 denom = sqrt(p_b) - sqrt(p_a)
                 self._hub.liquidity_l = my_amount1 / denom if denom > 0 else 0.0
                 await self._handle_out_of_range_upper()
                 return
             if p_now <= p_a:
                 self._hub.out_of_range = True
+                metrics.out_of_range.set(1)
                 denom = (1.0 / sqrt(p_a)) - (1.0 / sqrt(p_b))
                 L_oor = my_amount0 / denom if denom > 0 else 0.0
                 self._hub.liquidity_l = L_oor
@@ -360,6 +365,7 @@ class GridMakerEngine:
                 return
 
             self._hub.out_of_range = False
+            metrics.out_of_range.set(0)
             L_user = compute_l_from_value(my_value, p_a, p_b, p_now)
             self._hub.liquidity_l = L_user
 
@@ -420,6 +426,9 @@ class GridMakerEngine:
                     "side": pos.side, "size": pos.size, "entry": pos.entry_price,
                 }
                 self._hub.hedge_unrealized_pnl = pos.unrealized_pnl
+                metrics.hedge_position_size.set(pos.size)
+            else:
+                metrics.hedge_position_size.set(0.0)
 
             # Exposure check
             token0_pool = my_amount0
@@ -435,6 +444,7 @@ class GridMakerEngine:
             # 5. Diff and place/cancel
             t = time.monotonic()
             active = await self._db.get_active_grid_orders()
+            metrics.grid_orders_open.set(len(active))
             # Convert DB rows back to GridLevel approximations for diff
             current_levels = []
             for row in active:
@@ -484,6 +494,7 @@ class GridMakerEngine:
         finally:
             timings["total"] = (time.monotonic() - iter_start) * 1000
             metrics.loop_duration.labels(step="total").observe(timings["total"] / 1000)
+            metrics.operation_state.set(1.0 if self._hub.operation_state == "active" else 0.0)
             self._hub.last_iter_timings = timings
             self._hub.last_update = time.time()
 
