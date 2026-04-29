@@ -62,6 +62,9 @@ class StateHub:
     operation_state: str = "none"  # none/starting/active/stopping/closed/failed
     operation_pnl_breakdown: dict = field(default_factory=dict)
 
+    # Observability — populated by engine each iteration
+    last_iter_timings: dict = field(default_factory=dict)  # {"chain_read": 250.5, "total": 442.1, ...} ms
+
     def to_dict(self) -> dict:
         self.last_update = time.time()
         return asdict(self)
