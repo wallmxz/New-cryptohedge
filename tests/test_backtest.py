@@ -137,3 +137,53 @@ async def test_fetch_dydx_funding_calls_indexer_on_miss(tmp_path):
     assert len(result) == 2
     assert result[0][1] == 0.000125
     await cache.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_beefy_apr_history_uses_cache(tmp_path):
+    from backtest.data import DataFetcher
+    from backtest.cache import Cache
+
+    cache = Cache(str(tmp_path / "c.db"))
+    await cache.initialize()
+    fetcher = DataFetcher(cache=cache)
+
+    cached = json.dumps([[1700000000.0, 0.45], [1700086400.0, 0.50]])
+    await cache.set("beefy_apr:0xvault:1700000000:1700172800", cached)
+
+    result = await fetcher.fetch_beefy_apr_history(
+        vault="0xvault", start=1700000000, end=1700172800,
+    )
+    assert result == [(1700000000.0, 0.45), (1700086400.0, 0.50)]
+    await cache.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_beefy_apr_history_falls_back_constant(tmp_path):
+    """If Beefy API doesn't return useful data, fetcher falls back to a constant APR."""
+    from backtest.data import DataFetcher
+    from backtest.cache import Cache
+
+    cache = Cache(str(tmp_path / "c.db"))
+    await cache.initialize()
+    fetcher = DataFetcher(cache=cache, fallback_apr=0.40)
+
+    # Mock httpx to return empty response
+    fake_response = MagicMock()
+    fake_response.json = MagicMock(return_value={})
+    fake_response.raise_for_status = MagicMock()
+    fake_client = AsyncMock()
+    fake_client.get = AsyncMock(return_value=fake_response)
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=None)
+
+    with patch("backtest.data.httpx.AsyncClient", return_value=fake_client):
+        result = await fetcher.fetch_beefy_apr_history(
+            vault="0xvault", start=1700000000, end=1700172800,
+        )
+
+    # 2 days = 2 daily samples
+    assert len(result) >= 2
+    for ts, apr in result:
+        assert apr == 0.40
+    await cache.close()

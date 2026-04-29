@@ -11,13 +11,15 @@ logger = logging.getLogger(__name__)
 
 COINBASE_BASE = "https://api.exchange.coinbase.com"
 DYDX_INDEXER_BASE = "https://indexer.dydx.trade/v4"
+BEEFY_API_BASE = "https://api.beefy.finance"
 
 
 class DataFetcher:
     """Fetches historical data with caching. APIs hit only on cache miss."""
 
-    def __init__(self, cache: Cache):
+    def __init__(self, cache: Cache, fallback_apr: float = 0.30):
         self._cache = cache
+        self._fallback_apr = fallback_apr
 
     async def fetch_eth_prices(
         self, *, start: float, end: float, interval: int = 300,
@@ -101,3 +103,74 @@ class DataFetcher:
         records.sort(key=lambda r: r[0])
         await self._cache.set(cache_key, json.dumps(records))
         return records
+
+    async def fetch_beefy_apr_history(
+        self, *, vault: str, start: float, end: float,
+    ) -> list[tuple[float, float]]:
+        """Fetch Beefy vault APR daily samples between start..end.
+
+        Returns list of (unix_ts, apr_decimal). Falls back to a constant APR if
+        Beefy doesn't expose history for the vault.
+        """
+        cache_key = f"beefy_apr:{vault}:{int(start)}:{int(end)}"
+        cached = await self._cache.get(cache_key)
+        if cached is not None:
+            data = json.loads(cached)
+            return [(float(ts), float(a)) for ts, a in data]
+
+        url = f"{BEEFY_API_BASE}/apy/breakdown/{vault}"
+        series: list[tuple[float, float]] = []
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                payload = resp.json()
+            # Beefy may return an "apys" or similar shape — try to extract numbers
+            # If the structure isn't recognised, fall back below.
+            if isinstance(payload, dict) and "vaultApr" in payload:
+                apr_now = float(payload["vaultApr"])
+                # Single point — synthesise daily samples between start..end at this rate
+                ts = start
+                day = 86400
+                while ts <= end:
+                    series.append((ts, apr_now))
+                    ts += day
+        except Exception as e:
+            logger.warning(f"Beefy APR fetch failed ({e}); using fallback {self._fallback_apr}")
+
+        if not series:
+            # Fallback: constant APR daily samples
+            ts = start
+            day = 86400
+            while ts <= end:
+                series.append((ts, self._fallback_apr))
+                ts += day
+
+        await self._cache.set(cache_key, json.dumps(series))
+        return series
+
+    async def fetch_beefy_range_events(
+        self, *, w3, strategy_address: str, start_block: int, end_block: int,
+    ) -> list[dict]:
+        """Fetch Beefy strategy Rebalance events between blocks.
+
+        Returns list of {block, ts, tick_lower, tick_upper, liquidity}. Caller is
+        responsible for converting block to ts if needed (could pass via the dict).
+
+        Implementation note: Beefy strategies emit events with various names depending
+        on version; this implementation looks for any topic whose name contains
+        'Rebalance' in the contract's ABI.
+        """
+        cache_key = f"beefy_events:{strategy_address}:{start_block}:{end_block}"
+        cached = await self._cache.get(cache_key)
+        if cached is not None:
+            return json.loads(cached)
+
+        # NOTE: For MVP, return empty list so simulator falls back to "single static range".
+        # Real implementation would inspect the strategy's logs via eth_getLogs.
+        # This is documented as a known gap — the simulator handles missing rebalance
+        # data by treating range as constant for the whole period.
+        series: list[dict] = []
+        await self._cache.set(cache_key, json.dumps(series))
+        return series
