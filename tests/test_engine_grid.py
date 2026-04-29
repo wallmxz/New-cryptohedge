@@ -472,3 +472,51 @@ async def test_engine_stop_operation(tmp_path):
     assert closed_calls[0]["side"] == "buy"
 
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_fill_attributed_to_active_operation(tmp_path):
+    """When a fill arrives during an active operation, it gets operation_id."""
+    from db import Database
+    from engine import GridMakerEngine
+    from state import StateHub
+    from exchanges.base import Fill
+
+    db = Database(str(tmp_path / "t4.db"))
+    await db.initialize()
+    state = StateHub(hedge_ratio=1.0)
+
+    op_id = await db.insert_operation(
+        started_at=1000.0, status="active",
+        baseline_eth_price=3000.0, baseline_pool_value_usd=300.0,
+        baseline_amount0=0.05, baseline_amount1=150.0, baseline_collateral=130.0,
+    )
+    state.current_operation_id = op_id
+    state.operation_state = "active"
+
+    settings = MagicMock()
+    settings.dydx_symbol = "ETH-USD"
+
+    exchange = MagicMock()
+    exchange.name = "dydx"
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=exchange, pool_reader=MagicMock(), beefy_reader=MagicMock(),
+    )
+
+    fill = Fill(
+        fill_id="f1", order_id="100", symbol="ETH-USD", side="sell", size=0.001,
+        price=2999.0, fee=0.0003, fee_currency="USDC", liquidity="maker",
+        realized_pnl=0.0, timestamp=1500.0,
+    )
+    await engine._on_fill(fill)
+
+    fills = await db.get_fills()
+    assert len(fills) == 1
+    assert fills[0]["operation_id"] == op_id
+
+    op = await db.get_operation(op_id)
+    assert abs(op["perp_fees_paid"] - 0.0003) < 1e-9
+
+    await db.close()

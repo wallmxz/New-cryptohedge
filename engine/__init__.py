@@ -441,6 +441,7 @@ class GridMakerEngine:
                         cloid=str(spec["cloid_int"]),
                         side=spec["side"], target_price=spec["price"],
                         size=spec["size"], placed_at=time.time(),
+                        operation_id=self._hub.current_operation_id,
                     )
 
         # 6. Update margin/collateral
@@ -468,28 +469,30 @@ class GridMakerEngine:
                 timestamp=time.time(), exchange=self._exchange.name,
                 action="place", side=side, size=size, price=price,
                 reason="aggressive_correction",
+                operation_id=self._hub.current_operation_id,
             )
             logger.warning(f"Aggressive correction: {side} {size} @ {price}")
         except Exception as e:
             logger.exception(f"Aggressive order failed: {e}")
 
     async def _on_fill(self, fill):
-        """Handle a fill event from the exchange WS."""
+        """Handle a fill event from the exchange WS, attribute to active operation."""
+        op_id = self._hub.current_operation_id  # may be None
+
         fill_id = await self._db.insert_fill(
             timestamp=fill.timestamp, exchange=self._exchange.name,
             symbol=fill.symbol, side=fill.side, size=fill.size, price=fill.price,
             fee=fill.fee, fee_currency=fill.fee_currency, liquidity=fill.liquidity,
             realized_pnl=fill.realized_pnl, order_id=fill.order_id,
+            operation_id=op_id,
         )
 
-        # Update grid order if matches
         if fill.order_id:
             try:
                 await self._db.mark_grid_order_filled(fill.order_id, fill_id)
             except Exception:
                 pass
 
-        # Update aggregates in state
         if fill.liquidity == "maker":
             self._hub.total_maker_fills += 1
             self._hub.total_maker_volume += fill.size
@@ -500,10 +503,14 @@ class GridMakerEngine:
         self._hub.hedge_realized_pnl += fill.realized_pnl
         self._hub.last_update = time.time()
 
+        # Attribute fee to the active operation
+        if op_id is not None and fill.fee > 0:
+            await self._db.add_to_operation_accumulator(op_id, "perp_fees_paid", fill.fee)
+
         await self._db.insert_order_log(
             timestamp=time.time(), exchange=self._exchange.name,
             action="fill", side=fill.side, size=fill.size, price=fill.price,
-            reason=fill.liquidity,
+            reason=fill.liquidity, operation_id=op_id,
         )
 
     async def _handle_out_of_range_upper(self):
