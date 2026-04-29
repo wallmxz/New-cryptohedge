@@ -1,5 +1,7 @@
 import pytest
 from backtest.cache import Cache
+from unittest.mock import AsyncMock, MagicMock, patch
+import json
 
 
 @pytest.mark.asyncio
@@ -33,3 +35,58 @@ async def test_cache_persists_across_instances(tmp_path):
     await c2.initialize()
     assert await c2.get("k") == "persisted"
     await c2.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_eth_prices_uses_cache(tmp_path):
+    from backtest.data import DataFetcher
+    from backtest.cache import Cache
+
+    cache = Cache(str(tmp_path / "c.db"))
+    await cache.initialize()
+
+    fetcher = DataFetcher(cache=cache)
+
+    # Pre-populate cache with a known result
+    cached_payload = json.dumps([[1700000000.0, 2000.5], [1700000300.0, 2001.0]])
+    await cache.set("eth_prices:1700000000:1700000600:300", cached_payload)
+
+    result = await fetcher.fetch_eth_prices(start=1700000000, end=1700000600, interval=300)
+    assert result == [(1700000000.0, 2000.5), (1700000300.0, 2001.0)]
+    await cache.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_eth_prices_calls_api_on_miss(tmp_path):
+    from backtest.data import DataFetcher
+    from backtest.cache import Cache
+
+    cache = Cache(str(tmp_path / "c.db"))
+    await cache.initialize()
+    fetcher = DataFetcher(cache=cache)
+
+    # Mock httpx to return a Coinbase-like response
+    fake_response = MagicMock()
+    fake_response.json = MagicMock(return_value=[
+        # Coinbase candles: [time, low, high, open, close, volume]
+        [1700000600, 1999.0, 2002.0, 2000.0, 2001.0, 100.0],
+        [1700000300, 1998.0, 2001.5, 2000.5, 2000.5, 80.0],
+        [1700000000, 1997.0, 2001.0, 2000.0, 2000.5, 50.0],
+    ])
+    fake_response.raise_for_status = MagicMock()
+
+    fake_client = AsyncMock()
+    fake_client.get = AsyncMock(return_value=fake_response)
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=None)
+
+    with patch("backtest.data.httpx.AsyncClient", return_value=fake_client):
+        result = await fetcher.fetch_eth_prices(start=1700000000, end=1700000600, interval=300)
+
+    assert len(result) == 3
+    # Sorted ascending by timestamp
+    assert result[0][0] < result[1][0] < result[2][0]
+    # Cached
+    cached = await cache.get("eth_prices:1700000000:1700000600:300")
+    assert cached is not None
+    await cache.close()
