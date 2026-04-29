@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import time
 import logging
+from typing import TYPE_CHECKING
 from state import StateHub
 from db import Database
 from config import Settings
@@ -20,6 +21,9 @@ from engine import metrics
 from web.alerts import post_alert
 from web3 import AsyncWeb3, AsyncHTTPProvider
 
+if TYPE_CHECKING:
+    from engine.lifecycle import OperationLifecycle
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,6 +40,7 @@ class GridMakerEngine:
         exchange: ExchangeAdapter | None = None,
         pool_reader: UniswapV3PoolReader | None = None,
         beefy_reader: BeefyClmReader | None = None,
+        lifecycle: "OperationLifecycle | None" = None,
         decimals0: int = 18, decimals1: int = 6,
     ):
         self._settings = settings
@@ -44,6 +49,7 @@ class GridMakerEngine:
         self._exchange = exchange
         self._pool_reader = pool_reader
         self._beefy_reader = beefy_reader
+        self._lifecycle = lifecycle
         self._decimals0 = decimals0
         self._decimals1 = decimals1
         self._grid_mgr = GridManager()
@@ -63,8 +69,22 @@ class GridMakerEngine:
             )
         return self._reconciler
 
-    async def start_operation(self) -> int:
-        """Begin a new operation: snapshot baseline, bootstrap short, mark ACTIVE."""
+    async def start_operation(self, *, usdc_budget: float | None = None) -> int:
+        """Begin a new operation. Routes via lifecycle when configured.
+
+        When lifecycle is configured, usdc_budget is REQUIRED. Missing budget
+        raises RuntimeError to prevent silent fallback to legacy snapshot-only.
+        Legacy path (no lifecycle) is preserved for backwards compat with tests.
+        """
+        if self._lifecycle is not None:
+            if usdc_budget is None:
+                raise RuntimeError(
+                    "usdc_budget required when lifecycle is configured. "
+                    "Pass {usdc_budget: <float>} in request body."
+                )
+            return await self._lifecycle.bootstrap(usdc_budget=usdc_budget)
+
+        # Legacy path: existing Phase 1.2 behavior (no on-chain bootstrap)
         existing = await self._db.get_active_operation()
         if existing is not None:
             raise RuntimeError(f"Operation {existing['id']} already active")
@@ -121,9 +141,27 @@ class GridMakerEngine:
         logger.info(f"Operation {op_id} started")
         return op_id
 
-    async def stop_operation(self, *, close_reason: str = "user") -> dict:
-        """Encerra a operação ativa: cancela grade, fecha short, grava final_pnl."""
+    async def stop_operation(
+        self, *, close_reason: str = "user", swap_to_usdc: bool = False,
+    ) -> dict:
+        """Stop the active operation. If lifecycle is configured AND this op was
+        bootstrapped through lifecycle, do full teardown. Otherwise legacy path.
+
+        Legacy ops (Phase 1.2) have bootstrap_state='pending' (default) since they
+        never went through lifecycle.bootstrap. Routing them through lifecycle.teardown
+        would call beefy.withdraw on the user's full vault balance, draining shares
+        not deposited by this op. Gate on bootstrap_state to prevent that.
+        """
         op_row = await self._db.get_active_operation()
+        bootstrap_state = (op_row or {}).get("bootstrap_state") or "pending"
+        op_was_bootstrapped_via_lifecycle = bootstrap_state not in ("pending", None)
+
+        if self._lifecycle is not None and op_was_bootstrapped_via_lifecycle:
+            return await self._lifecycle.teardown(
+                swap_to_usdc=swap_to_usdc, close_reason=close_reason,
+            )
+
+        # Legacy path
         if op_row is None:
             raise RuntimeError("No active operation to stop")
         op_id = op_row["id"]

@@ -64,12 +64,29 @@ Stack: Python 3.14, asyncio, Starlette + Alpine.js, web3.py, dydx-v4-client, aio
   - Spec: `docs/superpowers/specs/2026-04-29-backtesting-design.md`
   - Plan: `docs/superpowers/plans/2026-04-29-backtesting.md`
 
+- ✅ **Phase 2.0 — On-chain Execution Automatica** (tag `fase-2.0-completa`, branch feature/onchain-execution)
+  - 13 tasks (T0–T12 + T13 follow-up), 170 testes (~33 novos: lp_math, chain_executor, uniswap_executor, beefy_executor, lifecycle, lifecycle_recovery)
+  - **1-click start:** bot faz approve + swap USDC->WETH (same-pool 0,05%) + deposit Beefy CLM + snapshot + open dYdX short
+  - **1-click stop:** cancel grid + close short + withdraw Beefy + (opcional) swap WETH->USDC
+  - **Custo round-trip:** ~$0,08 steady-state (~30× redução vs ~$3 manual atual = ~31% APR consumido)
+  - Modulos novos: `chains/executor.py` base + `uniswap_executor.py` + `beefy_executor.py`; `engine/lifecycle.py` (state machine 16-state) + `engine/lp_math.py` (V3 split math)
+  - State machine + tx_hash idempotency persistida no DB (`bootstrap_state` enum: pending → approving → swap_pending → swap_confirmed → deposit_pending → ... → active → teardown_* → closed/failed)
+  - Crash recovery: `OperationLifecycle.resume_in_flight()` chamado em startup; MVP marca operações in-flight como `failed` pra revisão manual via UI
+  - REST API: POST `/operations/start` aceita `{usdc_budget}`; `/operations/stop` aceita `{swap_to_usdc}`; novo POST `/operations/cashout`; novo GET `/wallet`
+  - UI: modal Start com input USDC + Max wallet button; operation card mostra progress + Arbiscan tx links; settings exibe slippage, WETH residual + Cash out button, wallet ETH balance com warning low-balance
+  - Pre-flight: rejeita start se wallet tem < 0.005 ETH (gas reserve)
+  - Backwards compat: ops legacy (sem `usdc_budget`) continuam usando path Phase 1.2 quando lifecycle está configurado mas op não tem `bootstrap_state` (evita drain acidental de LP pre-existente)
+  - Gap conhecido: ABI da Beefy CLM (`abi/beefy_clm_strategy_write.json`) usa shape canônico; verificar contra contrato deployed via Arbiscan antes de mainnet
+  - Spec: `docs/superpowers/specs/2026-04-29-onchain-execution-design.md`
+  - Plan: `docs/superpowers/plans/2026-04-29-onchain-execution.md`
+
 ### Não iniciado
 
-- Phase 2.0 — On-chain execution automática (swap Uniswap + deposit/withdraw Beefy)
-- Pré-produção — Testnet rehearsal antes de mainnet
+- Pré-produção — Testnet rehearsal antes de mainnet (verificar ABIs reais, smoke flow real, ETH mainnet)
 - Adaptive grid spacing — descartado em Phase 1.3 (grade já em densidade máxima do exchange)
 - Engine: rastrear takers de `_aggressive_correct` no DB pra evitar re-firing entre iterations (gap exposto pelo backtest; em produção o margin gate da dYdX já mitiga, mas vale fechar)
+- Lifecycle: full auto-resume de in-flight ops (atualmente MVP marca como `failed`; UI pode evoluir pra ter botão "Retry from state" ao invés de só "Force close")
+- Anvil fork test pra validar ABIs e calldata de Uniswap/Beefy contra contratos reais sem queimar gas
 
 ## Decisões já tomadas (não revisitar sem motivo)
 

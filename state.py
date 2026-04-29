@@ -62,6 +62,10 @@ class StateHub:
     # Observability — populated by engine each iteration
     last_iter_timings: dict = field(default_factory=dict)  # {"chain_read": 250.5, "total": 442.1, ...} ms
 
+    # Phase 2.0 on-chain execution
+    wallet_eth_balance: float = 0.0
+    bootstrap_progress: str = ""  # human-readable string for UI ("Swapping...", "Depositing...")
+
     def to_dict(self) -> dict:
         self.last_update = time.time()
         return asdict(self)

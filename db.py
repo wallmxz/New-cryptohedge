@@ -126,6 +126,20 @@ class Database:
             except Exception:
                 pass  # column already exists
         await self._conn.commit()
+        # Phase 2.0: bootstrap state machine + tx hashes
+        for col_def in (
+            "ADD COLUMN usdc_budget REAL",
+            "ADD COLUMN bootstrap_state TEXT DEFAULT 'pending'",
+            "ADD COLUMN bootstrap_swap_tx_hash TEXT",
+            "ADD COLUMN bootstrap_deposit_tx_hash TEXT",
+            "ADD COLUMN teardown_withdraw_tx_hash TEXT",
+            "ADD COLUMN teardown_swap_tx_hash TEXT",
+        ):
+            try:
+                await self._conn.execute(f"ALTER TABLE operations {col_def}")
+                await self._conn.commit()
+            except aiosqlite.OperationalError:
+                pass  # column already exists
 
     async def close(self) -> None:
         if self._conn:
@@ -313,14 +327,15 @@ class Database:
         self, *, started_at: float, status: str,
         baseline_eth_price: float, baseline_pool_value_usd: float,
         baseline_amount0: float, baseline_amount1: float, baseline_collateral: float,
+        usdc_budget: float | None = None,
     ) -> int:
         cursor = await self._conn.execute(
             """INSERT INTO operations
                (started_at, status, baseline_eth_price, baseline_pool_value_usd,
-                baseline_amount0, baseline_amount1, baseline_collateral)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                baseline_amount0, baseline_amount1, baseline_collateral, usdc_budget)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (started_at, status, baseline_eth_price, baseline_pool_value_usd,
-             baseline_amount0, baseline_amount1, baseline_collateral),
+             baseline_amount0, baseline_amount1, baseline_collateral, usdc_budget),
         )
         await self._conn.commit()
         return cursor.lastrowid
@@ -376,3 +391,55 @@ class Database:
             (delta, op_id),
         )
         await self._conn.commit()
+
+    async def update_baseline_amounts(
+        self, operation_id: int, *,
+        amount0: float, amount1: float, pool_value_usd: float,
+    ) -> None:
+        """Update baseline_amount0, baseline_amount1, baseline_pool_value_usd
+        after on-chain deposit completes (lifecycle.bootstrap step 4).
+        """
+        await self._conn.execute(
+            """UPDATE operations
+               SET baseline_amount0 = ?, baseline_amount1 = ?, baseline_pool_value_usd = ?
+               WHERE id = ?""",
+            (amount0, amount1, pool_value_usd, operation_id),
+        )
+        await self._conn.commit()
+
+    async def update_bootstrap_state(
+        self, operation_id: int, state: str,
+        *, swap_tx_hash: str | None = None,
+        deposit_tx_hash: str | None = None,
+        withdraw_tx_hash: str | None = None,
+        teardown_swap_tx_hash: str | None = None,
+    ) -> None:
+        """Atomic update of bootstrap_state plus optional tx hashes."""
+        fields = ["bootstrap_state = ?"]
+        values: list = [state]
+        if swap_tx_hash is not None:
+            fields.append("bootstrap_swap_tx_hash = ?")
+            values.append(swap_tx_hash)
+        if deposit_tx_hash is not None:
+            fields.append("bootstrap_deposit_tx_hash = ?")
+            values.append(deposit_tx_hash)
+        if withdraw_tx_hash is not None:
+            fields.append("teardown_withdraw_tx_hash = ?")
+            values.append(withdraw_tx_hash)
+        if teardown_swap_tx_hash is not None:
+            fields.append("teardown_swap_tx_hash = ?")
+            values.append(teardown_swap_tx_hash)
+        values.append(operation_id)
+        await self._conn.execute(
+            f"UPDATE operations SET {', '.join(fields)} WHERE id = ?", values,
+        )
+        await self._conn.commit()
+
+    async def get_in_flight_operations(self) -> list[dict]:
+        """Operations whose bootstrap_state is intermediate (not 'active', 'closed', 'failed', 'pending')."""
+        cursor = await self._conn.execute(
+            "SELECT * FROM operations WHERE bootstrap_state NOT IN ('active', 'closed', 'failed', 'pending')"
+        )
+        cols = [c[0] for c in cursor.description]
+        rows = await cursor.fetchall()
+        return [dict(zip(cols, r)) for r in rows]

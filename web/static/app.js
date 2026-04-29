@@ -21,6 +21,11 @@ function dashboard() {
             operation_state: "none",
             operation_pnl_breakdown: {},
             last_iter_timings: {},
+            wallet_eth_balance: 0,
+            weth_balance: 0,
+            bootstrap_progress: '',
+            bootstrap_swap_tx_hash: null,
+            bootstrap_deposit_tx_hash: null,
         },
 
         config: {
@@ -36,12 +41,17 @@ function dashboard() {
             pool_token1_symbol: 'USDC',
             max_open_orders: 200,
             threshold_aggressive: 0.01,
+            slippage_bps: 30,
         },
 
         logs: [],
         lastUpdate: '—',
         _opStartedAt: null,
         history: [],
+
+        showStartModal: false,
+        startBudget: 300.0,
+        startBudgetMax: 0.0,
 
         get hasBook() {
             return this.state.best_bid > 0 && this.state.best_ask > 0;
@@ -135,6 +145,38 @@ function dashboard() {
             }
         },
 
+        async openStartModal() {
+            try {
+                const resp = await fetch("/wallet");
+                if (resp.ok) {
+                    const data = await resp.json();
+                    this.startBudgetMax = data.usdc_balance || 0;
+                    if (this.startBudgetMax > 0) {
+                        this.startBudget = Math.floor(this.startBudgetMax);
+                    }
+                }
+            } catch (e) {}
+            this.showStartModal = true;
+        },
+
+        async confirmStart() {
+            try {
+                const resp = await fetch("/operations/start", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({usdc_budget: this.startBudget}),
+                });
+                if (!resp.ok) {
+                    const err = await resp.json();
+                    alert("Erro ao iniciar: " + (err.error || resp.status));
+                    return;
+                }
+                this.showStartModal = false;
+            } catch (e) {
+                alert("Erro: " + e);
+            }
+        },
+
         async stopOperation() {
             try {
                 const resp = await fetch("/operations/stop", { method: "POST" });
@@ -154,6 +196,32 @@ function dashboard() {
             } catch (e) {
                 console.error("Failed to load history:", e);
             }
+        },
+
+        async cashOut() {
+            if (!confirm("Converter WETH residual em USDC? (slippage 0.3%)")) return;
+            try {
+                const resp = await fetch("/operations/cashout", {method: "POST"});
+                const data = await resp.json();
+                if (resp.ok) {
+                    alert("Swap enviado! Tx: " + (data.tx_hash || "(no WETH to swap)"));
+                } else {
+                    alert("Erro: " + (data.error || resp.status));
+                }
+            } catch (e) {
+                alert("Erro: " + e);
+            }
+        },
+
+        async refreshWallet() {
+            try {
+                const resp = await fetch("/wallet");
+                if (resp.ok) {
+                    const data = await resp.json();
+                    this.state.weth_balance = data.weth_balance || 0;
+                    this.state.wallet_eth_balance = data.eth_balance || 0;
+                }
+            } catch (e) {}
         },
 
         init() {
@@ -191,6 +259,9 @@ function dashboard() {
             if (typeof initialSnapshots !== 'undefined' && window.initChart) {
                 window.initChart(initialSnapshots);
             }
+
+            this.refreshWallet();
+            setInterval(() => this.refreshWallet(), 30000);
         }
     };
 }

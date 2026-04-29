@@ -35,6 +35,15 @@
                                :value="config.threshold_aggressive" class="cfg-input">
                         <p class="cfg-hint">Safety net pra falhas: se exposure passar disso, escalada taker. Default 1%.</p>
                     </div>
+                    <div class="cfg-group">
+                        <label>Slippage tolerance (bps)</label>
+                        <input type="number" x-model.number="config.slippage_bps" disabled
+                               class="cfg-input">
+                        <p class="cfg-hint">
+                            Configurado via .env (SLIPPAGE_BPS). Default 30 = 0.3%.
+                            Aplicado a swaps e deposits Beefy.
+                        </p>
+                    </div>
                 </div>
 
                 <div x-show="settingsTab === 'rede'" x-cloak class="space-y-4">
@@ -73,6 +82,27 @@
                         <label class="cfg-label">Wallet</label>
                         <input type="text" :value="config.wallet_address" class="cfg-input" disabled>
                         <p class="cfg-hint">Definido no .env</p>
+                    </div>
+                    <div class="cfg-group">
+                        <label>WETH residual em wallet</label>
+                        <p class="text-sm" x-text="state.weth_balance ? state.weth_balance.toFixed(6) + ' WETH (~$' + (state.weth_balance * 3000).toFixed(2) + ')' : '0'"></p>
+                        <button @click="cashOut()"
+                                :disabled="!state.weth_balance || state.weth_balance < 1e-6"
+                                class="px-3 py-2 bg-amber-500 text-white rounded text-sm mt-2 disabled:opacity-50">
+                            Cash out remaining WETH
+                        </button>
+                        <p class="cfg-hint">
+                            Converte WETH residual da wallet de volta pra USDC. So funciona
+                            se nao houver operacao ativa.
+                        </p>
+                    </div>
+                    <div class="cfg-group">
+                        <label>Wallet ETH (gas)</label>
+                        <p class="text-sm" :class="state.wallet_eth_balance < 0.005 ? 'text-red-600 font-bold' : 'text-slate-700'"
+                           x-text="state.wallet_eth_balance.toFixed(4) + ' ETH'"></p>
+                        <p class="cfg-hint" x-show="state.wallet_eth_balance < 0.005">
+                            ⚠️ Saldo de ETH baixo. Adicione ETH na wallet pra pagar gas.
+                        </p>
                     </div>
                 </div>
 

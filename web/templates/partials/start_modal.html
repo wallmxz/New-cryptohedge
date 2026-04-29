@@ -1,0 +1,28 @@
+<div x-show="showStartModal" x-cloak
+     class="fixed inset-0 bg-black/50 flex items-center justify-center z-50"
+     @click.self="showStartModal = false">
+    <div class="bg-white p-6 rounded-lg shadow-xl max-w-md w-full">
+        <h2 class="text-lg font-bold mb-4">Iniciar nova operacao</h2>
+        <label class="block mb-2 text-sm font-medium">Capital (USDC)</label>
+        <div class="flex gap-2">
+            <input type="number" x-model.number="startBudget"
+                   class="flex-1 px-3 py-2 border rounded"
+                   step="0.01" min="0">
+            <button @click="startBudget = Math.floor(startBudgetMax)"
+                    class="px-3 py-2 bg-slate-200 rounded text-sm"
+                    x-show="startBudgetMax > 0">
+                Max (<span x-text="startBudgetMax.toFixed(2)"></span>)
+            </button>
+        </div>
+        <p class="text-xs text-slate-500 mt-2">
+            O bot vai fazer swap, depositar no Beefy e abrir short na dYdX automaticamente.
+        </p>
+        <div class="mt-4 flex justify-end gap-2">
+            <button @click="showStartModal = false"
+                    class="px-4 py-2 bg-slate-200 rounded">Cancelar</button>
+            <button @click="confirmStart()"
+                    :disabled="startBudget <= 0"
+                    class="px-4 py-2 bg-indigo-600 text-white rounded disabled:opacity-50">Iniciar</button>
+        </div>
+    </div>
+</div>
