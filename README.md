@@ -25,7 +25,8 @@ Ver `docs/grid-engine-runbook.md` para detalhes de operação.
 ## Estado atual
 
 - ✅ Phase 1.1 — Grid Maker Engine (tag `fase-1.1-completa`)
-- 🚧 Phase 1.2 — Operation Lifecycle (em planejamento)
+- ✅ Phase 1.2 — Operation Lifecycle (tag `fase-1.2-completa`)
+- 🔜 Phase 1.3 — Refinamentos (adaptive spacing + observability)
 
 Ver `docs/STATUS.md` para detalhes.
 
