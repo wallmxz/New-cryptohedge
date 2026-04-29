@@ -200,22 +200,22 @@ async def cashout(request: Request):
 
     try:
         bal = await engine._lifecycle._read_wallet_balance()
-        if bal["weth"] <= 0:
+        if bal["token0"] <= 0:
             return JSONResponse({"weth_swapped": 0.0, "message": "No WETH in wallet"}, status_code=200)
         import time
         p_now = await engine._lifecycle._pool_reader.read_price()
         slippage = engine._lifecycle._settings.slippage_bps / 10000.0
-        amount_in_raw = int(bal["weth"] * 10**engine._lifecycle._decimals0)
-        min_out = int(bal["weth"] * p_now * (1 - slippage) * 10**engine._lifecycle._decimals1)
+        amount_in_raw = int(bal["token0"] * 10**engine._lifecycle._decimals0)
+        min_out = int(bal["token0"] * p_now * (1 - slippage) * 10**engine._lifecycle._decimals1)
         tx_hash = await engine._lifecycle._uniswap.swap_exact_input(
-            token_in=engine._lifecycle._settings.weth_token_address,
-            token_out=engine._lifecycle._settings.usdc_token_address,
+            token_in=engine._lifecycle._settings.token0_address,
+            token_out=engine._lifecycle._settings.token1_address,
             fee=500,
             amount_in=amount_in_raw, amount_out_minimum=min_out,
             recipient=engine._lifecycle._uniswap.address,
             deadline=int(time.time()) + 300,
         )
-        return JSONResponse({"tx_hash": tx_hash, "weth_swapped": bal["weth"]}, status_code=200)
+        return JSONResponse({"tx_hash": tx_hash, "weth_swapped": bal["token0"]}, status_code=200)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -228,8 +228,8 @@ async def wallet_balance(request: Request):
         return JSONResponse({"usdc_balance": 0, "weth_balance": 0, "eth_balance": 0})
     bal = await engine._lifecycle._read_wallet_balance()
     return JSONResponse({
-        "usdc_balance": bal["usdc"],
-        "weth_balance": bal["weth"],
+        "usdc_balance": bal["token1"],
+        "weth_balance": bal["token0"],
         "eth_balance": bal["eth"],
     })
 

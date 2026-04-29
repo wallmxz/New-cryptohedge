@@ -9,8 +9,10 @@ def mock_settings():
     s = MagicMock()
     s.dydx_symbol = "ETH-USD"
     s.uniswap_v3_router_address = "0xRouter"
-    s.usdc_token_address = "0xUSDC"
-    s.weth_token_address = "0xWETH"
+    s.token0_address = "0xWETH"
+    s.token1_address = "0xUSDC"
+    s.token0_decimals = 18
+    s.token1_decimals = 6
     s.slippage_bps = 30
     s.uniswap_v3_pool_fee = 500
     s.clm_vault_address = "0xStrategy"
@@ -111,7 +113,7 @@ def lifecycle(mock_settings, mock_hub, mock_db, mock_exchange, mock_uniswap, moc
 @pytest.mark.asyncio
 async def test_bootstrap_happy_path(lifecycle, mock_db, mock_uniswap, mock_beefy_exec, mock_exchange):
     """bootstrap with $300 budget calls swap + deposit + opens short, marks active."""
-    with patch.object(lifecycle, "_read_wallet_balance", AsyncMock(return_value={"weth": 0.046, "usdc": 162.0, "eth": 0.01})):
+    with patch.object(lifecycle, "_read_wallet_balance", AsyncMock(return_value={"token0": 0.046, "token1": 162.0, "eth": 0.01})):
         with patch.object(lifecycle, "_check_gas_balance", AsyncMock(return_value=None)):
             op_id = await lifecycle.bootstrap(usdc_budget=300.0)
 
@@ -139,7 +141,7 @@ async def test_bootstrap_skips_swap_when_price_above_range(
 ):
     """When p >= p_b, no swap needed — deposit only USDC."""
     mock_pool_reader.read_price = AsyncMock(return_value=10_000.0)
-    with patch.object(lifecycle, "_read_wallet_balance", AsyncMock(return_value={"weth": 0.0, "usdc": 300.0, "eth": 0.01})):
+    with patch.object(lifecycle, "_read_wallet_balance", AsyncMock(return_value={"token0": 0.0, "token1": 300.0, "eth": 0.01})):
         with patch.object(lifecycle, "_check_gas_balance", AsyncMock(return_value=None)):
             await lifecycle.bootstrap(usdc_budget=300.0)
     mock_uniswap.swap_exact_output.assert_not_awaited()
@@ -234,7 +236,7 @@ async def test_teardown_with_cashout_swaps(lifecycle, mock_db, mock_exchange, mo
     pos.amount0 = 0.5; pos.amount1 = 1500.0
     mock_beefy_reader.read_position = AsyncMock(return_value=pos)
 
-    with patch.object(lifecycle, "_read_wallet_balance", AsyncMock(return_value={"weth": 0.04, "usdc": 162.0, "eth": 0.01})):
+    with patch.object(lifecycle, "_read_wallet_balance", AsyncMock(return_value={"token0": 0.04, "token1": 162.0, "eth": 0.01})):
         await lifecycle.teardown(swap_to_usdc=True)
 
     mock_uniswap.swap_exact_input.assert_awaited_once()
@@ -250,7 +252,7 @@ async def test_teardown_rejects_when_no_active(lifecycle, mock_db):
 @pytest.mark.asyncio
 async def test_bootstrap_persists_real_baseline_after_deposit(lifecycle, mock_db, mock_beefy_reader):
     """After deposit, lifecycle should persist the REAL post-deposit amounts to ops table."""
-    with patch.object(lifecycle, "_read_wallet_balance", AsyncMock(return_value={"weth": 0.046, "usdc": 162.0, "eth": 0.01})):
+    with patch.object(lifecycle, "_read_wallet_balance", AsyncMock(return_value={"token0": 0.046, "token1": 162.0, "eth": 0.01})):
         with patch.object(lifecycle, "_check_gas_balance", AsyncMock(return_value=None)):
             await lifecycle.bootstrap(usdc_budget=300.0)
 

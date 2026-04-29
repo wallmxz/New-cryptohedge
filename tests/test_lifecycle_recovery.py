@@ -8,8 +8,10 @@ def mock_settings():
     s = MagicMock()
     s.dydx_symbol = "ETH-USD"
     s.uniswap_v3_router_address = "0xRouter"
-    s.usdc_token_address = "0xUSDC"
-    s.weth_token_address = "0xWETH"
+    s.token0_address = "0xWETH"
+    s.token1_address = "0xUSDC"
+    s.token0_decimals = 18
+    s.token1_decimals = 6
     s.slippage_bps = 30
     s.uniswap_v3_pool_fee = 500
     s.alert_webhook_url = ""
