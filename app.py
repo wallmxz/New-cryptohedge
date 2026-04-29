@@ -14,13 +14,14 @@ from config import Settings
 from state import StateHub
 from db import Database
 from web.auth import BasicAuthMiddleware
+from web.logging_config import setup_logging
 from web.routes import (
     dashboard, sse_state, sse_logs, update_settings, get_config,
     list_operations, get_current_operation, start_operation, stop_operation,
     metrics,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+setup_logging()
 
 
 def create_app(start_engine: bool = True) -> Starlette:
