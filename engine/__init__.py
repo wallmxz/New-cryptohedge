@@ -61,6 +61,13 @@ class GridMakerEngine:
         self._iter_count = 0
         self.RECONCILE_EVERY_N_ITERATIONS = 30  # ~30s
         self._last_alert_level: str | None = None
+        # Cooldown for aggressive correction: prevents re-firing the same
+        # taker correction every iteration while a previous one is still in
+        # flight (taker on real dYdX fills in ~100ms, but on the simulator
+        # mock or under network latency it can lag). Without this, multiple
+        # corrections stack up and explode the position when price crosses.
+        self._last_aggressive_correction_at: float = 0.0
+        self.AGGRESSIVE_CORRECTION_COOLDOWN_SECONDS = 30.0
 
     def _ensure_reconciler(self):
         if self._reconciler is None and self._exchange is not None:
@@ -480,7 +487,18 @@ class GridMakerEngine:
                 exposure_pct = 0.0
 
             if exposure_pct > self._settings.threshold_aggressive:
+                now_ts = time.time()
+                seconds_since_last = now_ts - self._last_aggressive_correction_at
+                if seconds_since_last < self.AGGRESSIVE_CORRECTION_COOLDOWN_SECONDS:
+                    logger.info(
+                        f"Aggressive correction in cooldown "
+                        f"({seconds_since_last:.0f}s < "
+                        f"{self.AGGRESSIVE_CORRECTION_COOLDOWN_SECONDS:.0f}s); "
+                        f"skipping re-fire (exposure={exposure_pct:.4f})"
+                    )
+                    return
                 await self._aggressive_correct(current_short, target_short_at_now, p_now, meta)
+                self._last_aggressive_correction_at = now_ts
                 return
 
             # 5. Diff and place/cancel

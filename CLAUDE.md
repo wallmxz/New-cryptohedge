@@ -84,9 +84,12 @@ Stack: Python 3.14, asyncio, Starlette + Alpine.js, web3.py, dydx-v4-client, aio
 
 - Pré-produção — Testnet rehearsal antes de mainnet (verificar ABIs reais, smoke flow real, ETH mainnet)
 - Adaptive grid spacing — descartado em Phase 1.3 (grade já em densidade máxima do exchange)
-- Engine: rastrear takers de `_aggressive_correct` no DB pra evitar re-firing entre iterations (gap exposto pelo backtest; em produção o margin gate da dYdX já mitiga, mas vale fechar)
 - Lifecycle: full auto-resume de in-flight ops (atualmente MVP marca como `failed`; UI pode evoluir pra ter botão "Retry from state" ao invés de só "Force close")
 - Anvil fork test pra validar ABIs e calldata de Uniswap/Beefy contra contratos reais sem queimar gas
+
+### Fixes aplicados pós-Phase 2.0
+
+- ✅ **Engine `_aggressive_correct` cooldown** (`9016741`): adicionado cooldown in-memory de 30s pra prevenir re-fire de takers de correção quando o anterior ainda não filled. Antes, em latência alta ou no simulator, o mesmo correction fired toda iteration → stack de takers que blow up no próximo cross. Fix: `engine/__init__.py` checa `_last_aggressive_correction_at` antes de chamar `_aggressive_correct`. 3 tests novos (`tests/test_engine_grid.py`).
 
 ## Decisões já tomadas (não revisitar sem motivo)
 
