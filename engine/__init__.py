@@ -13,6 +13,7 @@ from exchanges.base import ExchangeAdapter
 from engine.curve import compute_l_from_value, compute_x, compute_target_grid, GridLevel
 from engine.grid import GridManager
 from engine.hedge import compute_hedge_action
+from engine.operation import Operation, OperationState
 from engine.reconciler import Reconciler
 from engine.margin import compute_required_collateral, compute_margin_ratio, classify_margin
 from web.alerts import post_alert
@@ -60,6 +61,62 @@ class GridMakerEngine:
                 db=self._db, exchange=self._exchange, settings=self._settings,
             )
         return self._reconciler
+
+    async def start_operation(self) -> int:
+        """Begin a new operation: snapshot baseline, bootstrap short, mark ACTIVE."""
+        existing = await self._db.get_active_operation()
+        if existing is not None:
+            raise RuntimeError(f"Operation {existing['id']} already active")
+
+        # Snapshot baseline
+        p_now = await self._pool_reader.read_price()
+        beefy_pos = await self._beefy_reader.read_position()
+        my_amount0 = beefy_pos.amount0 * beefy_pos.share
+        my_amount1 = beefy_pos.amount1 * beefy_pos.share
+        pool_value = my_amount0 * p_now + my_amount1
+        try:
+            collateral = await self._exchange.get_collateral()
+        except Exception:
+            collateral = 0.0
+
+        op_id = await self._db.insert_operation(
+            started_at=time.time(), status=OperationState.STARTING.value,
+            baseline_eth_price=p_now,
+            baseline_pool_value_usd=pool_value,
+            baseline_amount0=my_amount0,
+            baseline_amount1=my_amount1,
+            baseline_collateral=collateral,
+        )
+        self._hub.current_operation_id = op_id
+        self._hub.operation_state = OperationState.STARTING.value
+
+        # Bootstrap: open short = my_amount0 * hedge_ratio via taker
+        target_short = my_amount0 * self._hub.hedge_ratio
+        if target_short > 0:
+            try:
+                await self._exchange.place_long_term_order(
+                    symbol=self._settings.dydx_symbol,
+                    side="sell", size=target_short,
+                    price=p_now * 0.999,  # cross spread (taker)
+                    cloid_int=self._next_cloid(998),
+                    ttl_seconds=60,
+                )
+                # Slippage estimate: 5 bps of notional
+                slippage = 0.0005 * target_short * p_now
+                await self._db.add_to_operation_accumulator(
+                    op_id, "bootstrap_slippage", slippage,
+                )
+            except Exception as e:
+                logger.exception(f"Bootstrap failed: {e}")
+                await self._db.update_operation_status(op_id, OperationState.FAILED.value)
+                self._hub.operation_state = OperationState.FAILED.value
+                self._hub.current_operation_id = None
+                raise
+
+        await self._db.update_operation_status(op_id, OperationState.ACTIVE.value)
+        self._hub.operation_state = OperationState.ACTIVE.value
+        logger.info(f"Operation {op_id} started")
+        return op_id
 
     async def _check_margin_and_alert(self, peak_short_size: float, p_now: float):
         required = compute_required_collateral(

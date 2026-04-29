@@ -254,6 +254,105 @@ async def test_engine_fires_warning_alert_when_margin_low(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_engine_start_operation(tmp_path):
+    """start_operation grava baseline, marca state ACTIVE, e dispara bootstrap."""
+    from db import Database
+    from engine import GridMakerEngine
+    from state import StateHub
+    from exchanges.base import Order
+
+    db = Database(str(tmp_path / "t.db"))
+    await db.initialize()
+    state = StateHub(hedge_ratio=1.0)
+
+    settings = MagicMock()
+    settings.dydx_symbol = "ETH-USD"
+    settings.alert_webhook_url = ""
+    settings.pool_token0_symbol = "WETH"
+    settings.pool_token1_symbol = "USDC"
+
+    bootstrap_calls = []
+
+    async def fake_place_long_term_order(**kw):
+        bootstrap_calls.append(kw)
+        return Order(
+            order_id=str(kw["cloid_int"]), symbol=kw["symbol"], side=kw["side"],
+            size=kw["size"], price=kw["price"], status="open",
+        )
+
+    exchange = MagicMock()
+    exchange.name = "dydx"
+    exchange.get_market_meta = AsyncMock(return_value=MagicMock(min_notional=0.001))
+    exchange.get_position = AsyncMock(return_value=None)
+    exchange.get_collateral = AsyncMock(return_value=130.0)
+    exchange.place_long_term_order = AsyncMock(side_effect=fake_place_long_term_order)
+
+    pool_reader = MagicMock()
+    pool_reader.read_price = AsyncMock(return_value=3000.0)
+    beefy_reader = MagicMock()
+    beefy_reader.read_position = AsyncMock(return_value=MagicMock(
+        tick_lower=-197310, tick_upper=-195303,
+        amount0=0.5, amount1=1500.0, share=0.01, raw_balance=10**16,
+    ))
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=exchange, pool_reader=pool_reader, beefy_reader=beefy_reader,
+    )
+
+    op_id = await engine.start_operation()
+
+    assert state.current_operation_id == op_id
+    assert state.operation_state == "active"
+
+    # Baseline persisted
+    op = await db.get_operation(op_id)
+    assert op["status"] == "active"
+    assert op["baseline_eth_price"] == 3000.0
+    assert op["baseline_pool_value_usd"] > 0
+
+    # Bootstrap order placed (taker for opening short)
+    assert len(bootstrap_calls) == 1
+    assert bootstrap_calls[0]["side"] == "sell"  # short = sell
+
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_start_operation_rejects_when_already_active(tmp_path):
+    """Cannot start a new op when one is already active/starting."""
+    from db import Database
+    from engine import GridMakerEngine
+    from state import StateHub
+
+    db = Database(str(tmp_path / "t2.db"))
+    await db.initialize()
+    state = StateHub(hedge_ratio=1.0)
+    # Pre-existing active op in DB
+    await db.insert_operation(
+        started_at=1000.0, status="active",
+        baseline_eth_price=3000.0, baseline_pool_value_usd=300.0,
+        baseline_amount0=0.05, baseline_amount1=150.0, baseline_collateral=130.0,
+    )
+
+    settings = MagicMock()
+    settings.dydx_symbol = "ETH-USD"
+    settings.alert_webhook_url = ""
+    settings.pool_token0_symbol = "WETH"
+    settings.pool_token1_symbol = "USDC"
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=MagicMock(), pool_reader=MagicMock(), beefy_reader=MagicMock(),
+    )
+
+    with pytest.raises(RuntimeError, match="already active"):
+        await engine.start_operation()
+
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_engine_recovery_reconciles_on_start():
     """On start(), reconciler runs once before main loop."""
     import time
