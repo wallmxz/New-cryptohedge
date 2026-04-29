@@ -375,3 +375,66 @@ def test_cli_parses_args():
     assert args.capital == 300.0
     assert args.margin == 130.0
     assert args.hedge_ratio == 1.0  # default
+
+
+@pytest.mark.asyncio
+async def test_end_to_end_synthetic_run(tmp_path):
+    """Run a full simulation over synthetic data and assert final result is sane."""
+    from backtest.simulator import Simulator, SimConfig
+    from backtest.report import format_text_report, annualized_apr
+
+    config = SimConfig(
+        vault_address="0xvault",
+        pool_address="0xpool",
+        start_ts=1700000000.0,
+        end_ts=1700000000.0 + 86400 * 7,  # 7 days
+        capital_lp=300.0,
+        capital_dydx=130.0,
+        hedge_ratio=1.0,
+        threshold_aggressive=0.01,
+        max_open_orders=50,
+    )
+
+    # Generate synthetic 5-min ticks over 7 days
+    ticks = int(86400 * 7 / 300)
+    eth_prices = []
+    base = 3000.0
+    for i in range(ticks):
+        ts = config.start_ts + i * 300
+        # Sinusoidal mean-reverting around 3000 with small variance
+        from math import sin
+        price = base + 30 * sin(i / 50)
+        eth_prices.append((ts, price))
+
+    funding = []  # neutral
+    apr_history = [(config.start_ts, 0.40)]
+    static_range = {
+        "tick_lower": -197310, "tick_upper": -195303,
+        "amount0": 0.5, "amount1": 1500.0, "share": 0.01, "raw_balance": 10**16,
+    }
+
+    sim = Simulator(
+        config=config,
+        eth_prices=eth_prices,
+        funding=funding,
+        apr_history=apr_history,
+        range_events=[],
+        static_range=static_range,
+    )
+    result = await sim.run()
+
+    # Sanity checks
+    assert result["fills_maker"] >= 0
+    assert result["fills_taker"] >= 0
+    assert result["lp_fees_earned"] > 0
+    assert result["duration_seconds"] == 86400 * 7
+
+    # Reporting works
+    text = format_text_report(
+        result,
+        capital_lp=300.0, capital_dydx=130.0,
+        symbol="WETH/USDC", start_iso="2023-11-15", end_iso="2023-11-22",
+    )
+    assert "Net PnL" in text
+    assert "WETH/USDC" in text
+    assert "7.0 days" in text or "7 days" in text
