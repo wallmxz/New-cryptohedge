@@ -22,6 +22,7 @@ function dashboard() {
             operation_pnl_breakdown: {},
             last_iter_timings: {},
             wallet_eth_balance: 0,
+            weth_balance: 0,
             bootstrap_progress: '',
             bootstrap_swap_tx_hash: null,
             bootstrap_deposit_tx_hash: null,
@@ -40,6 +41,7 @@ function dashboard() {
             pool_token1_symbol: 'USDC',
             max_open_orders: 200,
             threshold_aggressive: 0.01,
+            slippage_bps: 30,
         },
 
         logs: [],
@@ -196,6 +198,32 @@ function dashboard() {
             }
         },
 
+        async cashOut() {
+            if (!confirm("Converter WETH residual em USDC? (slippage 0.3%)")) return;
+            try {
+                const resp = await fetch("/operations/cashout", {method: "POST"});
+                const data = await resp.json();
+                if (resp.ok) {
+                    alert("Swap enviado! Tx: " + (data.tx_hash || "(no WETH to swap)"));
+                } else {
+                    alert("Erro: " + (data.error || resp.status));
+                }
+            } catch (e) {
+                alert("Erro: " + e);
+            }
+        },
+
+        async refreshWallet() {
+            try {
+                const resp = await fetch("/wallet");
+                if (resp.ok) {
+                    const data = await resp.json();
+                    this.state.weth_balance = data.weth_balance || 0;
+                    this.state.wallet_eth_balance = data.eth_balance || 0;
+                }
+            } catch (e) {}
+        },
+
         init() {
             fetch('/config')
                 .then(r => r.json())
@@ -231,6 +259,9 @@ function dashboard() {
             if (typeof initialSnapshots !== 'undefined' && window.initChart) {
                 window.initChart(initialSnapshots);
             }
+
+            this.refreshWallet();
+            setInterval(() => this.refreshWallet(), 30000);
         }
     };
 }

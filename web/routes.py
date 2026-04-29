@@ -71,6 +71,7 @@ async def get_config(request: Request):
         "pool_token1_symbol": settings.pool_token1_symbol,
         "max_open_orders": settings.max_open_orders,
         "threshold_aggressive": settings.threshold_aggressive,
+        "slippage_bps": settings.slippage_bps,
     })
 
 
