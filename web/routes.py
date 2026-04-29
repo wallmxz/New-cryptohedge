@@ -65,7 +65,7 @@ async def get_config(request: Request):
         "clm_pool_address": settings.clm_pool_address,
         "wallet_address": settings.wallet_address,
         "active_exchange": settings.active_exchange,
-        "symbol": settings.hyperliquid_symbol if settings.active_exchange == "hyperliquid" else settings.dydx_symbol,
+        "symbol": settings.dydx_symbol,
         "alert_webhook_url": settings.alert_webhook_url,
         "pool_token0_symbol": settings.pool_token0_symbol,
         "pool_token1_symbol": settings.pool_token1_symbol,
@@ -166,3 +166,11 @@ async def stop_operation(request: Request):
         return JSONResponse(result, status_code=200)
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=404)
+
+
+from engine import metrics as engine_metrics
+
+
+async def metrics(request: Request):
+    body = engine_metrics.render_metrics()
+    return Response(body, media_type=engine_metrics.render_content_type())

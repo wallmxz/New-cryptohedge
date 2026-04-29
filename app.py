@@ -14,12 +14,14 @@ from config import Settings
 from state import StateHub
 from db import Database
 from web.auth import BasicAuthMiddleware
+from web.logging_config import setup_logging
 from web.routes import (
     dashboard, sse_state, sse_logs, update_settings, get_config,
     list_operations, get_current_operation, start_operation, stop_operation,
+    metrics,
 )
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+setup_logging()
 
 
 def create_app(start_engine: bool = True) -> Starlette:
@@ -75,6 +77,7 @@ def create_app(start_engine: bool = True) -> Starlette:
         Route("/operations/current", get_current_operation),
         Route("/operations/start", start_operation, methods=["POST"]),
         Route("/operations/stop", stop_operation, methods=["POST"]),
+        Route("/metrics", metrics),
         Mount("/static", StaticFiles(directory="web/static"), name="static"),
     ]
 
@@ -93,7 +96,7 @@ def create_app(start_engine: bool = True) -> Starlette:
         BasicAuthMiddleware,
         username=settings.auth_user,
         password=settings.auth_pass,
-        exclude=["/health"],
+        exclude=["/health", "/metrics"],
     )
     return app
 

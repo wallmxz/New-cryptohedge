@@ -1,0 +1,17 @@
+<!-- web/templates/partials/health.html -->
+<div class="card">
+    <p class="card-title">Saúde do loop</p>
+    <div x-show="healthSteps.length === 0" x-cloak class="text-sm text-slate-400 py-2">
+        Sem dados ainda — aguardando primeira iteração do engine
+    </div>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3" x-show="healthSteps.length > 0" x-cloak>
+        <template x-for="step in healthSteps" :key="step.name">
+            <div>
+                <p class="text-xs text-slate-400 mb-1" x-text="step.label"></p>
+                <p class="text-sm font-mono"
+                   :class="step.ms > 1000 ? 'text-red-500' : step.ms > 500 ? 'text-amber-600' : 'text-slate-700'"
+                   x-text="step.ms.toFixed(0) + 'ms'"></p>
+            </div>
+        </template>
+    </div>
+</div>

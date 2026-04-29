@@ -583,6 +583,120 @@ async def test_engine_updates_live_pnl_breakdown(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_engine_populates_last_iter_timings(tmp_path):
+    """After _iterate runs, hub.last_iter_timings has the expected step keys."""
+    from db import Database
+    from engine import GridMakerEngine
+
+    db = Database(str(tmp_path / "tobs.db"))
+    await db.initialize()
+    state = StateHub(hedge_ratio=1.0)
+    state.operation_state = "active"
+
+    settings = MagicMock()
+    settings.dydx_symbol = "ETH-USD"
+    settings.alert_webhook_url = ""
+    settings.threshold_aggressive = 0.05
+    settings.threshold_recovery = 0.02
+    settings.max_open_orders = 50
+    settings.pool_token0_symbol = "WETH"
+    settings.pool_token1_symbol = "USDC"
+
+    exchange = MagicMock()
+    exchange.name = "dydx"
+    exchange.get_market_meta = AsyncMock(return_value=MagicMock(min_notional=0.001))
+    exchange.get_position = AsyncMock(return_value=MagicMock(
+        side="short", size=0.00476, entry_price=3000.0, unrealized_pnl=0.0,
+    ))
+    exchange.get_collateral = AsyncMock(return_value=130.0)
+    exchange.batch_place = AsyncMock(return_value=[])
+    exchange.batch_cancel = AsyncMock(return_value=0)
+    exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+
+    pool_reader = MagicMock()
+    pool_reader.read_price = AsyncMock(return_value=3000.0)
+    beefy_reader = MagicMock()
+    beefy_reader.read_position = AsyncMock(return_value=MagicMock(
+        tick_lower=-197310, tick_upper=-195303,
+        amount0=0.5, amount1=1500.0, share=0.01, raw_balance=10**16,
+    ))
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=exchange, pool_reader=pool_reader, beefy_reader=beefy_reader,
+    )
+    await engine._iterate()
+
+    timings = state.last_iter_timings
+    assert "chain_read" in timings
+    assert "grid_compute" in timings
+    assert "grid_diff_apply" in timings
+    assert "total" in timings
+    # All values should be non-negative ms
+    for k, v in timings.items():
+        assert v >= 0, f"{k} should be >= 0, got {v}"
+
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_updates_gauge_metrics(tmp_path):
+    """After _iterate, gauges in metrics module reflect current state."""
+    from db import Database
+    from engine import GridMakerEngine, metrics
+
+    db = Database(str(tmp_path / "tobs2.db"))
+    await db.initialize()
+    state = StateHub(hedge_ratio=1.0)
+    state.operation_state = "active"
+
+    settings = MagicMock()
+    settings.dydx_symbol = "ETH-USD"
+    settings.alert_webhook_url = ""
+    settings.threshold_aggressive = 0.05
+    settings.threshold_recovery = 0.02
+    settings.max_open_orders = 50
+    settings.pool_token0_symbol = "WETH"
+    settings.pool_token1_symbol = "USDC"
+
+    exchange = MagicMock()
+    exchange.name = "dydx"
+    exchange.get_market_meta = AsyncMock(return_value=MagicMock(min_notional=0.001))
+    exchange.get_position = AsyncMock(return_value=MagicMock(
+        side="short", size=0.00476, entry_price=3000.0, unrealized_pnl=0.0,
+    ))
+    exchange.get_collateral = AsyncMock(return_value=130.0)
+    exchange.batch_place = AsyncMock(return_value=[])
+    exchange.batch_cancel = AsyncMock(return_value=0)
+    exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+
+    pool_reader = MagicMock()
+    pool_reader.read_price = AsyncMock(return_value=3000.0)
+    beefy_reader = MagicMock()
+    beefy_reader.read_position = AsyncMock(return_value=MagicMock(
+        tick_lower=-197310, tick_upper=-195303,
+        amount0=0.5, amount1=1500.0, share=0.01, raw_balance=10**16,
+    ))
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=exchange, pool_reader=pool_reader, beefy_reader=beefy_reader,
+    )
+    await engine._iterate()
+
+    # pool_value_usd should be > 0 after iterate
+    assert metrics.pool_value_usd._value.get() > 0
+    # hedge_position_size should equal current short
+    assert abs(metrics.hedge_position_size._value.get() - 0.00476) < 1e-9
+    # operation_state == 1 since active
+    assert metrics.operation_state._value.get() == 1.0
+    # out_of_range == 0 since in range
+    assert metrics.out_of_range._value.get() == 0.0
+
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_engine_recovery_restores_active_operation(tmp_path):
     """On start(), if DB has an active operation, restore it to hub."""
     from db import Database
@@ -621,5 +735,43 @@ async def test_engine_recovery_restores_active_operation(tmp_path):
 
     await engine.stop()
     await db.close()
+
+    await db.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_increments_counters(tmp_path):
+    """Fills, alerts, operations counters increment on relevant events."""
+    from db import Database
+    from engine import GridMakerEngine, metrics
+    from exchanges.base import Fill
+
+    db = Database(str(tmp_path / "tcounter.db"))
+    await db.initialize()
+    state = StateHub(hedge_ratio=1.0)
+
+    settings = MagicMock()
+    settings.dydx_symbol = "ETH-USD"
+
+    exchange = MagicMock()
+    exchange.name = "dydx"
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=exchange, pool_reader=MagicMock(), beefy_reader=MagicMock(),
+    )
+
+    # Snapshot counter before
+    before = metrics.fills_total.labels(liquidity="maker", side="sell")._value.get()
+
+    fill = Fill(
+        fill_id="f1", order_id="100", symbol="ETH-USD", side="sell", size=0.001,
+        price=2999.0, fee=0.0003, fee_currency="USDC", liquidity="maker",
+        realized_pnl=0.0, timestamp=1500.0,
+    )
+    await engine._on_fill(fill)
+
+    after = metrics.fills_total.labels(liquidity="maker", side="sell")._value.get()
+    assert after == before + 1
 
     await db.close()

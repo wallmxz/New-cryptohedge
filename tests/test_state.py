@@ -57,3 +57,10 @@ def test_statehub_operation_fields_default():
     assert s.current_operation_id is None
     assert s.operation_state == "none"
     assert s.operation_pnl_breakdown == {}
+
+
+def test_statehub_last_iter_timings_default():
+    from state import StateHub
+    s = StateHub()
+    assert s.last_iter_timings == {}
+    assert isinstance(s.last_iter_timings, dict)
