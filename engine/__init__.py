@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import time
 import logging
+from typing import TYPE_CHECKING
 from state import StateHub
 from db import Database
 from config import Settings
@@ -20,6 +21,9 @@ from engine import metrics
 from web.alerts import post_alert
 from web3 import AsyncWeb3, AsyncHTTPProvider
 
+if TYPE_CHECKING:
+    from engine.lifecycle import OperationLifecycle
+
 logger = logging.getLogger(__name__)
 
 
@@ -36,6 +40,7 @@ class GridMakerEngine:
         exchange: ExchangeAdapter | None = None,
         pool_reader: UniswapV3PoolReader | None = None,
         beefy_reader: BeefyClmReader | None = None,
+        lifecycle: "OperationLifecycle | None" = None,
         decimals0: int = 18, decimals1: int = 6,
     ):
         self._settings = settings
@@ -44,6 +49,7 @@ class GridMakerEngine:
         self._exchange = exchange
         self._pool_reader = pool_reader
         self._beefy_reader = beefy_reader
+        self._lifecycle = lifecycle
         self._decimals0 = decimals0
         self._decimals1 = decimals1
         self._grid_mgr = GridManager()
@@ -63,8 +69,15 @@ class GridMakerEngine:
             )
         return self._reconciler
 
-    async def start_operation(self) -> int:
-        """Begin a new operation: snapshot baseline, bootstrap short, mark ACTIVE."""
+    async def start_operation(self, *, usdc_budget: float | None = None) -> int:
+        """Begin a new operation. If usdc_budget is provided AND lifecycle is
+        configured, do full on-chain bootstrap (Phase 2.0). Otherwise fall back
+        to the legacy snapshot+hedge-only path (Phase 1.2).
+        """
+        if usdc_budget is not None and self._lifecycle is not None:
+            return await self._lifecycle.bootstrap(usdc_budget=usdc_budget)
+
+        # Legacy path: existing Phase 1.2 behavior
         existing = await self._db.get_active_operation()
         if existing is not None:
             raise RuntimeError(f"Operation {existing['id']} already active")
@@ -121,8 +134,18 @@ class GridMakerEngine:
         logger.info(f"Operation {op_id} started")
         return op_id
 
-    async def stop_operation(self, *, close_reason: str = "user") -> dict:
-        """Encerra a operação ativa: cancela grade, fecha short, grava final_pnl."""
+    async def stop_operation(
+        self, *, close_reason: str = "user", swap_to_usdc: bool = False,
+    ) -> dict:
+        """Stop the active operation. If lifecycle is configured, do full teardown
+        (cancel grid + close short + withdraw + optional swap). Otherwise legacy
+        Phase 1.2 path."""
+        if self._lifecycle is not None:
+            return await self._lifecycle.teardown(
+                swap_to_usdc=swap_to_usdc, close_reason=close_reason,
+            )
+
+        # Legacy path
         op_row = await self._db.get_active_operation()
         if op_row is None:
             raise RuntimeError("No active operation to stop")
