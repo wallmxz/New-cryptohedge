@@ -41,6 +41,7 @@ function dashboard() {
         logs: [],
         lastUpdate: '—',
         _opStartedAt: null,
+        history: [],
 
         get hasBook() {
             return this.state.best_bid > 0 && this.state.best_ask > 0;
@@ -125,6 +126,15 @@ function dashboard() {
                 }
             } catch (e) {
                 alert("Erro: " + e);
+            }
+        },
+
+        async loadHistory() {
+            try {
+                const resp = await fetch("/operations?limit=50");
+                if (resp.ok) this.history = await resp.json();
+            } catch (e) {
+                console.error("Failed to load history:", e);
             }
         },
 
