@@ -136,8 +136,20 @@ async def start_operation(request: Request):
             {"error": "Engine not running (set START_ENGINE=true)"}, status_code=503,
         )
     engine = request.app.state.engine
+
+    # Parse optional JSON body for Phase 2.0 budget
+    usdc_budget = None
     try:
-        op_id = await engine.start_operation()
+        body = await request.json()
+        if "usdc_budget" in body:
+            usdc_budget = float(body["usdc_budget"])
+            if usdc_budget <= 0:
+                return JSONResponse({"error": "usdc_budget must be positive"}, status_code=400)
+    except Exception:
+        pass  # No body or invalid JSON; legacy mode
+
+    try:
+        op_id = await engine.start_operation(usdc_budget=usdc_budget)
         return JSONResponse({"id": op_id, "status": "active"}, status_code=201)
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=409)
@@ -149,11 +161,76 @@ async def stop_operation(request: Request):
             {"error": "Engine not running"}, status_code=503,
         )
     engine = request.app.state.engine
+
+    swap_to_usdc = False
     try:
-        result = await engine.stop_operation(close_reason="user")
+        body = await request.json()
+        swap_to_usdc = bool(body.get("swap_to_usdc", False))
+    except Exception:
+        pass
+
+    try:
+        result = await engine.stop_operation(
+            close_reason="user", swap_to_usdc=swap_to_usdc,
+        )
         return JSONResponse(result, status_code=200)
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=404)
+
+
+async def cashout(request: Request):
+    """Manual swap WETH -> USDC. Used after teardown when user wants USDC out.
+
+    Only operates when there's NO active operation (otherwise teardown handles it).
+    """
+    if not hasattr(request.app.state, "engine"):
+        return JSONResponse({"error": "Engine not running"}, status_code=503)
+    engine = request.app.state.engine
+    db = request.app.state.db
+
+    active = await db.get_active_operation()
+    if active is not None:
+        return JSONResponse(
+            {"error": "Active operation in progress; use stop_operation with swap_to_usdc=true instead"},
+            status_code=409,
+        )
+    if engine._lifecycle is None:
+        return JSONResponse({"error": "Lifecycle not configured"}, status_code=503)
+
+    try:
+        bal = await engine._lifecycle._read_wallet_balance()
+        if bal["weth"] <= 0:
+            return JSONResponse({"weth_swapped": 0.0, "message": "No WETH in wallet"}, status_code=200)
+        import time
+        p_now = await engine._lifecycle._pool_reader.read_price()
+        slippage = engine._lifecycle._settings.slippage_bps / 10000.0
+        amount_in_raw = int(bal["weth"] * 10**engine._lifecycle._decimals0)
+        min_out = int(bal["weth"] * p_now * (1 - slippage) * 10**engine._lifecycle._decimals1)
+        tx_hash = await engine._lifecycle._uniswap.swap_exact_input(
+            token_in=engine._lifecycle._settings.weth_token_address,
+            token_out=engine._lifecycle._settings.usdc_token_address,
+            fee=500,
+            amount_in=amount_in_raw, amount_out_minimum=min_out,
+            recipient=engine._lifecycle._uniswap.address,
+            deadline=int(time.time()) + 300,
+        )
+        return JSONResponse({"tx_hash": tx_hash, "weth_swapped": bal["weth"]}, status_code=200)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def wallet_balance(request: Request):
+    if not hasattr(request.app.state, "engine"):
+        return JSONResponse({"usdc_balance": 0, "weth_balance": 0, "eth_balance": 0})
+    engine = request.app.state.engine
+    if engine._lifecycle is None:
+        return JSONResponse({"usdc_balance": 0, "weth_balance": 0, "eth_balance": 0})
+    bal = await engine._lifecycle._read_wallet_balance()
+    return JSONResponse({
+        "usdc_balance": bal["usdc"],
+        "weth_balance": bal["weth"],
+        "eth_balance": bal["eth"],
+    })
 
 
 from engine import metrics as engine_metrics
