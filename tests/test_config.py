@@ -37,4 +37,4 @@ def test_settings_defaults(monkeypatch):
 
     assert s.hedge_ratio == 1.0
     assert s.threshold_aggressive == 0.01
-    assert s.active_exchange == "hyperliquid"
+    assert s.active_exchange == "dydx"  # default since Phase 1.1 (Hyperliquid removed Phase 1.3)

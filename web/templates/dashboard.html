@@ -8,12 +8,12 @@
             <h1 class="text-xl font-bold text-slate-800 tracking-tight">AutoMoney</h1>
             <div class="tab-bar">
                 <button class="tab-btn" :class="activeTab === 'painel' && 'tab-active'" @click="activeTab = 'painel'">Painel</button>
-                <button class="tab-btn" :class="activeTab === 'operacoes' && 'tab-active'" @click="activeTab = 'operacoes'">Operacoes</button>
+                <button class="tab-btn" :class="activeTab === 'operacoes' && 'tab-active'" @click="activeTab = 'operacoes'">Operações</button>
                 <button class="tab-btn" :class="activeTab === 'historico' && 'tab-active'" @click="activeTab = 'historico'; loadHistory()">Histórico</button>
             </div>
         </div>
         <div class="flex items-center gap-3">
-            <div class="flex items-center gap-2" title="Status das conexoes">
+            <div class="flex items-center gap-2" title="Status das conexões">
                 <span class="flex items-center gap-1 text-xs" :class="state.connected_chain ? 'text-emerald-600' : 'text-slate-400'">
                     <span class="w-1.5 h-1.5 rounded-full" :class="state.connected_chain ? 'bg-emerald-500' : 'bg-slate-300'"></span>
                     Chain
@@ -45,7 +45,7 @@
         <div class="card" style="background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%); border: none;">
             <div class="flex items-center justify-between">
                 <div>
-                    <p class="text-indigo-200 text-xs font-medium uppercase tracking-wider mb-1">Resultado liquido</p>
+                    <p class="text-indigo-200 text-xs font-medium uppercase tracking-wider mb-1">Resultado líquido</p>
                     <p class="text-3xl font-bold text-white" :class="pnl.net < 0 && 'text-red-200'"
                        x-text="(pnl.net >= 0 ? '+' : '') + '$' + pnl.net.toFixed(2)">$0.00</p>
                 </div>

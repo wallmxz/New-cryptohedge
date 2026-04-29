@@ -1,7 +1,7 @@
 <div x-show="showSettings" x-cloak class="modal-overlay" @click.self="showSettings = false">
         <div class="modal-box" @click.stop>
             <div class="flex items-center justify-between mb-6">
-                <h2 class="text-lg font-bold text-slate-800">Configuracoes</h2>
+                <h2 class="text-lg font-bold text-slate-800">Configurações</h2>
                 <button @click="showSettings = false" class="text-slate-400 hover:text-slate-600 transition p-1 rounded-lg hover:bg-slate-100">
                     <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
                 </button>
@@ -20,10 +20,10 @@
                     <div class="cfg-group">
                         <label class="cfg-label">Ratio do hedge</label>
                         <input type="number" name="hedge_ratio" step="0.01" min="0" max="1" :value="state.hedge_ratio" class="cfg-input">
-                        <p class="cfg-hint">Percentual da posicao hedgeado. 0.95 = 95%</p>
+                        <p class="cfg-hint">Percentual da posição hedgeado. 1.0 = 100%</p>
                     </div>
                     <div class="cfg-group">
-                        <label class="cfg-label">Maximo open orders na exchange</label>
+                        <label class="cfg-label">Máximo open orders na exchange</label>
                         <input type="number" name="max_open_orders" step="1" min="20" max="500"
                                :value="config.max_open_orders" class="cfg-input">
                         <p class="cfg-hint">Limite de ordens da grade. Default 200</p>
@@ -67,15 +67,14 @@
 
                 <div x-show="settingsTab === 'exchange'" x-cloak class="space-y-4">
                     <div class="cfg-group">
-                        <label class="cfg-label">Exchange ativa</label>
-                        <select name="active_exchange" class="cfg-input">
-                            <option value="hyperliquid" :selected="config.active_exchange === 'hyperliquid'">Hyperliquid</option>
-                            <option value="dydx" :selected="config.active_exchange === 'dydx'">dYdX v4</option>
-                        </select>
+                        <label class="cfg-label">Exchange</label>
+                        <input type="text" value="dYdX v4" class="cfg-input" disabled>
+                        <p class="cfg-hint">Fixo desde Phase 1.1 (decisão arquitetural)</p>
                     </div>
                     <div class="cfg-group">
-                        <label class="cfg-label">Simbolo</label>
-                        <input type="text" name="symbol" :value="config.symbol" class="cfg-input">
+                        <label class="cfg-label">Símbolo</label>
+                        <input type="text" :value="config.symbol" class="cfg-input" disabled>
+                        <p class="cfg-hint">Definido no .env (DYDX_SYMBOL). Phase 2.0 assume ETH-USD.</p>
                     </div>
                     <div class="cfg-group">
                         <label class="cfg-label">Wallet</label>
@@ -91,8 +90,8 @@
                             Cash out remaining WETH
                         </button>
                         <p class="cfg-hint">
-                            Converte WETH residual da wallet de volta pra USDC. So funciona
-                            se nao houver operacao ativa.
+                            Converte WETH residual da wallet de volta pra USDC. Só funciona
+                            se não houver operação ativa.
                         </p>
                     </div>
                     <div class="cfg-group">

@@ -19,7 +19,7 @@
             <span class="metric-value" :class="state.hedge_unrealized_pnl >= 0 ? 'metric-up' : 'metric-down'" x-text="'$' + state.hedge_unrealized_pnl.toFixed(2)">$0.00</span>
         </div>
         <div class="metric-row">
-            <span class="metric-label">Exposicao</span>
+            <span class="metric-label">Exposição</span>
             <span class="metric-value metric-warn" x-text="(exposurePct * 100).toFixed(1) + '%'">0%</span>
         </div>
     </div>
