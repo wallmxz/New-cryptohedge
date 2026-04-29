@@ -269,3 +269,51 @@ async def test_mock_beefy_returns_current_position():
     assert pos.tick_upper == -195303
     assert abs(pos.amount0 - 0.5) < 1e-9
     assert abs(pos.share - 0.01) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_simulator_runs_synthetic_period(tmp_path):
+    """Simulator runs through a tiny synthetic timeline and produces a result dict."""
+    from backtest.simulator import Simulator, SimConfig
+
+    # Synthetic timeline: 3 ETH price points, no funding, single static range
+    config = SimConfig(
+        vault_address="0xvault",
+        pool_address="0xpool",
+        start_ts=1700000000.0,
+        end_ts=1700000900.0,  # 15 min
+        capital_lp=300.0,
+        capital_dydx=130.0,
+        hedge_ratio=1.0,
+        threshold_aggressive=0.01,
+        max_open_orders=50,
+    )
+
+    eth_prices = [
+        (1700000000.0, 3000.0),
+        (1700000300.0, 3001.0),
+        (1700000600.0, 2999.0),
+    ]
+    funding = []
+    apr_history = [(1700000000.0, 0.40)]
+    range_events = []  # constant range
+    static_range = {
+        "tick_lower": -197310, "tick_upper": -195303,
+        "amount0": 0.5, "amount1": 1500.0, "share": 0.01, "raw_balance": 10**16,
+    }
+
+    sim = Simulator(
+        config=config,
+        eth_prices=eth_prices,
+        funding=funding,
+        apr_history=apr_history,
+        range_events=range_events,
+        static_range=static_range,
+    )
+    result = await sim.run()
+    # Result has expected top-level keys
+    assert "net_pnl" in result
+    assert "fills_maker" in result
+    assert "fills_taker" in result
+    assert "duration_seconds" in result
+    assert result["duration_seconds"] == 900
