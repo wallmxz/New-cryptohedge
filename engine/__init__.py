@@ -110,11 +110,13 @@ class GridMakerEngine:
             except Exception as e:
                 logger.exception(f"Bootstrap failed: {e}")
                 await self._db.update_operation_status(op_id, OperationState.FAILED.value)
+                metrics.operations_total.labels(status="failed").inc()
                 self._hub.operation_state = OperationState.FAILED.value
                 self._hub.current_operation_id = None
                 raise
 
         await self._db.update_operation_status(op_id, OperationState.ACTIVE.value)
+        metrics.operations_total.labels(status="started").inc()
         self._hub.operation_state = OperationState.ACTIVE.value
         logger.info(f"Operation {op_id} started")
         return op_id
@@ -183,6 +185,7 @@ class GridMakerEngine:
             op_id, ended_at=time.time(),
             final_net_pnl=breakdown["net_pnl"], close_reason=close_reason,
         )
+        metrics.operations_total.labels(status="closed").inc()
         self._hub.current_operation_id = None
         self._hub.operation_state = OperationState.NONE.value
         self._hub.operation_pnl_breakdown = {}
@@ -205,6 +208,7 @@ class GridMakerEngine:
                 message=f"Margin ratio is {ratio:.2f} (collateral=${self._hub.dydx_collateral:.2f}, required=${required:.2f})",
                 data={"ratio": ratio, "collateral": self._hub.dydx_collateral, "required": required},
             )
+            metrics.alerts_total.labels(level=level).inc()
             self._last_alert_level = level
         if level == "healthy":
             self._last_alert_level = None
@@ -501,6 +505,7 @@ class GridMakerEngine:
     async def _aggressive_correct(self, current_short, target_short, p_now, meta):
         """Use taker orders to correct exposure quickly."""
         delta = target_short - current_short
+        metrics.aggressive_corrections_total.inc()
         side = "sell" if delta > 0 else "buy"
         size = abs(delta)
         price = p_now * (1.001 if side == "sell" else 0.999)  # cross spread
@@ -548,6 +553,8 @@ class GridMakerEngine:
         self._hub.total_fees_paid += fill.fee
         self._hub.hedge_realized_pnl += fill.realized_pnl
         self._hub.last_update = time.time()
+
+        metrics.fills_total.labels(liquidity=fill.liquidity, side=fill.side).inc()
 
         # Attribute fee to the active operation
         if op_id is not None and fill.fee > 0:

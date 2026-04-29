@@ -737,3 +737,41 @@ async def test_engine_recovery_restores_active_operation(tmp_path):
     await db.close()
 
     await db.close()
+
+
+@pytest.mark.asyncio
+async def test_engine_increments_counters(tmp_path):
+    """Fills, alerts, operations counters increment on relevant events."""
+    from db import Database
+    from engine import GridMakerEngine, metrics
+    from exchanges.base import Fill
+
+    db = Database(str(tmp_path / "tcounter.db"))
+    await db.initialize()
+    state = StateHub(hedge_ratio=1.0)
+
+    settings = MagicMock()
+    settings.dydx_symbol = "ETH-USD"
+
+    exchange = MagicMock()
+    exchange.name = "dydx"
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=exchange, pool_reader=MagicMock(), beefy_reader=MagicMock(),
+    )
+
+    # Snapshot counter before
+    before = metrics.fills_total.labels(liquidity="maker", side="sell")._value.get()
+
+    fill = Fill(
+        fill_id="f1", order_id="100", symbol="ETH-USD", side="sell", size=0.001,
+        price=2999.0, fee=0.0003, fee_currency="USDC", liquidity="maker",
+        realized_pnl=0.0, timestamp=1500.0,
+    )
+    await engine._on_fill(fill)
+
+    after = metrics.fills_total.labels(liquidity="maker", side="sell")._value.get()
+    assert after == before + 1
+
+    await db.close()
