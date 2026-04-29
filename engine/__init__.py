@@ -12,7 +12,6 @@ from exchanges.dydx import DydxAdapter
 from exchanges.base import ExchangeAdapter
 from engine.curve import compute_l_from_value, compute_x, compute_target_grid, GridLevel
 from engine.grid import GridManager
-from engine.hedge import compute_hedge_action
 from engine.operation import Operation, OperationState
 from engine.pnl import compute_operation_pnl
 from engine.reconciler import Reconciler
