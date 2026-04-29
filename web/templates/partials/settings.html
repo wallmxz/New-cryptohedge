@@ -1,5 +1,4 @@
-<template x-if="showSettings">
-    <div class="modal-overlay" @click.self="showSettings = false">
+<div x-show="showSettings" x-cloak class="modal-overlay" @click.self="showSettings = false">
         <div class="modal-box" @click.stop>
             <div class="flex items-center justify-between mb-6">
                 <h2 class="text-lg font-bold text-slate-800">Configuracoes</h2>
@@ -124,4 +123,4 @@
             </form>
         </div>
     </div>
-</template>
+</div>
