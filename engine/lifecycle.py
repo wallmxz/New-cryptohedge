@@ -204,8 +204,117 @@ class OperationLifecycle:
             raise
 
     async def teardown(self, *, swap_to_usdc: bool = False, close_reason: str = "user") -> dict:
-        # Implemented in Task 6.
-        raise NotImplementedError("teardown() implemented in Task 6")
+        """Cancel grid -> close short -> withdraw Beefy -> (optional) swap WETH to USDC.
+
+        Returns final PnL breakdown dict.
+        """
+        op_row = await self._db.get_active_operation()
+        if op_row is None:
+            raise RuntimeError("No active operation to teardown")
+        op_id = op_row["id"]
+
+        await self._db.update_operation_status(op_id, OperationState.STOPPING.value)
+        self._hub.operation_state = OperationState.STOPPING.value
+        self._hub.bootstrap_progress = "Cancelling grid..."
+
+        try:
+            # Step 1: Cancel all open grid orders
+            await self._db.update_bootstrap_state(op_id, "teardown_grid_cancel")
+            active_orders = await self._db.get_active_grid_orders()
+            if active_orders:
+                await self._exchange.batch_cancel([
+                    dict(symbol=self._settings.dydx_symbol, cloid_int=int(r["cloid"]))
+                    for r in active_orders
+                ])
+                for r in active_orders:
+                    await self._db.mark_grid_order_cancelled(r["cloid"], time.time())
+
+            # Step 2: Close short (taker)
+            await self._db.update_bootstrap_state(op_id, "teardown_short_close")
+            self._hub.bootstrap_progress = "Closing short..."
+            pos = await self._exchange.get_position(self._settings.dydx_symbol)
+            p_now = await self._pool_reader.read_price()
+            if pos and pos.size > 0:
+                side = "buy" if pos.side == "short" else "sell"
+                price = p_now * 1.001 if side == "buy" else p_now * 0.999
+                await self._exchange.place_long_term_order(
+                    symbol=self._settings.dydx_symbol,
+                    side=side, size=pos.size, price=price,
+                    cloid_int=self._next_cloid(997), ttl_seconds=60,
+                )
+                slippage = 0.0005 * pos.size * p_now
+                await self._db.add_to_operation_accumulator(op_id, "perp_fees_paid", slippage)
+
+            # Step 3: Withdraw from Beefy
+            await self._db.update_bootstrap_state(op_id, "teardown_withdraw_pending")
+            self._hub.bootstrap_progress = "Withdrawing Beefy..."
+            beefy_pos = await self._beefy_reader.read_position()
+            shares = beefy_pos.raw_balance
+            if shares > 0:
+                tx = await self._beefy.withdraw(shares=shares, min_amount0=0, min_amount1=0)
+                await self._db.update_bootstrap_state(
+                    op_id, "teardown_withdraw_confirmed", withdraw_tx_hash=tx,
+                )
+            else:
+                await self._db.update_bootstrap_state(op_id, "teardown_withdraw_confirmed")
+
+            # Step 4: Optional swap WETH -> USDC
+            if swap_to_usdc:
+                await self._db.update_bootstrap_state(op_id, "teardown_swap_pending")
+                self._hub.bootstrap_progress = "Swapping WETH -> USDC..."
+                bal = await self._read_wallet_balance()
+                if bal["weth"] > 0:
+                    amount_in_raw = int(bal["weth"] * 10**self._decimals0)
+                    p_now = await self._pool_reader.read_price()
+                    slippage = self._settings.slippage_bps / 10000.0
+                    min_out = int(bal["weth"] * p_now * (1 - slippage) * 10**self._decimals1)
+                    tx = await self._uniswap.swap_exact_input(
+                        token_in=self._settings.weth_token_address,
+                        token_out=self._settings.usdc_token_address,
+                        fee=500,
+                        amount_in=amount_in_raw,
+                        amount_out_minimum=min_out,
+                        recipient=self._uniswap.address,
+                        deadline=int(time.time()) + DEFAULT_DEADLINE_SECONDS,
+                    )
+                    await self._db.update_bootstrap_state(
+                        op_id, "teardown_swap_confirmed", teardown_swap_tx_hash=tx,
+                    )
+                else:
+                    await self._db.update_bootstrap_state(op_id, "teardown_swap_confirmed")
+
+            # Step 5: Compute final PnL + close
+            op = Operation.from_db_row(await self._db.get_operation(op_id))
+            from engine.pnl import compute_operation_pnl
+            my_amount0 = beefy_pos.amount0 * beefy_pos.share
+            my_amount1 = beefy_pos.amount1 * beefy_pos.share
+            pool_value = my_amount0 * p_now + my_amount1
+            breakdown = compute_operation_pnl(
+                op,
+                current_pool_value_usd=pool_value,
+                current_eth_price=p_now,
+                hedge_realized_since_baseline=self._hub.hedge_realized_pnl,
+                hedge_unrealized_since_baseline=self._hub.hedge_unrealized_pnl,
+            )
+
+            await self._db.close_operation(
+                op_id, ended_at=time.time(),
+                final_net_pnl=breakdown["net_pnl"], close_reason=close_reason,
+            )
+            await self._db.update_bootstrap_state(op_id, "closed")
+            self._hub.current_operation_id = None
+            self._hub.operation_state = OperationState.NONE.value
+            self._hub.bootstrap_progress = ""
+            self._hub.operation_pnl_breakdown = {}
+            return {"id": op_id, "final_net_pnl": breakdown["net_pnl"], "breakdown": breakdown}
+
+        except Exception as e:
+            logger.exception(f"Teardown failed at op_id={op_id}: {e}")
+            await self._db.update_bootstrap_state(op_id, "failed")
+            await self._db.update_operation_status(op_id, OperationState.FAILED.value)
+            self._hub.operation_state = OperationState.FAILED.value
+            self._hub.bootstrap_progress = f"TEARDOWN FAILED: {e}"
+            raise
 
     async def resume_in_flight(self) -> None:
         # Implemented in Task 7.

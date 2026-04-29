@@ -25,6 +25,8 @@ def mock_hub():
     h.current_operation_id = None
     h.bootstrap_progress = ""
     h.dydx_collateral = 130.0
+    h.hedge_realized_pnl = 0.0
+    h.hedge_unrealized_pnl = 0.0
     return h
 
 
@@ -37,6 +39,10 @@ def mock_db():
     db.update_operation_status = AsyncMock()
     db.add_to_operation_accumulator = AsyncMock()
     db.get_in_flight_operations = AsyncMock(return_value=[])
+    db.close_operation = AsyncMock()
+    db.get_operation = AsyncMock(return_value=None)
+    db.get_active_grid_orders = AsyncMock(return_value=[])
+    db.mark_grid_order_cancelled = AsyncMock()
     return db
 
 
@@ -144,3 +150,96 @@ async def test_bootstrap_aborts_on_low_gas(lifecycle):
     with patch.object(lifecycle, "_check_gas_balance", AsyncMock(side_effect=RuntimeError("Wallet gas too low"))):
         with pytest.raises(RuntimeError, match="gas"):
             await lifecycle.bootstrap(usdc_budget=300.0)
+
+
+@pytest.mark.asyncio
+async def test_teardown_happy_path(lifecycle, mock_db, mock_exchange, mock_beefy_reader, mock_beefy_exec, mock_uniswap):
+    """teardown cancels grid, closes short, withdraws Beefy, optionally swaps."""
+    mock_db.get_active_operation = AsyncMock(return_value={
+        "id": 1, "status": "active", "started_at": 1700000000.0,
+        "ended_at": None,
+        "baseline_eth_price": 3000.0,
+        "baseline_pool_value_usd": 300.0,
+        "baseline_amount0": 0.05,
+        "baseline_amount1": 150.0,
+        "baseline_collateral": 130.0,
+        "perp_fees_paid": 0.0,
+        "funding_paid": 0.0,
+        "lp_fees_earned": 0.0,
+        "bootstrap_slippage": 0.15,
+        "final_net_pnl": None,
+        "close_reason": None,
+        "usdc_budget": 300.0,
+        "bootstrap_state": "active",
+    })
+    mock_db.get_active_grid_orders = AsyncMock(return_value=[
+        {"cloid": "1234", "side": "sell"}
+    ])
+    mock_db.mark_grid_order_cancelled = AsyncMock()
+    mock_db.update_operation_status = AsyncMock()
+    mock_db.close_operation = AsyncMock()
+    mock_db.get_operation = AsyncMock(return_value={
+        "id": 1, "status": "stopping", "started_at": 1700000000.0, "ended_at": None,
+        "baseline_eth_price": 3000.0, "baseline_pool_value_usd": 300.0,
+        "baseline_amount0": 0.05, "baseline_amount1": 150.0,
+        "baseline_collateral": 130.0, "perp_fees_paid": 0.0, "funding_paid": 0.0,
+        "lp_fees_earned": 0.0, "bootstrap_slippage": 0.15,
+        "final_net_pnl": None, "close_reason": None,
+    })
+
+    mock_pos = MagicMock()
+    mock_pos.size = 0.05
+    mock_pos.side = "short"
+    mock_exchange.get_position = AsyncMock(return_value=mock_pos)
+
+    pos = MagicMock()
+    pos.share = 0.01
+    pos.raw_balance = 10**16
+    pos.amount0 = 0.5
+    pos.amount1 = 1500.0
+    mock_beefy_reader.read_position = AsyncMock(return_value=pos)
+
+    result = await lifecycle.teardown(swap_to_usdc=False)
+    assert "id" in result
+    mock_exchange.batch_cancel.assert_awaited()
+    mock_exchange.place_long_term_order.assert_awaited()  # close short
+    mock_beefy_exec.withdraw.assert_awaited_once()
+    # No swap when swap_to_usdc=False
+    mock_uniswap.swap_exact_input.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_teardown_with_cashout_swaps(lifecycle, mock_db, mock_exchange, mock_beefy_reader, mock_beefy_exec, mock_uniswap):
+    """teardown(swap_to_usdc=True) does the WETH->USDC swap at the end."""
+    mock_db.get_active_operation = AsyncMock(return_value={
+        "id": 2, "status": "active", "started_at": 1700000000.0, "ended_at": None,
+        "baseline_eth_price": 3000.0, "baseline_pool_value_usd": 300.0,
+        "baseline_amount0": 0.05, "baseline_amount1": 150.0,
+        "baseline_collateral": 130.0, "perp_fees_paid": 0.0, "funding_paid": 0.0,
+        "lp_fees_earned": 0.0, "bootstrap_slippage": 0.15,
+        "final_net_pnl": None, "close_reason": None,
+        "usdc_budget": 300.0, "bootstrap_state": "active",
+    })
+    mock_db.get_active_grid_orders = AsyncMock(return_value=[])
+    mock_db.update_operation_status = AsyncMock()
+    mock_db.close_operation = AsyncMock()
+    mock_db.get_operation = AsyncMock(return_value=mock_db.get_active_operation.return_value)
+
+    mock_exchange.get_position = AsyncMock(return_value=None)  # already flat
+
+    pos = MagicMock()
+    pos.share = 0.01; pos.raw_balance = 10**16
+    pos.amount0 = 0.5; pos.amount1 = 1500.0
+    mock_beefy_reader.read_position = AsyncMock(return_value=pos)
+
+    with patch.object(lifecycle, "_read_wallet_balance", AsyncMock(return_value={"weth": 0.04, "usdc": 162.0, "eth": 0.01})):
+        await lifecycle.teardown(swap_to_usdc=True)
+
+    mock_uniswap.swap_exact_input.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_teardown_rejects_when_no_active(lifecycle, mock_db):
+    mock_db.get_active_operation = AsyncMock(return_value=None)
+    with pytest.raises(RuntimeError, match="No active operation"):
+        await lifecycle.teardown()
