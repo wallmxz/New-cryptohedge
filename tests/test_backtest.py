@@ -317,3 +317,41 @@ async def test_simulator_runs_synthetic_period(tmp_path):
     assert "fills_taker" in result
     assert "duration_seconds" in result
     assert result["duration_seconds"] == 900
+
+
+def test_report_formats_text():
+    from backtest.report import format_text_report
+
+    result = {
+        "net_pnl": 174.61,
+        "fills_maker": 1240,
+        "fills_taker": 12,
+        "lp_fees_earned": 187.40,
+        "range_resets": 18,
+        "out_of_range_seconds": 11520,
+        "max_drawdown": -3.40,
+        "duration_seconds": 86400 * 181,
+        "pnl_series": [],
+    }
+    text = format_text_report(
+        result,
+        capital_lp=300.0,
+        capital_dydx=130.0,
+        symbol="WETH/USDC",
+        start_iso="2024-01-01",
+        end_iso="2024-06-30",
+    )
+    assert "Net PnL" in text
+    assert "$174.61" in text
+    assert "1240" in text
+    # APR roughly: 174.61/300 = 58.2% raw return on LP over 181 days,
+    # which annualizes (x365/181) to ~117.4% APR on LP. Test that some
+    # plausible APR-shaped percentage shows up.
+    assert "58.2%" in text or "117.4%" in text or "117." in text
+
+
+def test_report_apr_calc():
+    from backtest.report import annualized_apr
+    # 100 net on 300 over 365 days = 33.3%
+    apr = annualized_apr(net=100.0, capital=300.0, duration_seconds=365 * 86400)
+    assert abs(apr - 0.3333) < 0.001
