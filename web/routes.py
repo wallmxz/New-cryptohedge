@@ -2,7 +2,7 @@ from __future__ import annotations
 import asyncio
 import json
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.templating import Jinja2Templates
 from sse_starlette.sse import EventSourceResponse
 
@@ -106,3 +106,63 @@ async def update_settings(request: Request):
         await db.set_config("threshold_recovery", str(float(form["threshold_recovery"])))
 
     return HTMLResponse('<div id="settings-status">Configuracoes salvas (reinicie o engine para aplicar mudancas de exchange/symbol)</div>')
+
+
+async def list_operations(request: Request):
+    db = request.app.state.db
+    limit = int(request.query_params.get("limit", "20"))
+    rows = await db.get_operations(limit=limit)
+    return JSONResponse(rows)
+
+
+async def get_current_operation(request: Request):
+    db = request.app.state.db
+    hub = request.app.state.hub
+    op = await db.get_active_operation()
+    if op is None:
+        return Response(status_code=204)
+    return JSONResponse({
+        "id": op["id"],
+        "status": op["status"],
+        "started_at": op["started_at"],
+        "baseline": {
+            "eth_price": op["baseline_eth_price"],
+            "pool_value_usd": op["baseline_pool_value_usd"],
+            "amount0": op["baseline_amount0"],
+            "amount1": op["baseline_amount1"],
+            "collateral": op["baseline_collateral"],
+        },
+        "accumulators": {
+            "perp_fees_paid": op["perp_fees_paid"],
+            "funding_paid": op["funding_paid"],
+            "lp_fees_earned": op["lp_fees_earned"],
+            "bootstrap_slippage": op["bootstrap_slippage"],
+        },
+        "current_pnl_breakdown": dict(hub.operation_pnl_breakdown),
+    })
+
+
+async def start_operation(request: Request):
+    if not hasattr(request.app.state, "engine"):
+        return JSONResponse(
+            {"error": "Engine not running (set START_ENGINE=true)"}, status_code=503,
+        )
+    engine = request.app.state.engine
+    try:
+        op_id = await engine.start_operation()
+        return JSONResponse({"id": op_id, "status": "active"}, status_code=201)
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+
+
+async def stop_operation(request: Request):
+    if not hasattr(request.app.state, "engine"):
+        return JSONResponse(
+            {"error": "Engine not running"}, status_code=503,
+        )
+    engine = request.app.state.engine
+    try:
+        result = await engine.stop_operation(close_reason="user")
+        return JSONResponse(result, status_code=200)
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
