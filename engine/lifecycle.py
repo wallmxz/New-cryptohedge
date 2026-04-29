@@ -27,6 +27,26 @@ GAS_RESERVE_ETH = 0.005  # ~$15 at $3000/ETH; alert if below
 DEPOSIT_MIN_SHARES_TOLERANCE = 0.99  # accept >= 99% of computed expected shares
 DEFAULT_DEADLINE_SECONDS = 300  # 5 min
 
+# State -> next-step continuation map.
+# - 'with_hash' means: if tx_hash exists, wait for receipt, then continue.
+# - 'without_hash' means: re-execute the step (safe because on-chain state hasn't changed).
+_BOOTSTRAP_STATES_RESUMABLE = {
+    "approving",
+    "swap_pending",
+    "swap_confirmed",
+    "deposit_pending",
+    "deposit_confirmed",
+    "snapshot",
+    "hedge_pending",
+    "hedge_confirmed",
+    "teardown_grid_cancel",
+    "teardown_short_close",
+    "teardown_withdraw_pending",
+    "teardown_withdraw_confirmed",
+    "teardown_swap_pending",
+    "teardown_swap_confirmed",
+}
+
 
 class OperationLifecycle:
     def __init__(
@@ -317,5 +337,64 @@ class OperationLifecycle:
             raise
 
     async def resume_in_flight(self) -> None:
-        # Implemented in Task 7.
-        raise NotImplementedError("resume_in_flight() implemented in Task 7")
+        """Called at startup. For each in-flight operation:
+        1. If state has a tx_hash and it's '_pending', wait for receipt then advance.
+        2. If state has no tx_hash or is past confirmation, re-execute next step.
+        3. If state is unknown/corrupted, mark failed.
+        """
+        in_flight = await self._db.get_in_flight_operations()
+        if not in_flight:
+            return
+        for op_row in in_flight:
+            op_id = op_row["id"]
+            state = op_row.get("bootstrap_state")
+            logger.info(f"Resuming operation {op_id} from state '{state}'")
+
+            if state not in _BOOTSTRAP_STATES_RESUMABLE:
+                logger.error(f"Operation {op_id} has unknown bootstrap_state '{state}' -- marking failed")
+                await self._db.update_bootstrap_state(op_id, "failed")
+                await self._db.update_operation_status(op_id, OperationState.FAILED.value)
+                continue
+
+            try:
+                # Wait for any pending tx receipts first
+                if state == "swap_pending" and op_row.get("bootstrap_swap_tx_hash"):
+                    await self._uniswap.wait_for_receipt(op_row["bootstrap_swap_tx_hash"])
+                    await self._db.update_bootstrap_state(op_id, "swap_confirmed")
+                elif state == "deposit_pending" and op_row.get("bootstrap_deposit_tx_hash"):
+                    await self._beefy.wait_for_receipt(op_row["bootstrap_deposit_tx_hash"])
+                    await self._db.update_bootstrap_state(op_id, "deposit_confirmed")
+                elif state == "teardown_withdraw_pending" and op_row.get("teardown_withdraw_tx_hash"):
+                    await self._beefy.wait_for_receipt(op_row["teardown_withdraw_tx_hash"])
+                    await self._db.update_bootstrap_state(op_id, "teardown_withdraw_confirmed")
+                elif state == "teardown_swap_pending" and op_row.get("teardown_swap_tx_hash"):
+                    await self._uniswap.wait_for_receipt(op_row["teardown_swap_tx_hash"])
+                    await self._db.update_bootstrap_state(op_id, "teardown_swap_confirmed")
+
+                # Continue from current state
+                if state.startswith("teardown_"):
+                    await self._continue_teardown(op_id, state, op_row)
+                else:
+                    await self._continue_bootstrap(op_id, state, op_row)
+            except Exception as e:
+                logger.exception(f"Resume failed for op {op_id}: {e}")
+                await self._db.update_bootstrap_state(op_id, "failed")
+                await self._db.update_operation_status(op_id, OperationState.FAILED.value)
+
+    async def _continue_bootstrap(self, op_id: int, current_state: str, op_row: dict) -> None:
+        """Re-enter bootstrap from `current_state`. MVP: mark failed and surface to operator."""
+        logger.warning(
+            f"Operation {op_id}: resume from bootstrap state '{current_state}' "
+            f"requires manual review. Marking 'failed' to prevent automatic retry."
+        )
+        await self._db.update_bootstrap_state(op_id, "failed")
+        await self._db.update_operation_status(op_id, OperationState.FAILED.value)
+
+    async def _continue_teardown(self, op_id: int, current_state: str, op_row: dict) -> None:
+        """Re-enter teardown from `current_state`. MVP: mark failed and surface to operator."""
+        logger.warning(
+            f"Operation {op_id}: resume from teardown state '{current_state}' "
+            f"requires manual review. Marking 'failed' to prevent automatic retry."
+        )
+        await self._db.update_bootstrap_state(op_id, "failed")
+        await self._db.update_operation_status(op_id, OperationState.FAILED.value)
