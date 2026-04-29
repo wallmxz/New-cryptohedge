@@ -767,3 +767,100 @@ async def test_engine_increments_counters(tmp_path):
     assert after == before + 1
 
     await db.close()
+
+
+def _build_engine_for_aggressive_test(state, db_mock=None):
+    """Helper: build a GridMakerEngine with mocks tuned to trigger aggressive
+    correction (current_short far from target_short_at_now)."""
+    from engine import GridMakerEngine
+
+    state.operation_state = "active"
+
+    settings = MagicMock()
+    settings.dydx_symbol = "ETH-USD"
+    settings.alert_webhook_url = ""
+    settings.threshold_aggressive = 0.01  # 1%
+    settings.max_open_orders = 50
+    settings.pool_token0_symbol = "WETH"
+    settings.pool_token1_symbol = "USDC"
+
+    db = db_mock or MagicMock()
+    if not isinstance(db.get_active_grid_orders, AsyncMock):
+        db.get_active_grid_orders = AsyncMock(return_value=[])
+    if not isinstance(db.insert_order_log, AsyncMock):
+        db.insert_order_log = AsyncMock()
+    if not isinstance(db.add_to_operation_accumulator, AsyncMock):
+        db.add_to_operation_accumulator = AsyncMock()
+
+    exchange = MagicMock()
+    exchange.name = "dydx"
+    exchange.get_market_meta = AsyncMock(return_value=MagicMock(
+        min_notional=0.001, ticker="ETH-USD", tick_size=0.1,
+    ))
+    # Position is FLAT but pool implies a sizable short target -> exposure_pct > threshold
+    exchange.get_position = AsyncMock(return_value=None)
+    exchange.get_collateral = AsyncMock(return_value=130.0)
+    exchange.batch_place = AsyncMock(return_value=[])
+    exchange.batch_cancel = AsyncMock(return_value=0)
+    exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+    exchange.place_long_term_order = AsyncMock()
+    exchange.get_tick_size = MagicMock(return_value=0.1)
+    exchange.get_min_notional = MagicMock(return_value=0.001)
+
+    pool_reader = MagicMock()
+    pool_reader.read_price = AsyncMock(return_value=3000.0)
+    beefy_reader = MagicMock()
+    beefy_reader.read_position = AsyncMock(return_value=MagicMock(
+        tick_lower=-197310, tick_upper=-195303,
+        amount0=0.5, amount1=1500.0, share=0.01, raw_balance=10**16,
+    ))
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=exchange, pool_reader=pool_reader, beefy_reader=beefy_reader,
+    )
+    return engine, exchange
+
+
+@pytest.mark.asyncio
+async def test_aggressive_correction_first_iter_fires():
+    """First time exposure breach is detected, aggressive correction fires."""
+    state = StateHub(hedge_ratio=1.0)
+    engine, exchange = _build_engine_for_aggressive_test(state)
+    # Speed up: cooldown is 30s, first call has _last_aggressive_correction_at=0
+    # so seconds_since_last >> cooldown.
+    await engine._iterate()
+    # Should have fired one taker
+    exchange.place_long_term_order.assert_awaited_once()
+    # Timestamp updated
+    assert engine._last_aggressive_correction_at > 0
+
+
+@pytest.mark.asyncio
+async def test_aggressive_correction_cooldown_blocks_refire():
+    """Within cooldown window, subsequent breaches do not re-fire."""
+    state = StateHub(hedge_ratio=1.0)
+    engine, exchange = _build_engine_for_aggressive_test(state)
+    await engine._iterate()
+    # First call fired (1 invocation)
+    assert exchange.place_long_term_order.await_count == 1
+
+    # Run two more iterations immediately -- exposure still bad, but cooldown blocks
+    await engine._iterate()
+    await engine._iterate()
+    # Still 1 invocation -- cooldown held
+    assert exchange.place_long_term_order.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_aggressive_correction_refires_after_cooldown_elapses():
+    """After cooldown window elapses, a fresh breach fires another correction."""
+    state = StateHub(hedge_ratio=1.0)
+    engine, exchange = _build_engine_for_aggressive_test(state)
+    await engine._iterate()
+    assert exchange.place_long_term_order.await_count == 1
+
+    # Simulate cooldown window elapsed
+    engine._last_aggressive_correction_at -= engine.AGGRESSIVE_CORRECTION_COOLDOWN_SECONDS + 1
+    await engine._iterate()
+    assert exchange.place_long_term_order.await_count == 2
