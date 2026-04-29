@@ -32,7 +32,6 @@ async def test_engine_full_loop_in_range(tmp_path):
     settings.dydx_symbol = "ETH-USD"
     settings.alert_webhook_url = ""
     settings.threshold_aggressive = 0.05
-    settings.threshold_recovery = 0.02
     settings.max_open_orders = 50
     settings.pool_token0_symbol = "WETH"
     settings.pool_token1_symbol = "USDC"
@@ -140,7 +139,6 @@ async def test_engine_out_of_range_upper_cancels_grid(tmp_path):
     settings.dydx_symbol = "ETH-USD"
     settings.alert_webhook_url = ""
     settings.threshold_aggressive = 0.05
-    settings.threshold_recovery = 0.02
     settings.max_open_orders = 200
     settings.pool_token0_symbol = "WETH"
     settings.pool_token1_symbol = "USDC"
@@ -192,7 +190,6 @@ async def test_engine_out_of_range_lower_holds_short(tmp_path):
     settings.dydx_symbol = "ETH-USD"
     settings.alert_webhook_url = ""
     settings.threshold_aggressive = 0.05
-    settings.threshold_recovery = 0.02
     settings.max_open_orders = 200
     settings.pool_token0_symbol = "WETH"
     settings.pool_token1_symbol = "USDC"

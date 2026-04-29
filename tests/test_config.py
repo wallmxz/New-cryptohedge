@@ -12,8 +12,6 @@ def test_settings_loads_from_env(monkeypatch):
     monkeypatch.setenv("CLM_VAULT_ADDRESS", "0xvault")
     monkeypatch.setenv("CLM_POOL_ADDRESS", "0xpool")
     monkeypatch.setenv("HEDGE_RATIO", "0.90")
-    monkeypatch.setenv("MAX_EXPOSURE_PCT", "0.03")
-    monkeypatch.setenv("REPOST_DEPTH", "2")
     monkeypatch.setenv("ACTIVE_EXCHANGE", "dydx")
 
     s = Settings.from_env()
@@ -23,8 +21,6 @@ def test_settings_loads_from_env(monkeypatch):
     assert s.wallet_address == "0xabc"
     assert s.arbitrum_rpc_url == "https://rpc.test"
     assert s.hedge_ratio == 0.90
-    assert s.max_exposure_pct == 0.03
-    assert s.repost_depth == 2
     assert s.active_exchange == "dydx"
 
 
@@ -40,6 +36,5 @@ def test_settings_defaults(monkeypatch):
     s = Settings.from_env()
 
     assert s.hedge_ratio == 1.0
-    assert s.max_exposure_pct == 0.05
-    assert s.repost_depth == 3
+    assert s.threshold_aggressive == 0.01
     assert s.active_exchange == "hyperliquid"

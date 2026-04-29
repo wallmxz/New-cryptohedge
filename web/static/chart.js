@@ -57,9 +57,10 @@ function updateChart(state) {
     if (!state.last_update) return;
 
     const now = state.last_update;
-    const poolPnl = state.pool_value_usd - state.pool_deposited_usd;
-    const hedgePnl = -(state.hedge_realized_pnl + state.hedge_unrealized_pnl + state.funding_total);
-    const netPnl = poolPnl + state.hedge_realized_pnl + state.hedge_unrealized_pnl + state.funding_total - state.total_fees_paid;
+    const b = state.operation_pnl_breakdown || {};
+    const poolPnl = (b.lp_fees_earned || 0) + (b.beefy_perf_fee || 0) + (b.il_natural || 0);
+    const hedgePnl = -(b.hedge_pnl || 0);
+    const netPnl = b.net_pnl || 0;
 
     chartData[0].push(now);
     chartData[1].push(poolPnl);

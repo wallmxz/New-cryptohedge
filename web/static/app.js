@@ -5,11 +5,11 @@ function dashboard() {
         settingsTab: 'trading',
 
         state: {
-            pool_value_usd: 0, pool_deposited_usd: 0, pool_tokens: {},
+            pool_value_usd: 0, pool_tokens: {},
             hedge_position: null, hedge_unrealized_pnl: 0, hedge_realized_pnl: 0,
             funding_total: 0, best_bid: 0, best_ask: 0, my_order: null,
-            safe_mode: false, hedge_ratio: 0.95, max_exposure_pct: 0.05,
-            repost_depth: 3, total_maker_fills: 0, total_taker_fills: 0,
+            safe_mode: false, hedge_ratio: 0.95,
+            total_maker_fills: 0, total_taker_fills: 0,
             total_maker_volume: 0, total_taker_volume: 0,
             total_fees_paid: 0, total_fees_earned: 0,
             connected_exchange: false, connected_chain: false,
@@ -35,8 +35,7 @@ function dashboard() {
             pool_token0_symbol: 'ARB',
             pool_token1_symbol: 'USDC',
             max_open_orders: 200,
-            threshold_aggressive: 0.05,
-            threshold_recovery: 0.02,
+            threshold_aggressive: 0.01,
         },
 
         logs: [],
@@ -73,9 +72,10 @@ function dashboard() {
         },
 
         get pnl() {
-            const pool = this.state.pool_value_usd - this.state.pool_deposited_usd;
-            const hedge = this.state.hedge_realized_pnl + this.state.hedge_unrealized_pnl;
-            const net = pool + hedge + this.state.funding_total - this.state.total_fees_paid;
+            const b = this.state.operation_pnl_breakdown || {};
+            const pool = (b.lp_fees_earned || 0) + (b.beefy_perf_fee || 0) + (b.il_natural || 0);
+            const hedge = b.hedge_pnl || 0;
+            const net = b.net_pnl || 0;
             return { pool, hedge, net };
         },
 

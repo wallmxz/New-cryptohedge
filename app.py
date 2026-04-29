@@ -28,8 +28,6 @@ def create_app(start_engine: bool = True) -> Starlette:
     settings = Settings.from_env()
     state = StateHub(
         hedge_ratio=settings.hedge_ratio,
-        max_exposure_pct=settings.max_exposure_pct,
-        repost_depth=settings.repost_depth,
     )
     db_path = os.environ.get("DB_PATH", "automoney.db")
     db = Database(db_path)
@@ -37,9 +35,6 @@ def create_app(start_engine: bool = True) -> Starlette:
     async def _load_persisted_config():
         for key, caster, attr in [
             ("hedge_ratio", float, "hedge_ratio"),
-            ("max_exposure_pct", float, "max_exposure_pct"),
-            ("repost_depth", int, "repost_depth"),
-            ("pool_deposited_usd", float, "pool_deposited_usd"),
         ]:
             raw = await db.get_config(key)
             if raw is not None:

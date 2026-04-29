@@ -66,6 +66,7 @@ Stack: Python 3.14, asyncio, Starlette + Alpine.js, web3.py, dydx-v4-client, aio
 - **Grid sizing:** densidade máxima — cada ordem = `min_notional` da exchange (~$3 ETH-USD)
 - **Single concurrent operation** (uma operação ativa por vez)
 - **Auto-defenses:** **NÃO IMPLEMENTAR** auto-deleverage; só auto-emergency-close em margem crítica (decisão Phase 1.2: usuário NÃO QUER essa mecânica por enquanto, só alerts)
+- **Threshold semantics:** A grade É a predição (replica matemática da curva LP). `threshold_aggressive` é safety net pra falhas (bot offline, exchange congestion, price gaps), NÃO tuning estratégico. Em operação saudável, drift é <0.5% e nunca dispara. Default 1% (apertado, coerente com modelo preditivo).
 - **Hedge ratio default:** 1.0 (full hedge), pode ajustar no UI
 - **Capital de validação:** $300 LP + $113-150 dYdX margin = ~$430 total
 - **Config sensível** (mnemonic, private key) só via `.env`, nunca via UI

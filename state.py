@@ -7,7 +7,6 @@ from dataclasses import dataclass, field, asdict
 class StateHub:
     # Pool
     pool_value_usd: float = 0.0
-    pool_deposited_usd: float = 0.0
     pool_tokens: dict = field(default_factory=dict)
     cow_balance: float = 0.0
     cow_total_supply: float = 0.0
@@ -27,8 +26,6 @@ class StateHub:
 
     # Config
     hedge_ratio: float = 0.95
-    max_exposure_pct: float = 0.05
-    repost_depth: int = 3
 
     # Metrics
     total_maker_fills: int = 0
