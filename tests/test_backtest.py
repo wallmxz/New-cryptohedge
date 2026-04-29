@@ -90,3 +90,50 @@ async def test_fetch_eth_prices_calls_api_on_miss(tmp_path):
     cached = await cache.get("eth_prices:1700000000:1700000600:300")
     assert cached is not None
     await cache.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_dydx_funding_uses_cache(tmp_path):
+    from backtest.data import DataFetcher
+    from backtest.cache import Cache
+
+    cache = Cache(str(tmp_path / "c.db"))
+    await cache.initialize()
+    fetcher = DataFetcher(cache=cache)
+
+    cached = json.dumps([[1700000000.0, 0.0001], [1700003600.0, -0.00005]])
+    await cache.set("dydx_funding:ETH-USD:1700000000:1700007200", cached)
+
+    result = await fetcher.fetch_dydx_funding(symbol="ETH-USD", start=1700000000, end=1700007200)
+    assert result == [(1700000000.0, 0.0001), (1700003600.0, -0.00005)]
+    await cache.close()
+
+
+@pytest.mark.asyncio
+async def test_fetch_dydx_funding_calls_indexer_on_miss(tmp_path):
+    from backtest.data import DataFetcher
+    from backtest.cache import Cache
+
+    cache = Cache(str(tmp_path / "c.db"))
+    await cache.initialize()
+    fetcher = DataFetcher(cache=cache)
+
+    fake_response = MagicMock()
+    fake_response.json = MagicMock(return_value={
+        "historicalFunding": [
+            {"effectiveAt": "2023-11-15T00:00:00Z", "rate": "0.000125"},
+            {"effectiveAt": "2023-11-15T01:00:00Z", "rate": "-0.000050"},
+        ]
+    })
+    fake_response.raise_for_status = MagicMock()
+    fake_client = AsyncMock()
+    fake_client.get = AsyncMock(return_value=fake_response)
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=None)
+
+    with patch("backtest.data.httpx.AsyncClient", return_value=fake_client):
+        result = await fetcher.fetch_dydx_funding(symbol="ETH-USD", start=1700000000, end=1700007200)
+
+    assert len(result) == 2
+    assert result[0][1] == 0.000125
+    await cache.close()
