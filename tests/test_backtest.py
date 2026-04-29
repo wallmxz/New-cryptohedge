@@ -187,3 +187,57 @@ async def test_fetch_beefy_apr_history_falls_back_constant(tmp_path):
     for ts, apr in result:
         assert apr == 0.40
     await cache.close()
+
+
+@pytest.mark.asyncio
+async def test_mock_exchange_fills_when_price_crosses_buy():
+    """A buy order at price P fills when simulated price drops to <= P."""
+    from backtest.exchange_mock import MockExchangeAdapter
+    from exchanges.base import Order
+
+    received_fills = []
+    async def on_fill(fill):
+        received_fills.append(fill)
+
+    ex = MockExchangeAdapter(symbol="ETH-USD", min_notional=0.001)
+    await ex.connect()
+    await ex.subscribe_fills("ETH-USD", on_fill)
+
+    await ex.place_long_term_order(
+        symbol="ETH-USD", side="buy", size=0.001, price=3000.0,
+        cloid_int=1, ttl_seconds=60,
+    )
+
+    # Price moves up — no fill
+    await ex.advance_to_price(3010.0, ts=1000.0)
+    assert received_fills == []
+
+    # Price drops to 3000 — order fills
+    await ex.advance_to_price(2999.0, ts=2000.0)
+    assert len(received_fills) == 1
+    f = received_fills[0]
+    assert f.side == "buy"
+    assert abs(f.price - 3000.0) < 1e-9
+    assert f.liquidity == "maker"
+
+
+@pytest.mark.asyncio
+async def test_mock_exchange_position_tracks_fills():
+    """Sell fill increases short size; buy fill reduces it."""
+    from backtest.exchange_mock import MockExchangeAdapter
+
+    ex = MockExchangeAdapter(symbol="ETH-USD", min_notional=0.001)
+    await ex.connect()
+
+    async def _noop(_): pass
+    await ex.subscribe_fills("ETH-USD", _noop)
+
+    await ex.place_long_term_order(
+        symbol="ETH-USD", side="sell", size=0.005, price=3000.0,
+        cloid_int=1, ttl_seconds=60,
+    )
+    await ex.advance_to_price(3001.0, ts=1000.0)
+    pos = await ex.get_position("ETH-USD")
+    assert pos is not None
+    assert pos.side == "short"
+    assert abs(pos.size - 0.005) < 1e-9
