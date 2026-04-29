@@ -355,3 +355,23 @@ def test_report_apr_calc():
     # 100 net on 300 over 365 days = 33.3%
     apr = annualized_apr(net=100.0, capital=300.0, duration_seconds=365 * 86400)
     assert abs(apr - 0.3333) < 0.001
+
+
+def test_cli_parses_args():
+    from backtest.__main__ import parse_args
+
+    args = parse_args([
+        "--vault", "0xvault",
+        "--pool", "0xpool",
+        "--from", "2024-01-01",
+        "--to", "2024-01-02",
+        "--capital", "300",
+        "--margin", "130",
+    ])
+    assert args.vault == "0xvault"
+    assert args.pool == "0xpool"
+    assert args.start_iso == "2024-01-01"
+    assert args.end_iso == "2024-01-02"
+    assert args.capital == 300.0
+    assert args.margin == 130.0
+    assert args.hedge_ratio == 1.0  # default
