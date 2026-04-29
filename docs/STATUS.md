@@ -9,7 +9,7 @@ Fluxo:
 1. Le a pool on-chain via `EVMChainReader` (poll 1s)
 2. Calcula a quantidade do token0 que voce detem no vault (`calc_pool_position`)
 3. Abre/ajusta short na perp ate `token0_pool * hedge_ratio` contratos
-4. Usa ordens maker no topo do book; reposta se sair do nivel. Se exposicao passa `max_exposure_pct`, vira taker
+4. Mantem uma grade densa de ordens maker que replica matematicamente a curva da LP (preditivo). `threshold_aggressive` (default 1%) e a rede de seguranca: se a exposicao passa esse desvio (bot offline, congestao na exchange, gap de preco), vira taker pra recuperar
 5. Salva snapshots a cada 10s para o grafico e fills em cada execucao
 6. Entra em Safe Mode se algo trava (nao implementado ainda)
 

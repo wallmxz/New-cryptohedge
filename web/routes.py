@@ -71,7 +71,6 @@ async def get_config(request: Request):
         "pool_token1_symbol": settings.pool_token1_symbol,
         "max_open_orders": settings.max_open_orders,
         "threshold_aggressive": settings.threshold_aggressive,
-        "threshold_recovery": settings.threshold_recovery,
     })
 
 
@@ -83,15 +82,6 @@ async def update_settings(request: Request):
     if "hedge_ratio" in form:
         hub.hedge_ratio = float(form["hedge_ratio"])
         await db.set_config("hedge_ratio", str(hub.hedge_ratio))
-    if "max_exposure_pct" in form:
-        hub.max_exposure_pct = float(form["max_exposure_pct"])
-        await db.set_config("max_exposure_pct", str(hub.max_exposure_pct))
-    if "repost_depth" in form:
-        hub.repost_depth = int(form["repost_depth"])
-        await db.set_config("repost_depth", str(hub.repost_depth))
-    if "pool_deposited_usd" in form:
-        hub.pool_deposited_usd = float(form["pool_deposited_usd"])
-        await db.set_config("pool_deposited_usd", str(hub.pool_deposited_usd))
     if "active_exchange" in form:
         await db.set_config("active_exchange", form["active_exchange"])
     if "symbol" in form:
@@ -102,8 +92,6 @@ async def update_settings(request: Request):
         await db.set_config("max_open_orders", str(int(form["max_open_orders"])))
     if "threshold_aggressive" in form:
         await db.set_config("threshold_aggressive", str(float(form["threshold_aggressive"])))
-    if "threshold_recovery" in form:
-        await db.set_config("threshold_recovery", str(float(form["threshold_recovery"])))
 
     return HTMLResponse('<div id="settings-status">Configuracoes salvas (reinicie o engine para aplicar mudancas de exchange/symbol)</div>')
 

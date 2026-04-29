@@ -7,7 +7,6 @@ def test_statehub_defaults():
     assert s.pool_value_usd == 0.0
     assert s.hedge_position is None
     assert s.hedge_ratio == 0.95
-    assert s.max_exposure_pct == 0.05
     assert s.safe_mode is False
     assert s.total_maker_fills == 0
     assert s.my_order is None
@@ -24,7 +23,6 @@ def test_statehub_exposure_calculation():
 def test_statehub_snapshot():
     s = StateHub()
     s.pool_value_usd = 204.0
-    s.pool_deposited_usd = 200.0
     s.hedge_unrealized_pnl = -3.80
     s.hedge_realized_pnl = 0.0
     s.funding_total = 0.15

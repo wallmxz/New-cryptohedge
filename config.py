@@ -20,14 +20,11 @@ class Settings:
     dydx_symbol: str
     alert_webhook_url: str
     hedge_ratio: float
-    max_exposure_pct: float
-    repost_depth: int
     # max grid orders open at once on dYdX (caps grid density)
     max_open_orders: int
-    # exposure pct above which bot uses taker (bypass grid)
+    # Safety net for execution failures (bot offline, exchange congestion, price gaps).
+    # In healthy operation the predictive grid drives exposure to ~0% and this never fires.
     threshold_aggressive: float
-    # exposure pct below which bot resumes grid (hysteresis)
-    threshold_recovery: float
     active_exchange: str
     pool_token0_symbol: str
     pool_token1_symbol: str
@@ -52,11 +49,8 @@ class Settings:
             dydx_symbol=os.environ.get("DYDX_SYMBOL", "ARB-USD"),
             alert_webhook_url=os.environ.get("ALERT_WEBHOOK_URL", ""),
             hedge_ratio=float(os.environ.get("HEDGE_RATIO", "1.0")),
-            max_exposure_pct=float(os.environ.get("MAX_EXPOSURE_PCT", "0.05")),
-            repost_depth=int(os.environ.get("REPOST_DEPTH", "3")),
             max_open_orders=int(os.environ.get("MAX_OPEN_ORDERS", "200")),
-            threshold_aggressive=float(os.environ.get("THRESHOLD_AGGRESSIVE", "0.05")),
-            threshold_recovery=float(os.environ.get("THRESHOLD_RECOVERY", "0.02")),
+            threshold_aggressive=float(os.environ.get("THRESHOLD_AGGRESSIVE", "0.01")),
             active_exchange=os.environ.get("ACTIVE_EXCHANGE", "hyperliquid"),
             pool_token0_symbol=os.environ.get("POOL_TOKEN0_SYMBOL", "ARB"),
             pool_token1_symbol=os.environ.get("POOL_TOKEN1_SYMBOL", "USDC"),

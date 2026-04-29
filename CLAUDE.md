@@ -52,12 +52,24 @@ Stack: Python 3.14, asyncio, Starlette + Alpine.js, web3.py, dydx-v4-client, aio
   - Spec: `docs/superpowers/specs/2026-04-28-observability-design.md`
   - Plan: `docs/superpowers/plans/2026-04-28-observability.md`
 
+- ✅ **Phase 1.4 — Backtesting Framework** (tag `fase-1.4-completa`, branch feature/backtesting)
+  - 12 tasks (T0–T13), 142 testes (124 da base + 18 backtest)
+  - CLI: `python -m backtest --vault X --pool Y --from <date> --to <date> [--capital 300] [--margin 130]`
+  - Reusa `GridMakerEngine` real com mocks de exchange (`MockExchangeAdapter`) e chain (`MockPoolReader`/`MockBeefyReader`)
+  - Data layer: ETH price (Coinbase, paginado), dYdX funding (indexer com dedupe), Beefy APR (API com fallback constante)
+  - Cache SQLite local (`backtest_cache.db`) pra evitar re-fetches
+  - Output: net PnL via `state.operation_pnl_breakdown` (inclui IL natural, hedge PnL, funding, fees, slippage); APR LP + APR total; max drawdown; fills maker/taker; JSON opcional via `--output`
+  - Mock exchange enforça margin gate (5x collateral) — modela rejeição de dYdX em produção
+  - T0 cleanup: removidos `max_exposure_pct`, `repost_depth`, `threshold_recovery`, `pool_deposited_usd`, `engine/pnl.py::calc_pnl`, `PnLBreakdown`; `threshold_aggressive` agora 1% default
+  - Spec: `docs/superpowers/specs/2026-04-29-backtesting-design.md`
+  - Plan: `docs/superpowers/plans/2026-04-29-backtesting.md`
+
 ### Não iniciado
 
-- Phase 1.4 — Backtesting framework (simular estratégia em dados históricos)
 - Phase 2.0 — On-chain execution automática (swap Uniswap + deposit/withdraw Beefy)
 - Pré-produção — Testnet rehearsal antes de mainnet
 - Adaptive grid spacing — descartado em Phase 1.3 (grade já em densidade máxima do exchange)
+- Engine: rastrear takers de `_aggressive_correct` no DB pra evitar re-firing entre iterations (gap exposto pelo backtest; em produção o margin gate da dYdX já mitiga, mas vale fechar)
 
 ## Decisões já tomadas (não revisitar sem motivo)
 
@@ -66,6 +78,7 @@ Stack: Python 3.14, asyncio, Starlette + Alpine.js, web3.py, dydx-v4-client, aio
 - **Grid sizing:** densidade máxima — cada ordem = `min_notional` da exchange (~$3 ETH-USD)
 - **Single concurrent operation** (uma operação ativa por vez)
 - **Auto-defenses:** **NÃO IMPLEMENTAR** auto-deleverage; só auto-emergency-close em margem crítica (decisão Phase 1.2: usuário NÃO QUER essa mecânica por enquanto, só alerts)
+- **Threshold semantics:** A grade É a predição (replica matemática da curva LP). `threshold_aggressive` é safety net pra falhas (bot offline, exchange congestion, price gaps), NÃO tuning estratégico. Em operação saudável, drift é <0.5% e nunca dispara. Default 1% (apertado, coerente com modelo preditivo).
 - **Hedge ratio default:** 1.0 (full hedge), pode ajustar no UI
 - **Capital de validação:** $300 LP + $113-150 dYdX margin = ~$430 total
 - **Config sensível** (mnemonic, private key) só via `.env`, nunca via UI
