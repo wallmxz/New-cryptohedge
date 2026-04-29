@@ -1,0 +1,47 @@
+<!-- web/templates/partials/operation.html -->
+<div class="card">
+    <div class="flex items-center justify-between mb-3">
+        <p class="card-title">Operação</p>
+        <div x-show="state.operation_state === 'none'" x-cloak>
+            <span class="text-xs text-slate-400">Nenhuma operação ativa</span>
+        </div>
+        <div x-show="state.operation_state !== 'none'" x-cloak class="flex items-center gap-2">
+            <span class="text-xs px-2 py-0.5 rounded-full"
+                  :class="{
+                    'bg-amber-100 text-amber-700': state.operation_state === 'starting' || state.operation_state === 'stopping',
+                    'bg-emerald-100 text-emerald-700': state.operation_state === 'active',
+                  }"
+                  x-text="state.operation_state.toUpperCase()"></span>
+            <span class="text-xs text-slate-400" x-text="op.elapsed"></span>
+        </div>
+    </div>
+
+    <!-- PnL breakdown when active -->
+    <div x-show="state.operation_state === 'active'" x-cloak class="space-y-1 text-sm">
+        <template x-for="row in op.breakdown" :key="row.label">
+            <div class="flex justify-between">
+                <span class="text-slate-500" x-text="row.label"></span>
+                <span class="font-mono" :class="row.value >= 0 ? 'text-emerald-600' : 'text-red-500'"
+                      x-text="(row.value >= 0 ? '+$' : '-$') + Math.abs(row.value).toFixed(2)"></span>
+            </div>
+        </template>
+        <div class="flex justify-between border-t border-slate-200 pt-2 mt-2 font-semibold">
+            <span>Net PnL</span>
+            <span class="font-mono" :class="op.netPnl >= 0 ? 'text-emerald-600' : 'text-red-500'"
+                  x-text="(op.netPnl >= 0 ? '+$' : '-$') + Math.abs(op.netPnl).toFixed(2)"></span>
+        </div>
+    </div>
+
+    <div class="flex justify-end mt-3 gap-2">
+        <button x-show="state.operation_state === 'none'"
+                @click="startOperation()"
+                class="px-4 py-1.5 text-sm bg-emerald-600 text-white rounded-lg hover:bg-emerald-700">
+            Iniciar operação
+        </button>
+        <button x-show="state.operation_state === 'active'" x-cloak
+                @click="if (confirm('Encerrar operação? Vai cancelar grade e fechar short.')) stopOperation()"
+                class="px-4 py-1.5 text-sm bg-red-500 text-white rounded-lg hover:bg-red-600">
+            Encerrar operação
+        </button>
+    </div>
+</div>

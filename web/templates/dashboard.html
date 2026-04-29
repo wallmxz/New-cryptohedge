@@ -37,6 +37,9 @@
 
     <!-- Tab: Painel -->
     <div x-show="activeTab === 'painel'" x-cloak class="space-y-5">
+        <!-- Operação atual -->
+        {% include "partials/operation.html" %}
+
         <!-- PnL destaque -->
         <div class="card" style="background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%); border: none;">
             <div class="flex items-center justify-between">

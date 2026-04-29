@@ -17,6 +17,9 @@ function dashboard() {
             range_lower: 0, range_upper: 0, liquidity_l: 0,
             dydx_collateral: 0, margin_ratio: 999, out_of_range: false,
             current_grid: [],
+            current_operation_id: null,
+            operation_state: "none",
+            operation_pnl_breakdown: {},
         },
 
         config: {
@@ -37,6 +40,7 @@ function dashboard() {
 
         logs: [],
         lastUpdate: '—',
+        _opStartedAt: null,
 
         get hasBook() {
             return this.state.best_bid > 0 && this.state.best_ask > 0;
@@ -73,10 +77,68 @@ function dashboard() {
             return { pool, hedge, net };
         },
 
+        get op() {
+            const b = this.state.operation_pnl_breakdown || {};
+            const netPnl = b.net_pnl || 0;
+            const breakdown = [
+                { label: "LP fees recebidas", value: b.lp_fees_earned || 0 },
+                { label: "Beefy perf fee", value: b.beefy_perf_fee || 0 },
+                { label: "IL natural", value: b.il_natural || 0 },
+                { label: "Hedge PnL", value: b.hedge_pnl || 0 },
+                { label: "Funding", value: b.funding || 0 },
+                { label: "Perp fees", value: b.perp_fees_paid || 0 },
+                { label: "Bootstrap slippage", value: b.bootstrap_slippage || 0 },
+            ];
+            return {
+                elapsed: this._formatElapsed(),
+                breakdown: breakdown,
+                netPnl: netPnl,
+            };
+        },
+
+        _formatElapsed() {
+            if (!this._opStartedAt) return "";
+            const sec = Math.max(0, (Date.now() / 1000) - this._opStartedAt);
+            const h = Math.floor(sec / 3600);
+            const m = Math.floor((sec % 3600) / 60);
+            return h + "h " + m + "min";
+        },
+
+        async startOperation() {
+            try {
+                const resp = await fetch("/operations/start", { method: "POST" });
+                if (!resp.ok) {
+                    const err = await resp.json();
+                    alert("Erro ao iniciar: " + (err.error || resp.status));
+                }
+            } catch (e) {
+                alert("Erro: " + e);
+            }
+        },
+
+        async stopOperation() {
+            try {
+                const resp = await fetch("/operations/stop", { method: "POST" });
+                if (!resp.ok) {
+                    const err = await resp.json();
+                    alert("Erro ao encerrar: " + (err.error || resp.status));
+                }
+            } catch (e) {
+                alert("Erro: " + e);
+            }
+        },
+
         init() {
             fetch('/config')
                 .then(r => r.json())
                 .then(data => Object.assign(this.config, data))
+                .catch(() => {});
+
+            fetch('/operations/current')
+                .then(r => r.status === 204 ? null : r.json())
+                .then(data => {
+                    if (data) this._opStartedAt = data.started_at;
+                })
                 .catch(() => {});
 
             const es = new EventSource('/sse/state');
