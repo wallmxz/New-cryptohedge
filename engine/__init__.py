@@ -14,6 +14,7 @@ from engine.curve import compute_l_from_value, compute_x, compute_target_grid, G
 from engine.grid import GridManager
 from engine.hedge import compute_hedge_action
 from engine.operation import Operation, OperationState
+from engine.pnl import compute_operation_pnl
 from engine.reconciler import Reconciler
 from engine.margin import compute_required_collateral, compute_margin_ratio, classify_margin
 from web.alerts import post_alert
@@ -355,6 +356,22 @@ class GridMakerEngine:
         if self._hub.operation_state != "active":
             self._hub.last_update = time.time()
             return
+
+        # Live PnL breakdown for active operation
+        if self._hub.current_operation_id is not None:
+            try:
+                op_row = await self._db.get_operation(self._hub.current_operation_id)
+                if op_row:
+                    op = Operation.from_db_row(op_row)
+                    self._hub.operation_pnl_breakdown = compute_operation_pnl(
+                        op,
+                        current_pool_value_usd=my_value,
+                        current_eth_price=p_now,
+                        hedge_realized_since_baseline=self._hub.hedge_realized_pnl,
+                        hedge_unrealized_since_baseline=self._hub.hedge_unrealized_pnl,
+                    )
+            except Exception as e:
+                logger.error(f"PnL breakdown update failed: {e}")
 
         # Refresh collateral so margin check sees current exchange value.
         try:
