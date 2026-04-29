@@ -44,67 +44,70 @@ async def main(argv: list[str] | None = None) -> int:
 
     cache = Cache(args.cache_path)
     await cache.initialize()
-    fetcher = DataFetcher(cache=cache)
 
-    print("Fetching ETH prices...", flush=True)
-    eth_prices = await fetcher.fetch_eth_prices(start=start_ts, end=end_ts)
-    print(f"  -> {len(eth_prices)} samples", flush=True)
+    try:
+        fetcher = DataFetcher(cache=cache)
 
-    print("Fetching dYdX funding...", flush=True)
-    funding = await fetcher.fetch_dydx_funding(symbol=args.symbol, start=start_ts, end=end_ts)
-    print(f"  -> {len(funding)} samples", flush=True)
+        print("Fetching ETH prices...", flush=True)
+        eth_prices = await fetcher.fetch_eth_prices(start=start_ts, end=end_ts)
+        print(f"  -> {len(eth_prices)} samples", flush=True)
 
-    print("Fetching Beefy APR history...", flush=True)
-    apr_history = await fetcher.fetch_beefy_apr_history(
-        vault=args.vault, start=start_ts, end=end_ts,
-    )
-    print(f"  -> {len(apr_history)} samples", flush=True)
+        print("Fetching dYdX funding...", flush=True)
+        funding = await fetcher.fetch_dydx_funding(symbol=args.symbol, start=start_ts, end=end_ts)
+        print(f"  -> {len(funding)} samples", flush=True)
 
-    config = SimConfig(
-        vault_address=args.vault,
-        pool_address=args.pool,
-        start_ts=start_ts,
-        end_ts=end_ts,
-        capital_lp=args.capital,
-        capital_dydx=args.margin,
-        hedge_ratio=args.hedge_ratio,
-        threshold_aggressive=args.threshold_aggressive,
-        max_open_orders=args.max_open_orders,
-    )
+        print("Fetching Beefy APR history...", flush=True)
+        apr_history = await fetcher.fetch_beefy_apr_history(
+            vault=args.vault, start=start_ts, end=end_ts,
+        )
+        print(f"  -> {len(apr_history)} samples", flush=True)
 
-    static_range = {
-        "tick_lower": args.tick_lower, "tick_upper": args.tick_upper,
-        "amount0": args.token0_amount, "amount1": args.token1_amount,
-        "share": args.share, "raw_balance": int(args.share * 10**18),
-    }
+        config = SimConfig(
+            vault_address=args.vault,
+            pool_address=args.pool,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            capital_lp=args.capital,
+            capital_dydx=args.margin,
+            hedge_ratio=args.hedge_ratio,
+            threshold_aggressive=args.threshold_aggressive,
+            max_open_orders=args.max_open_orders,
+        )
 
-    print("Running simulator...", flush=True)
-    sim = Simulator(
-        config=config,
-        eth_prices=eth_prices,
-        funding=funding,
-        apr_history=apr_history,
-        range_events=[],
-        static_range=static_range,
-    )
-    result = await sim.run()
+        static_range = {
+            "tick_lower": args.tick_lower, "tick_upper": args.tick_upper,
+            "amount0": args.token0_amount, "amount1": args.token1_amount,
+            "share": args.share, "raw_balance": int(args.share * 10**18),
+        }
 
-    print()
-    print(format_text_report(
-        result,
-        capital_lp=args.capital, capital_dydx=args.margin,
-        symbol=args.symbol, start_iso=args.start_iso, end_iso=args.end_iso,
-    ))
+        print("Running simulator...", flush=True)
+        sim = Simulator(
+            config=config,
+            eth_prices=eth_prices,
+            funding=funding,
+            apr_history=apr_history,
+            range_events=[],
+            static_range=static_range,
+        )
+        result = await sim.run()
 
-    if args.output:
-        with open(args.output, "w") as f:
-            f.write(format_json_report(
-                result, capital_lp=args.capital, capital_dydx=args.margin,
-            ))
-        print(f"\nJSON written to {args.output}")
+        print()
+        print(format_text_report(
+            result,
+            capital_lp=args.capital, capital_dydx=args.margin,
+            symbol=args.symbol, start_iso=args.start_iso, end_iso=args.end_iso,
+        ))
 
-    await cache.close()
-    return 0
+        if args.output:
+            with open(args.output, "w") as f:
+                f.write(format_json_report(
+                    result, capital_lp=args.capital, capital_dydx=args.margin,
+                ))
+            print(f"\nJSON written to {args.output}")
+
+        return 0
+    finally:
+        await cache.close()
 
 
 if __name__ == "__main__":

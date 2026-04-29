@@ -81,6 +81,26 @@ class MockExchangeAdapter(ExchangeAdapter):
         cloid_int: int,
         ttl_seconds: int = 86400,
     ) -> Order:
+        # Margin gate: real dYdX rejects orders that would breach the leverage
+        # cap. The mock had no such check, which let the engine's
+        # _aggressive_correct re-fire pattern stack takers to absurd notionals
+        # in the simulator (root cause of the -$502M PnL bug). Apply a
+        # conservative 5x leverage cap on hypothetical post-fill notional.
+        # Closing/reducing orders are always allowed.
+        signed_delta = size if side == "buy" else -size
+        hypothetical_size = self._position_size + signed_delta
+        ref_price = price if price > 0 else self._last_price
+        hypothetical_notional = abs(hypothetical_size) * ref_price
+        max_notional = max(0.0, self._collateral * 5.0)
+        if (
+            hypothetical_notional > max_notional
+            and abs(hypothetical_size) > abs(self._position_size)
+        ):
+            raise ValueError(
+                f"Margin insufficient: notional ${hypothetical_notional:.2f} exceeds "
+                f"5x collateral ${max_notional:.2f}"
+            )
+
         self._open_orders[cloid_int] = _OpenOrder(
             cloid_int=cloid_int, side=side, size=size, price=price,
         )

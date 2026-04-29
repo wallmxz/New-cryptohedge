@@ -429,6 +429,15 @@ async def test_end_to_end_synthetic_run(tmp_path):
     assert result["lp_fees_earned"] > 0
     assert result["duration_seconds"] == 86400 * 7
 
+    # Sanity: PnL should not blow up — margin gate + accurate PnL should keep
+    # it bounded by the total deployed capital. Any drift past this means the
+    # simulator and engine have diverged again.
+    total_capital = config.capital_lp + config.capital_dydx
+    assert abs(result["net_pnl"]) < total_capital, (
+        f"net_pnl={result['net_pnl']} exceeds total capital {total_capital} — "
+        "indicates simulator/engine drift"
+    )
+
     # Reporting works
     text = format_text_report(
         result,

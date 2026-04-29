@@ -1,6 +1,7 @@
 # backtest/data.py
 """Historical data fetchers for backtest. Caches results to SQLite."""
 from __future__ import annotations
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -8,6 +9,9 @@ import httpx
 from backtest.cache import Cache
 
 logger = logging.getLogger(__name__)
+
+# Coinbase Exchange `/products/<id>/candles` returns at most 300 rows per call.
+COINBASE_MAX_CANDLES_PER_PAGE = 300
 
 COINBASE_BASE = "https://api.exchange.coinbase.com"
 DYDX_INDEXER_BASE = "https://indexer.dydx.trade/v4"
@@ -25,7 +29,11 @@ class DataFetcher:
         self, *, start: float, end: float, interval: int = 300,
         product_id: str = "ETH-USD",
     ) -> list[tuple[float, float]]:
-        """Fetch ETH/USD candles between start..end (unix seconds). Returns sorted (ts, close_price)."""
+        """Fetch ETH/USD candles between start..end (unix seconds). Returns sorted (ts, close_price).
+
+        Coinbase Exchange caps responses at 300 candles per request, so we paginate
+        backward from `end` until we cross `start` or the API runs out of data.
+        """
         cache_key = f"eth_prices:{int(start)}:{int(end)}:{interval}"
         cached = await self._cache.get(cache_key)
         if cached is not None:
@@ -36,18 +44,55 @@ class DataFetcher:
         # Returns: [[time, low, high, open, close, volume], ...] (descending by time)
         # granularity in seconds: 60, 300, 900, 3600, 21600, 86400
         url = f"{COINBASE_BASE}/products/{product_id}/candles"
-        params = {"start": int(start), "end": int(end), "granularity": interval}
+
+        seen: set[float] = set()
+        records: list[tuple[float, float]] = []
+        cur_end = int(end)
+        page_count = 0
 
         async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.get(url, params=params)
-            resp.raise_for_status()
-            candles = resp.json()
+            while cur_end > int(start):
+                params = {"start": int(start), "end": cur_end, "granularity": interval}
+                resp = await client.get(url, params=params)
+                resp.raise_for_status()
+                candles = resp.json()
+                if not candles:
+                    break
+
+                new_in_page = 0
+                oldest_ts: float | None = None
+                for c in candles:
+                    ts = float(c[0])
+                    if ts in seen:
+                        continue
+                    if oldest_ts is None or ts < oldest_ts:
+                        oldest_ts = ts
+                    seen.add(ts)
+                    records.append((ts, float(c[4])))
+                    new_in_page += 1
+
+                page_count += 1
+                # Defensive break: API returned only duplicates -> no progress.
+                if new_in_page == 0:
+                    break
+                # Reached start: oldest seen is at-or-before requested start.
+                if oldest_ts is not None and oldest_ts <= float(start):
+                    break
+                # Got fewer than the cap -> no more data older than this window.
+                if len(candles) < COINBASE_MAX_CANDLES_PER_PAGE:
+                    break
+                # Step the window backward: next call asks for candles older than
+                # the oldest one we just received.
+                if oldest_ts is None:
+                    break
+                cur_end = int(oldest_ts) - 1
+
+                # Coinbase public rate limit: 5 req/s; throttle when paginating.
+                if page_count > 1:
+                    await asyncio.sleep(0.25)
 
         # Sort ascending by timestamp; use close price
-        records = sorted(
-            [(float(c[0]), float(c[4])) for c in candles],
-            key=lambda r: r[0],
-        )
+        records.sort(key=lambda r: r[0])
         await self._cache.set(cache_key, json.dumps(records))
         return records
 

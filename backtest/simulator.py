@@ -234,7 +234,7 @@ class Simulator:
                 logger.error(f"Engine iteration error at ts={ts}: {e}")
 
             # Track PnL series
-            net = self._compute_net_pnl(exchange, price)
+            net = self._compute_net_pnl(exchange, price, state)
             self._pnl_series.append((ts, net))
 
             prev_ts = ts
@@ -259,9 +259,19 @@ class Simulator:
             "pnl_series": self._pnl_series,
         }
 
-    def _compute_net_pnl(self, exchange: MockExchangeAdapter, price: float) -> float:
-        """Crude net-PnL estimate: collateral delta + LP fees earned so far.
+    def _compute_net_pnl(
+        self, exchange: MockExchangeAdapter, price: float, state
+    ) -> float:
+        """Net-PnL estimate using the engine's PnL breakdown when available.
 
-        This excludes IL natural and unrealized hedge PnL — refine in T9 if needed.
+        The engine populates ``state.operation_pnl_breakdown`` each iteration via
+        ``compute_operation_pnl`` (LP fees, Beefy perf fee, IL natural, hedge
+        realized + unrealized, funding, perp fees, bootstrap slippage). Use that
+        as the source of truth so the simulator and engine stay aligned. Fall
+        back to the crude collateral-delta calc only on the very first tick,
+        before the engine has had a chance to populate the breakdown.
         """
+        breakdown = state.operation_pnl_breakdown
+        if breakdown and "net_pnl" in breakdown:
+            return float(breakdown["net_pnl"])
         return (exchange._collateral - self._config.capital_dydx) + self._lp_fees_earned
