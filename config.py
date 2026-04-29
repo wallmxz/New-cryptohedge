@@ -13,9 +13,6 @@ class Settings:
     arbitrum_rpc_fallback: str
     clm_vault_address: str
     clm_pool_address: str
-    hyperliquid_api_key: str
-    hyperliquid_api_secret: str
-    hyperliquid_symbol: str
     dydx_mnemonic: str
     dydx_address: str
     dydx_network: str
@@ -48,9 +45,6 @@ class Settings:
             arbitrum_rpc_fallback=os.environ.get("ARBITRUM_RPC_FALLBACK", ""),
             clm_vault_address=os.environ["CLM_VAULT_ADDRESS"],
             clm_pool_address=os.environ["CLM_POOL_ADDRESS"],
-            hyperliquid_api_key=os.environ.get("HYPERLIQUID_API_KEY", ""),
-            hyperliquid_api_secret=os.environ.get("HYPERLIQUID_API_SECRET", ""),
-            hyperliquid_symbol=os.environ.get("HYPERLIQUID_SYMBOL", "ARB"),
             dydx_mnemonic=os.environ.get("DYDX_MNEMONIC", ""),
             dydx_address=os.environ.get("DYDX_ADDRESS", ""),
             dydx_network=os.environ.get("DYDX_NETWORK", "mainnet"),
@@ -64,7 +58,7 @@ class Settings:
             threshold_aggressive=float(os.environ.get("THRESHOLD_AGGRESSIVE", "0.05")),
             threshold_recovery=float(os.environ.get("THRESHOLD_RECOVERY", "0.02")),
             active_exchange=os.environ.get("ACTIVE_EXCHANGE", "hyperliquid"),
-            pool_token0_symbol=os.environ.get("POOL_TOKEN0_SYMBOL", os.environ.get("HYPERLIQUID_SYMBOL", "ARB")),
+            pool_token0_symbol=os.environ.get("POOL_TOKEN0_SYMBOL", "ARB"),
             pool_token1_symbol=os.environ.get("POOL_TOKEN1_SYMBOL", "USDC"),
             pool_token1_is_stable=os.environ.get("POOL_TOKEN1_IS_STABLE", "true").lower() == "true",
             pool_token1_usd_price=float(os.environ.get("POOL_TOKEN1_USD_PRICE", "1.0")),

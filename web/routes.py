@@ -65,7 +65,7 @@ async def get_config(request: Request):
         "clm_pool_address": settings.clm_pool_address,
         "wallet_address": settings.wallet_address,
         "active_exchange": settings.active_exchange,
-        "symbol": settings.hyperliquid_symbol if settings.active_exchange == "hyperliquid" else settings.dydx_symbol,
+        "symbol": settings.dydx_symbol,
         "alert_webhook_url": settings.alert_webhook_url,
         "pool_token0_symbol": settings.pool_token0_symbol,
         "pool_token1_symbol": settings.pool_token1_symbol,
