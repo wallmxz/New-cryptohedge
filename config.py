@@ -31,6 +31,12 @@ class Settings:
     pool_token1_is_stable: bool
     pool_token1_usd_price: float
 
+    # Phase 2.0 on-chain execution
+    uniswap_v3_router_address: str
+    usdc_token_address: str
+    weth_token_address: str
+    slippage_bps: int  # default 30 = 0.3%
+
     @classmethod
     def from_env(cls) -> Settings:
         return cls(
@@ -56,4 +62,17 @@ class Settings:
             pool_token1_symbol=os.environ.get("POOL_TOKEN1_SYMBOL", "USDC"),
             pool_token1_is_stable=os.environ.get("POOL_TOKEN1_IS_STABLE", "true").lower() == "true",
             pool_token1_usd_price=float(os.environ.get("POOL_TOKEN1_USD_PRICE", "1.0")),
+            uniswap_v3_router_address=os.environ.get(
+                "UNISWAP_V3_ROUTER_ADDRESS",
+                "0xE592427A0AEce92De3Edee1F18E0157C05861564",  # Arbitrum SwapRouter
+            ),
+            usdc_token_address=os.environ.get(
+                "USDC_TOKEN_ADDRESS",
+                "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",  # Native USDC Arbitrum
+            ),
+            weth_token_address=os.environ.get(
+                "WETH_TOKEN_ADDRESS",
+                "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",  # WETH Arbitrum
+            ),
+            slippage_bps=int(os.environ.get("SLIPPAGE_BPS", "30")),
         )

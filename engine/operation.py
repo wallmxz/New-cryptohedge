@@ -43,6 +43,13 @@ class Operation:
     bootstrap_slippage: float = 0.0
     final_net_pnl: float | None = None
     close_reason: str | None = None
+    # Phase 2.0
+    usdc_budget: float | None = None
+    bootstrap_state: str = "pending"
+    bootstrap_swap_tx_hash: str | None = None
+    bootstrap_deposit_tx_hash: str | None = None
+    teardown_withdraw_tx_hash: str | None = None
+    teardown_swap_tx_hash: str | None = None
 
     def is_active(self) -> bool:
         return self.state in (
@@ -67,4 +74,10 @@ class Operation:
             bootstrap_slippage=row.get("bootstrap_slippage", 0.0) or 0.0,
             final_net_pnl=row.get("final_net_pnl"),
             close_reason=row.get("close_reason"),
+            usdc_budget=row.get("usdc_budget"),
+            bootstrap_state=row.get("bootstrap_state") or "pending",
+            bootstrap_swap_tx_hash=row.get("bootstrap_swap_tx_hash"),
+            bootstrap_deposit_tx_hash=row.get("bootstrap_deposit_tx_hash"),
+            teardown_withdraw_tx_hash=row.get("teardown_withdraw_tx_hash"),
+            teardown_swap_tx_hash=row.get("teardown_swap_tx_hash"),
         )
