@@ -250,6 +250,13 @@ class GridMakerEngine:
             except Exception as e:
                 logger.error(f"Initial reconciliation failed: {e}")
 
+        # Restore active operation, if any
+        active_op = await self._db.get_active_operation()
+        if active_op is not None:
+            self._hub.current_operation_id = active_op["id"]
+            self._hub.operation_state = active_op["status"]
+            logger.info(f"Restored active operation {active_op['id']} (status={active_op['status']})")
+
         await self._exchange.subscribe_fills(self._settings.dydx_symbol, self._on_fill)
 
         self._running = True

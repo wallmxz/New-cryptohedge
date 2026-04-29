@@ -367,6 +367,7 @@ async def test_engine_recovery_reconciles_on_start():
         {"cloid": "999", "side": "sell"}  # stale from previous run
     ])
     db.mark_grid_order_cancelled = AsyncMock()
+    db.get_active_operation = AsyncMock(return_value=None)
 
     exchange = MagicMock()
     exchange.connect = AsyncMock()
@@ -579,5 +580,46 @@ async def test_engine_updates_live_pnl_breakdown(tmp_path):
     assert "lp_fees_earned" in state.operation_pnl_breakdown
     assert "net_pnl" in state.operation_pnl_breakdown
     assert isinstance(state.operation_pnl_breakdown["net_pnl"], (int, float))
+
+
+@pytest.mark.asyncio
+async def test_engine_recovery_restores_active_operation(tmp_path):
+    """On start(), if DB has an active operation, restore it to hub."""
+    from db import Database
+    from engine import GridMakerEngine
+    from state import StateHub
+
+    db = Database(str(tmp_path / "t6.db"))
+    await db.initialize()
+
+    op_id = await db.insert_operation(
+        started_at=1000.0, status="active",
+        baseline_eth_price=3000.0, baseline_pool_value_usd=300.0,
+        baseline_amount0=0.05, baseline_amount1=150.0, baseline_collateral=130.0,
+    )
+
+    state = StateHub()
+    settings = MagicMock()
+    settings.dydx_symbol = "ETH-USD"
+
+    exchange = MagicMock()
+    exchange.connect = AsyncMock()
+    exchange.disconnect = AsyncMock()
+    exchange.subscribe_fills = AsyncMock()
+    exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+    exchange.name = "dydx"
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=exchange, pool_reader=MagicMock(), beefy_reader=MagicMock(),
+    )
+    engine._iterate = AsyncMock()
+    await engine.start()
+
+    assert state.current_operation_id == op_id
+    assert state.operation_state == "active"
+
+    await engine.stop()
+    await db.close()
 
     await db.close()
