@@ -42,11 +42,22 @@ Stack: Python 3.14, asyncio, Starlette + Alpine.js, web3.py, dydx-v4-client, aio
   - Spec: `docs/superpowers/specs/2026-04-27-operation-lifecycle-design.md`
   - Plan: `docs/superpowers/plans/2026-04-27-operation-lifecycle.md`
 
+- ✅ **Phase 1.3 — Observability + Cleanup** (tag `fase-1.3-completa`, branch feature/observability)
+  - 11 tasks, 124 testes
+  - Prometheus metrics em `/metrics` (counters/gauges/histograms; auth bypassed)
+  - Logs estruturados JSON via `LOG_FORMAT=json` env var
+  - Latency tracing: `hub.last_iter_timings` populado a cada loop, exposto em health card no dashboard
+  - Cleanup: removidos `hyperliquid_api_key/secret/symbol` do `Settings`
+  - Stack adicionada: `prometheus-client>=0.21,<1.0`, `python-json-logger>=2.0,<3.0`
+  - Spec: `docs/superpowers/specs/2026-04-28-observability-design.md`
+  - Plan: `docs/superpowers/plans/2026-04-28-observability.md`
+
 ### Não iniciado
 
-- Phase 1.3 — Refinamentos do engine (adaptive grid spacing + observability)
-- Phase 1.4 — Backtesting framework
+- Phase 1.4 — Backtesting framework (simular estratégia em dados históricos)
+- Phase 2.0 — On-chain execution automática (swap Uniswap + deposit/withdraw Beefy)
 - Pré-produção — Testnet rehearsal antes de mainnet
+- Adaptive grid spacing — descartado em Phase 1.3 (grade já em densidade máxima do exchange)
 
 ## Decisões já tomadas (não revisitar sem motivo)
 
