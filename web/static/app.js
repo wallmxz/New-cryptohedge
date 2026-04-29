@@ -20,6 +20,7 @@ function dashboard() {
             current_operation_id: null,
             operation_state: "none",
             operation_pnl_breakdown: {},
+            last_iter_timings: {},
         },
 
         config: {
@@ -95,6 +96,23 @@ function dashboard() {
                 breakdown: breakdown,
                 netPnl: netPnl,
             };
+        },
+
+        get healthSteps() {
+            const t = this.state.last_iter_timings || {};
+            const order = [
+                ["chain_read", "Read chain"],
+                ["margin_check", "Margin check"],
+                ["grid_compute", "Compute grid"],
+                ["grid_diff_apply", "Place/cancel"],
+                ["pnl_breakdown", "PnL breakdown"],
+                ["total", "Total"],
+            ];
+            const out = [];
+            for (const [name, label] of order) {
+                if (name in t) out.push({ name, label, ms: t[name] });
+            }
+            return out;
         },
 
         _formatElapsed() {
