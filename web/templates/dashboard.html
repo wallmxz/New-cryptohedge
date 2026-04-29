@@ -9,6 +9,7 @@
             <div class="tab-bar">
                 <button class="tab-btn" :class="activeTab === 'painel' && 'tab-active'" @click="activeTab = 'painel'">Painel</button>
                 <button class="tab-btn" :class="activeTab === 'operacoes' && 'tab-active'" @click="activeTab = 'operacoes'">Operacoes</button>
+                <button class="tab-btn" :class="activeTab === 'historico' && 'tab-active'" @click="activeTab = 'historico'; loadHistory()">Histórico</button>
             </div>
         </div>
         <div class="flex items-center gap-3">
@@ -37,6 +38,9 @@
 
     <!-- Tab: Painel -->
     <div x-show="activeTab === 'painel'" x-cloak class="space-y-5">
+        <!-- Operação atual -->
+        {% include "partials/operation.html" %}
+
         <!-- PnL destaque -->
         <div class="card" style="background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%); border: none;">
             <div class="flex items-center justify-between">
@@ -100,6 +104,11 @@
             {% include "partials/logs.html" %}
         </div>
         {% include "partials/reports.html" %}
+    </div>
+
+    <!-- Tab: Historico -->
+    <div x-show="activeTab === 'historico'" x-cloak class="space-y-5">
+        {% include "partials/history.html" %}
     </div>
 
     <!-- Modal: Configuracoes -->

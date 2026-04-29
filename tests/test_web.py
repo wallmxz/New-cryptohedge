@@ -36,3 +36,20 @@ def test_dashboard_with_valid_auth(app):
     creds = base64.b64encode(b"admin:secret").decode()
     resp = client.get("/", headers={"Authorization": f"Basic {creds}"})
     assert resp.status_code == 200
+
+
+def test_operations_endpoints_exist(app):
+    import base64
+    from starlette.testclient import TestClient
+    creds = base64.b64encode(b"admin:secret").decode()
+    headers = {"Authorization": f"Basic {creds}"}
+
+    client = TestClient(app)
+    # GET /operations should return 200 with empty list
+    resp = client.get("/operations", headers=headers)
+    assert resp.status_code == 200
+    assert isinstance(resp.json(), list)
+
+    # GET /operations/current should return 204 when none active
+    resp = client.get("/operations/current", headers=headers)
+    assert resp.status_code == 204

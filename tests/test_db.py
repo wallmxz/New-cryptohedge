@@ -139,3 +139,65 @@ async def test_mark_grid_order_filled(db):
     await db.mark_grid_order_filled("hb-r1-l5-1", fill_id)
     active = await db.get_active_grid_orders()
     assert len(active) == 0
+
+
+async def test_insert_and_get_active_operation(db):
+    op_id = await db.insert_operation(
+        started_at=1000.0, status="starting",
+        baseline_eth_price=3000.0, baseline_pool_value_usd=300.0,
+        baseline_amount0=0.05, baseline_amount1=150.0,
+        baseline_collateral=130.0,
+    )
+    active = await db.get_active_operation()
+    assert active is not None
+    assert active["id"] == op_id
+    assert active["status"] == "starting"
+
+
+async def test_close_operation(db):
+    op_id = await db.insert_operation(
+        started_at=1000.0, status="active",
+        baseline_eth_price=3000.0, baseline_pool_value_usd=300.0,
+        baseline_amount0=0.05, baseline_amount1=150.0,
+        baseline_collateral=130.0,
+    )
+    await db.close_operation(op_id, ended_at=2000.0, final_net_pnl=5.50, close_reason="user")
+    active = await db.get_active_operation()
+    assert active is None
+    history = await db.get_operations(limit=10)
+    assert len(history) == 1
+    assert history[0]["status"] == "closed"
+    assert history[0]["final_net_pnl"] == 5.50
+
+
+async def test_operation_id_fk_in_fills(db):
+    """Fills should accept operation_id and surface it on read."""
+    op_id = await db.insert_operation(
+        started_at=1000.0, status="active",
+        baseline_eth_price=3000.0, baseline_pool_value_usd=300.0,
+        baseline_amount0=0.05, baseline_amount1=150.0,
+        baseline_collateral=130.0,
+    )
+    fill_id = await db.insert_fill(
+        timestamp=1500.0, exchange="dydx", symbol="ETH-USD",
+        side="sell", size=0.001, price=3000.0, fee=0.0003, fee_currency="USDC",
+        liquidity="maker", realized_pnl=0.0, order_id="cl-1",
+        operation_id=op_id,
+    )
+    rows = await db.get_fills()
+    assert rows[0]["operation_id"] == op_id
+
+
+async def test_operation_accumulators_update(db):
+    op_id = await db.insert_operation(
+        started_at=1000.0, status="active",
+        baseline_eth_price=3000.0, baseline_pool_value_usd=300.0,
+        baseline_amount0=0.05, baseline_amount1=150.0,
+        baseline_collateral=130.0,
+    )
+    await db.add_to_operation_accumulator(op_id, "perp_fees_paid", 0.5)
+    await db.add_to_operation_accumulator(op_id, "perp_fees_paid", 0.3)
+    await db.add_to_operation_accumulator(op_id, "lp_fees_earned", 2.10)
+    op = await db.get_operation(op_id)
+    assert abs(op["perp_fees_paid"] - 0.8) < 1e-9
+    assert abs(op["lp_fees_earned"] - 2.10) < 1e-9

@@ -1,0 +1,27 @@
+<!-- web/templates/partials/history.html -->
+<div class="card">
+    <p class="card-title">Histórico de operações</p>
+    <div x-show="history.length === 0" class="text-sm text-slate-400 py-4 text-center">
+        Nenhuma operação encerrada ainda
+    </div>
+    <div class="space-y-2">
+        <template x-for="op in history" :key="op.id">
+            <div class="border border-slate-200 rounded-lg p-3 hover:bg-slate-50">
+                <div class="flex justify-between items-center">
+                    <div>
+                        <span class="font-medium text-slate-700" x-text="'Op #' + op.id"></span>
+                        <span class="text-xs text-slate-400 ml-2"
+                              x-text="new Date(op.started_at * 1000).toLocaleString()"></span>
+                    </div>
+                    <span class="font-mono font-semibold"
+                          :class="(op.final_net_pnl || 0) >= 0 ? 'text-emerald-600' : 'text-red-500'"
+                          x-text="((op.final_net_pnl || 0) >= 0 ? '+$' : '-$') + Math.abs(op.final_net_pnl || 0).toFixed(2)"></span>
+                </div>
+                <div class="text-xs text-slate-400 mt-1">
+                    <span x-text="op.status"></span>
+                    <span x-show="op.ended_at" x-text="' • ' + Math.round((op.ended_at - op.started_at) / 60) + ' min'"></span>
+                </div>
+            </div>
+        </template>
+    </div>
+</div>

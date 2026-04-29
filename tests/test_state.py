@@ -49,3 +49,11 @@ def test_statehub_grid_fields_default():
     assert s.dydx_collateral == 0.0
     assert s.margin_ratio == 999.0  # sentinel: no position yet
     assert s.out_of_range is False
+
+
+def test_statehub_operation_fields_default():
+    from state import StateHub
+    s = StateHub()
+    assert s.current_operation_id is None
+    assert s.operation_state == "none"
+    assert s.operation_pnl_breakdown == {}

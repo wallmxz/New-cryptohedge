@@ -12,7 +12,8 @@ from exchanges.dydx import DydxAdapter
 from exchanges.base import ExchangeAdapter
 from engine.curve import compute_l_from_value, compute_x, compute_target_grid, GridLevel
 from engine.grid import GridManager
-from engine.hedge import compute_hedge_action
+from engine.operation import Operation, OperationState
+from engine.pnl import compute_operation_pnl
 from engine.reconciler import Reconciler
 from engine.margin import compute_required_collateral, compute_margin_ratio, classify_margin
 from web.alerts import post_alert
@@ -60,6 +61,132 @@ class GridMakerEngine:
                 db=self._db, exchange=self._exchange, settings=self._settings,
             )
         return self._reconciler
+
+    async def start_operation(self) -> int:
+        """Begin a new operation: snapshot baseline, bootstrap short, mark ACTIVE."""
+        existing = await self._db.get_active_operation()
+        if existing is not None:
+            raise RuntimeError(f"Operation {existing['id']} already active")
+
+        # Snapshot baseline
+        p_now = await self._pool_reader.read_price()
+        beefy_pos = await self._beefy_reader.read_position()
+        my_amount0 = beefy_pos.amount0 * beefy_pos.share
+        my_amount1 = beefy_pos.amount1 * beefy_pos.share
+        pool_value = my_amount0 * p_now + my_amount1
+        try:
+            collateral = await self._exchange.get_collateral()
+        except Exception:
+            collateral = 0.0
+
+        op_id = await self._db.insert_operation(
+            started_at=time.time(), status=OperationState.STARTING.value,
+            baseline_eth_price=p_now,
+            baseline_pool_value_usd=pool_value,
+            baseline_amount0=my_amount0,
+            baseline_amount1=my_amount1,
+            baseline_collateral=collateral,
+        )
+        self._hub.current_operation_id = op_id
+        self._hub.operation_state = OperationState.STARTING.value
+
+        # Bootstrap: open short = my_amount0 * hedge_ratio via taker
+        target_short = my_amount0 * self._hub.hedge_ratio
+        if target_short > 0:
+            try:
+                await self._exchange.place_long_term_order(
+                    symbol=self._settings.dydx_symbol,
+                    side="sell", size=target_short,
+                    price=p_now * 0.999,  # cross spread (taker)
+                    cloid_int=self._next_cloid(998),
+                    ttl_seconds=60,
+                )
+                # Slippage estimate: 5 bps of notional
+                slippage = 0.0005 * target_short * p_now
+                await self._db.add_to_operation_accumulator(
+                    op_id, "bootstrap_slippage", slippage,
+                )
+            except Exception as e:
+                logger.exception(f"Bootstrap failed: {e}")
+                await self._db.update_operation_status(op_id, OperationState.FAILED.value)
+                self._hub.operation_state = OperationState.FAILED.value
+                self._hub.current_operation_id = None
+                raise
+
+        await self._db.update_operation_status(op_id, OperationState.ACTIVE.value)
+        self._hub.operation_state = OperationState.ACTIVE.value
+        logger.info(f"Operation {op_id} started")
+        return op_id
+
+    async def stop_operation(self, *, close_reason: str = "user") -> dict:
+        """Encerra a operação ativa: cancela grade, fecha short, grava final_pnl."""
+        op_row = await self._db.get_active_operation()
+        if op_row is None:
+            raise RuntimeError("No active operation to stop")
+        op_id = op_row["id"]
+
+        await self._db.update_operation_status(op_id, OperationState.STOPPING.value)
+        self._hub.operation_state = OperationState.STOPPING.value
+
+        # 1. Cancel all active grid orders
+        active_orders = await self._db.get_active_grid_orders()
+        if active_orders:
+            try:
+                await self._exchange.batch_cancel([
+                    dict(symbol=self._settings.dydx_symbol, cloid_int=int(r["cloid"]))
+                    for r in active_orders
+                ])
+                for r in active_orders:
+                    await self._db.mark_grid_order_cancelled(r["cloid"], time.time())
+            except Exception as e:
+                logger.error(f"Cancel grid during stop failed: {e}")
+
+        # 2. Close short via taker
+        pos = await self._exchange.get_position(self._settings.dydx_symbol)
+        if pos and pos.size > 0:
+            p_now = await self._pool_reader.read_price()
+            side = "buy" if pos.side == "short" else "sell"
+            # Cross spread for fast fill
+            price = p_now * 1.001 if side == "buy" else p_now * 0.999
+            try:
+                await self._exchange.place_long_term_order(
+                    symbol=self._settings.dydx_symbol,
+                    side=side, size=pos.size, price=price,
+                    cloid_int=self._next_cloid(997), ttl_seconds=60,
+                )
+                slippage = 0.0005 * pos.size * p_now
+                await self._db.add_to_operation_accumulator(
+                    op_id, "perp_fees_paid", slippage,
+                )
+            except Exception as e:
+                logger.exception(f"Close short during stop failed: {e}")
+
+        # 3. Compute final PnL
+        op = Operation.from_db_row(await self._db.get_operation(op_id))
+        p_now = await self._pool_reader.read_price()
+        beefy_pos = await self._beefy_reader.read_position()
+        my_amount0 = beefy_pos.amount0 * beefy_pos.share
+        my_amount1 = beefy_pos.amount1 * beefy_pos.share
+        pool_value = my_amount0 * p_now + my_amount1
+
+        from engine.pnl import compute_operation_pnl
+        breakdown = compute_operation_pnl(
+            op,
+            current_pool_value_usd=pool_value,
+            current_eth_price=p_now,
+            hedge_realized_since_baseline=self._hub.hedge_realized_pnl,
+            hedge_unrealized_since_baseline=self._hub.hedge_unrealized_pnl,
+        )
+
+        await self._db.close_operation(
+            op_id, ended_at=time.time(),
+            final_net_pnl=breakdown["net_pnl"], close_reason=close_reason,
+        )
+        self._hub.current_operation_id = None
+        self._hub.operation_state = OperationState.NONE.value
+        self._hub.operation_pnl_breakdown = {}
+        logger.info(f"Operation {op_id} closed; final PnL = {breakdown['net_pnl']:.2f}")
+        return {"id": op_id, "final_net_pnl": breakdown["net_pnl"], "breakdown": breakdown}
 
     async def _check_margin_and_alert(self, peak_short_size: float, p_now: float):
         required = compute_required_collateral(
@@ -121,6 +248,13 @@ class GridMakerEngine:
                 logger.info("Initial reconciliation complete")
             except Exception as e:
                 logger.error(f"Initial reconciliation failed: {e}")
+
+        # Restore active operation, if any
+        active_op = await self._db.get_active_operation()
+        if active_op is not None:
+            self._hub.current_operation_id = active_op["id"]
+            self._hub.operation_state = active_op["status"]
+            logger.info(f"Restored active operation {active_op['id']} (status={active_op['status']})")
 
         await self._exchange.subscribe_fills(self._settings.dydx_symbol, self._on_fill)
 
@@ -224,6 +358,27 @@ class GridMakerEngine:
         L_user = compute_l_from_value(my_value, p_a, p_b, p_now)
         self._hub.liquidity_l = L_user
 
+        # 2.5. If no active operation, stop here — read state but skip grid
+        if self._hub.operation_state != "active":
+            self._hub.last_update = time.time()
+            return
+
+        # Live PnL breakdown for active operation
+        if self._hub.current_operation_id is not None:
+            try:
+                op_row = await self._db.get_operation(self._hub.current_operation_id)
+                if op_row:
+                    op = Operation.from_db_row(op_row)
+                    self._hub.operation_pnl_breakdown = compute_operation_pnl(
+                        op,
+                        current_pool_value_usd=my_value,
+                        current_eth_price=p_now,
+                        hedge_realized_since_baseline=self._hub.hedge_realized_pnl,
+                        hedge_unrealized_since_baseline=self._hub.hedge_unrealized_pnl,
+                    )
+            except Exception as e:
+                logger.error(f"PnL breakdown update failed: {e}")
+
         # Refresh collateral so margin check sees current exchange value.
         try:
             self._hub.dydx_collateral = await self._exchange.get_collateral()
@@ -309,6 +464,7 @@ class GridMakerEngine:
                         cloid=str(spec["cloid_int"]),
                         side=spec["side"], target_price=spec["price"],
                         size=spec["size"], placed_at=time.time(),
+                        operation_id=self._hub.current_operation_id,
                     )
 
         # 6. Update margin/collateral
@@ -336,28 +492,30 @@ class GridMakerEngine:
                 timestamp=time.time(), exchange=self._exchange.name,
                 action="place", side=side, size=size, price=price,
                 reason="aggressive_correction",
+                operation_id=self._hub.current_operation_id,
             )
             logger.warning(f"Aggressive correction: {side} {size} @ {price}")
         except Exception as e:
             logger.exception(f"Aggressive order failed: {e}")
 
     async def _on_fill(self, fill):
-        """Handle a fill event from the exchange WS."""
+        """Handle a fill event from the exchange WS, attribute to active operation."""
+        op_id = self._hub.current_operation_id  # may be None
+
         fill_id = await self._db.insert_fill(
             timestamp=fill.timestamp, exchange=self._exchange.name,
             symbol=fill.symbol, side=fill.side, size=fill.size, price=fill.price,
             fee=fill.fee, fee_currency=fill.fee_currency, liquidity=fill.liquidity,
             realized_pnl=fill.realized_pnl, order_id=fill.order_id,
+            operation_id=op_id,
         )
 
-        # Update grid order if matches
         if fill.order_id:
             try:
                 await self._db.mark_grid_order_filled(fill.order_id, fill_id)
             except Exception:
                 pass
 
-        # Update aggregates in state
         if fill.liquidity == "maker":
             self._hub.total_maker_fills += 1
             self._hub.total_maker_volume += fill.size
@@ -368,10 +526,14 @@ class GridMakerEngine:
         self._hub.hedge_realized_pnl += fill.realized_pnl
         self._hub.last_update = time.time()
 
+        # Attribute fee to the active operation
+        if op_id is not None and fill.fee > 0:
+            await self._db.add_to_operation_accumulator(op_id, "perp_fees_paid", fill.fee)
+
         await self._db.insert_order_log(
             timestamp=time.time(), exchange=self._exchange.name,
             action="fill", side=fill.side, size=fill.size, price=fill.price,
-            reason=fill.liquidity,
+            reason=fill.liquidity, operation_id=op_id,
         )
 
     async def _handle_out_of_range_upper(self):

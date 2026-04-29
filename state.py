@@ -57,6 +57,11 @@ class StateHub:
     safe_mode: bool = False
     last_update: float = field(default_factory=time.time)
 
+    # Operation lifecycle
+    current_operation_id: int | None = None
+    operation_state: str = "none"  # none/starting/active/stopping/closed/failed
+    operation_pnl_breakdown: dict = field(default_factory=dict)
+
     def to_dict(self) -> dict:
         self.last_update = time.time()
         return asdict(self)
