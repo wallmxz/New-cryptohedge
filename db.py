@@ -392,6 +392,21 @@ class Database:
         )
         await self._conn.commit()
 
+    async def update_baseline_amounts(
+        self, operation_id: int, *,
+        amount0: float, amount1: float, pool_value_usd: float,
+    ) -> None:
+        """Update baseline_amount0, baseline_amount1, baseline_pool_value_usd
+        after on-chain deposit completes (lifecycle.bootstrap step 4).
+        """
+        await self._conn.execute(
+            """UPDATE operations
+               SET baseline_amount0 = ?, baseline_amount1 = ?, baseline_pool_value_usd = ?
+               WHERE id = ?""",
+            (amount0, amount1, pool_value_usd, operation_id),
+        )
+        await self._conn.commit()
+
     async def update_bootstrap_state(
         self, operation_id: int, state: str,
         *, swap_tx_hash: str | None = None,

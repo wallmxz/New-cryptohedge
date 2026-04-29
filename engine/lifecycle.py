@@ -160,7 +160,7 @@ class OperationLifecycle:
                 tx = await self._uniswap.swap_exact_output(
                     token_in=self._settings.usdc_token_address,
                     token_out=self._settings.weth_token_address,
-                    fee=500,
+                    fee=self._settings.uniswap_v3_pool_fee,
                     amount_out=amount_out_raw,
                     amount_in_maximum=amount_in_max,
                     recipient=self._uniswap.address,
@@ -188,6 +188,12 @@ class OperationLifecycle:
             beefy_pos_after = await self._beefy_reader.read_position()
             my_amount0 = beefy_pos_after.amount0 * beefy_pos_after.share
             my_amount1 = beefy_pos_after.amount1 * beefy_pos_after.share
+            real_pool_value = my_amount0 * p_now + my_amount1
+            await self._db.update_baseline_amounts(
+                op_id,
+                amount0=my_amount0, amount1=my_amount1,
+                pool_value_usd=real_pool_value,
+            )
 
             # Step 5: Hedge
             await self._db.update_bootstrap_state(op_id, "hedge_pending")
@@ -291,7 +297,7 @@ class OperationLifecycle:
                     tx = await self._uniswap.swap_exact_input(
                         token_in=self._settings.weth_token_address,
                         token_out=self._settings.usdc_token_address,
-                        fee=500,
+                        fee=self._settings.uniswap_v3_pool_fee,
                         amount_in=amount_in_raw,
                         amount_out_minimum=min_out,
                         recipient=self._uniswap.address,

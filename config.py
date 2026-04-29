@@ -36,6 +36,7 @@ class Settings:
     usdc_token_address: str
     weth_token_address: str
     slippage_bps: int  # default 30 = 0.3%
+    uniswap_v3_pool_fee: int  # 500 = 0.05%, 3000 = 0.30%
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -52,7 +53,7 @@ class Settings:
             dydx_address=os.environ.get("DYDX_ADDRESS", ""),
             dydx_network=os.environ.get("DYDX_NETWORK", "mainnet"),
             dydx_subaccount=int(os.environ.get("DYDX_SUBACCOUNT", "0")),
-            dydx_symbol=os.environ.get("DYDX_SYMBOL", "ARB-USD"),
+            dydx_symbol=os.environ.get("DYDX_SYMBOL", "ETH-USD"),
             alert_webhook_url=os.environ.get("ALERT_WEBHOOK_URL", ""),
             hedge_ratio=float(os.environ.get("HEDGE_RATIO", "1.0")),
             max_open_orders=int(os.environ.get("MAX_OPEN_ORDERS", "200")),
@@ -75,4 +76,5 @@ class Settings:
                 "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",  # WETH Arbitrum
             ),
             slippage_bps=int(os.environ.get("SLIPPAGE_BPS", "30")),
+            uniswap_v3_pool_fee=int(os.environ.get("UNISWAP_V3_POOL_FEE", "500")),
         )

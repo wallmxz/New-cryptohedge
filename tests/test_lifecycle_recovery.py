@@ -11,6 +11,7 @@ def mock_settings():
     s.usdc_token_address = "0xUSDC"
     s.weth_token_address = "0xWETH"
     s.slippage_bps = 30
+    s.uniswap_v3_pool_fee = 500
     s.alert_webhook_url = ""
     s.clm_vault_address = "0xStrategy"
     return s
@@ -31,6 +32,7 @@ def mock_db():
     db = MagicMock()
     db.update_bootstrap_state = AsyncMock()
     db.update_operation_status = AsyncMock()
+    db.update_baseline_amounts = AsyncMock()
     return db
 
 
@@ -139,3 +141,50 @@ async def test_resume_marks_failed_on_unexpected_state(lifecycle, mock_db):
     }])
     await lifecycle.resume_in_flight()
     mock_db.update_bootstrap_state.assert_any_call(7, "failed")
+
+
+@pytest.mark.asyncio
+async def test_resume_deposit_pending_with_hash_waits_then_continues(
+    lifecycle, mock_db, mock_beefy_exec,
+):
+    """If deposit was submitted (tx_hash exists) but not confirmed: wait, advance, continue."""
+    mock_db.get_in_flight_operations = AsyncMock(return_value=[{
+        "id": 8, "bootstrap_state": "deposit_pending",
+        "bootstrap_swap_tx_hash": "0xswap_done",
+        "bootstrap_deposit_tx_hash": "0xpending_deposit",
+        "usdc_budget": 300.0,
+    }])
+    with patch.object(lifecycle, "_continue_bootstrap", AsyncMock()) as mock_continue:
+        await lifecycle.resume_in_flight()
+    mock_beefy_exec.wait_for_receipt.assert_awaited_with("0xpending_deposit")
+    mock_continue.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resume_teardown_withdraw_pending_waits_then_continues(
+    lifecycle, mock_db, mock_beefy_exec,
+):
+    """If withdraw was submitted (tx_hash exists) but not confirmed: wait, advance, continue."""
+    mock_db.get_in_flight_operations = AsyncMock(return_value=[{
+        "id": 9, "bootstrap_state": "teardown_withdraw_pending",
+        "teardown_withdraw_tx_hash": "0xpending_withdraw",
+    }])
+    with patch.object(lifecycle, "_continue_teardown", AsyncMock()) as mock_continue:
+        await lifecycle.resume_in_flight()
+    mock_beefy_exec.wait_for_receipt.assert_awaited_with("0xpending_withdraw")
+    mock_continue.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_resume_teardown_swap_pending_waits_then_continues(
+    lifecycle, mock_db, mock_uniswap,
+):
+    """If teardown swap was submitted (tx_hash exists) but not confirmed: wait, advance, continue."""
+    mock_db.get_in_flight_operations = AsyncMock(return_value=[{
+        "id": 10, "bootstrap_state": "teardown_swap_pending",
+        "teardown_swap_tx_hash": "0xpending_teardownswap",
+    }])
+    with patch.object(lifecycle, "_continue_teardown", AsyncMock()) as mock_continue:
+        await lifecycle.resume_in_flight()
+    mock_uniswap.wait_for_receipt.assert_awaited_with("0xpending_teardownswap")
+    mock_continue.assert_awaited_once()

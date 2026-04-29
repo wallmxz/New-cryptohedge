@@ -12,6 +12,7 @@ def mock_settings():
     s.usdc_token_address = "0xUSDC"
     s.weth_token_address = "0xWETH"
     s.slippage_bps = 30
+    s.uniswap_v3_pool_fee = 500
     s.clm_vault_address = "0xStrategy"
     s.alert_webhook_url = ""
     return s
@@ -43,6 +44,7 @@ def mock_db():
     db.get_operation = AsyncMock(return_value=None)
     db.get_active_grid_orders = AsyncMock(return_value=[])
     db.mark_grid_order_cancelled = AsyncMock()
+    db.update_baseline_amounts = AsyncMock()
     return db
 
 
@@ -243,3 +245,20 @@ async def test_teardown_rejects_when_no_active(lifecycle, mock_db):
     mock_db.get_active_operation = AsyncMock(return_value=None)
     with pytest.raises(RuntimeError, match="No active operation"):
         await lifecycle.teardown()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_persists_real_baseline_after_deposit(lifecycle, mock_db, mock_beefy_reader):
+    """After deposit, lifecycle should persist the REAL post-deposit amounts to ops table."""
+    with patch.object(lifecycle, "_read_wallet_balance", AsyncMock(return_value={"weth": 0.046, "usdc": 162.0, "eth": 0.01})):
+        with patch.object(lifecycle, "_check_gas_balance", AsyncMock(return_value=None)):
+            await lifecycle.bootstrap(usdc_budget=300.0)
+
+    # Verify update_baseline_amounts was called
+    assert mock_db.update_baseline_amounts.called, "update_baseline_amounts must be called after deposit"
+    # The values come from beefy_pos_after.amount0 * .share, .amount1 * .share
+    # mock_beefy_reader returns amount0=0.5, amount1=1500.0, share=1.0 -> 0.5 WETH + $1500
+    call_kwargs = mock_db.update_baseline_amounts.call_args.kwargs
+    assert call_kwargs["amount0"] > 0
+    assert call_kwargs["amount1"] > 0
+    assert call_kwargs["pool_value_usd"] > 0

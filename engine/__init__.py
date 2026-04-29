@@ -70,14 +70,21 @@ class GridMakerEngine:
         return self._reconciler
 
     async def start_operation(self, *, usdc_budget: float | None = None) -> int:
-        """Begin a new operation. If usdc_budget is provided AND lifecycle is
-        configured, do full on-chain bootstrap (Phase 2.0). Otherwise fall back
-        to the legacy snapshot+hedge-only path (Phase 1.2).
+        """Begin a new operation. Routes via lifecycle when configured.
+
+        When lifecycle is configured, usdc_budget is REQUIRED. Missing budget
+        raises RuntimeError to prevent silent fallback to legacy snapshot-only.
+        Legacy path (no lifecycle) is preserved for backwards compat with tests.
         """
-        if usdc_budget is not None and self._lifecycle is not None:
+        if self._lifecycle is not None:
+            if usdc_budget is None:
+                raise RuntimeError(
+                    "usdc_budget required when lifecycle is configured. "
+                    "Pass {usdc_budget: <float>} in request body."
+                )
             return await self._lifecycle.bootstrap(usdc_budget=usdc_budget)
 
-        # Legacy path: existing Phase 1.2 behavior
+        # Legacy path: existing Phase 1.2 behavior (no on-chain bootstrap)
         existing = await self._db.get_active_operation()
         if existing is not None:
             raise RuntimeError(f"Operation {existing['id']} already active")
@@ -137,16 +144,24 @@ class GridMakerEngine:
     async def stop_operation(
         self, *, close_reason: str = "user", swap_to_usdc: bool = False,
     ) -> dict:
-        """Stop the active operation. If lifecycle is configured, do full teardown
-        (cancel grid + close short + withdraw + optional swap). Otherwise legacy
-        Phase 1.2 path."""
-        if self._lifecycle is not None:
+        """Stop the active operation. If lifecycle is configured AND this op was
+        bootstrapped through lifecycle, do full teardown. Otherwise legacy path.
+
+        Legacy ops (Phase 1.2) have bootstrap_state='pending' (default) since they
+        never went through lifecycle.bootstrap. Routing them through lifecycle.teardown
+        would call beefy.withdraw on the user's full vault balance, draining shares
+        not deposited by this op. Gate on bootstrap_state to prevent that.
+        """
+        op_row = await self._db.get_active_operation()
+        bootstrap_state = (op_row or {}).get("bootstrap_state") or "pending"
+        op_was_bootstrapped_via_lifecycle = bootstrap_state not in ("pending", None)
+
+        if self._lifecycle is not None and op_was_bootstrapped_via_lifecycle:
             return await self._lifecycle.teardown(
                 swap_to_usdc=swap_to_usdc, close_reason=close_reason,
             )
 
         # Legacy path
-        op_row = await self._db.get_active_operation()
         if op_row is None:
             raise RuntimeError("No active operation to stop")
         op_id = op_row["id"]
