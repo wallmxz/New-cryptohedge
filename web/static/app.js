@@ -21,6 +21,10 @@ function dashboard() {
             operation_state: "none",
             operation_pnl_breakdown: {},
             last_iter_timings: {},
+            wallet_eth_balance: 0,
+            bootstrap_progress: '',
+            bootstrap_swap_tx_hash: null,
+            bootstrap_deposit_tx_hash: null,
         },
 
         config: {
@@ -42,6 +46,10 @@ function dashboard() {
         lastUpdate: '—',
         _opStartedAt: null,
         history: [],
+
+        showStartModal: false,
+        startBudget: 300.0,
+        startBudgetMax: 0.0,
 
         get hasBook() {
             return this.state.best_bid > 0 && this.state.best_ask > 0;
@@ -130,6 +138,38 @@ function dashboard() {
                     const err = await resp.json();
                     alert("Erro ao iniciar: " + (err.error || resp.status));
                 }
+            } catch (e) {
+                alert("Erro: " + e);
+            }
+        },
+
+        async openStartModal() {
+            try {
+                const resp = await fetch("/wallet");
+                if (resp.ok) {
+                    const data = await resp.json();
+                    this.startBudgetMax = data.usdc_balance || 0;
+                    if (this.startBudgetMax > 0) {
+                        this.startBudget = Math.floor(this.startBudgetMax);
+                    }
+                }
+            } catch (e) {}
+            this.showStartModal = true;
+        },
+
+        async confirmStart() {
+            try {
+                const resp = await fetch("/operations/start", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({usdc_budget: this.startBudget}),
+                });
+                if (!resp.ok) {
+                    const err = await resp.json();
+                    alert("Erro ao iniciar: " + (err.error || resp.status));
+                    return;
+                }
+                this.showStartModal = false;
             } catch (e) {
                 alert("Erro: " + e);
             }
