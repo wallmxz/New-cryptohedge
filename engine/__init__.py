@@ -118,6 +118,76 @@ class GridMakerEngine:
         logger.info(f"Operation {op_id} started")
         return op_id
 
+    async def stop_operation(self, *, close_reason: str = "user") -> dict:
+        """Encerra a operação ativa: cancela grade, fecha short, grava final_pnl."""
+        op_row = await self._db.get_active_operation()
+        if op_row is None:
+            raise RuntimeError("No active operation to stop")
+        op_id = op_row["id"]
+
+        await self._db.update_operation_status(op_id, OperationState.STOPPING.value)
+        self._hub.operation_state = OperationState.STOPPING.value
+
+        # 1. Cancel all active grid orders
+        active_orders = await self._db.get_active_grid_orders()
+        if active_orders:
+            try:
+                await self._exchange.batch_cancel([
+                    dict(symbol=self._settings.dydx_symbol, cloid_int=int(r["cloid"]))
+                    for r in active_orders
+                ])
+                for r in active_orders:
+                    await self._db.mark_grid_order_cancelled(r["cloid"], time.time())
+            except Exception as e:
+                logger.error(f"Cancel grid during stop failed: {e}")
+
+        # 2. Close short via taker
+        pos = await self._exchange.get_position(self._settings.dydx_symbol)
+        if pos and pos.size > 0:
+            p_now = await self._pool_reader.read_price()
+            side = "buy" if pos.side == "short" else "sell"
+            # Cross spread for fast fill
+            price = p_now * 1.001 if side == "buy" else p_now * 0.999
+            try:
+                await self._exchange.place_long_term_order(
+                    symbol=self._settings.dydx_symbol,
+                    side=side, size=pos.size, price=price,
+                    cloid_int=self._next_cloid(997), ttl_seconds=60,
+                )
+                slippage = 0.0005 * pos.size * p_now
+                await self._db.add_to_operation_accumulator(
+                    op_id, "perp_fees_paid", slippage,
+                )
+            except Exception as e:
+                logger.exception(f"Close short during stop failed: {e}")
+
+        # 3. Compute final PnL
+        op = Operation.from_db_row(await self._db.get_operation(op_id))
+        p_now = await self._pool_reader.read_price()
+        beefy_pos = await self._beefy_reader.read_position()
+        my_amount0 = beefy_pos.amount0 * beefy_pos.share
+        my_amount1 = beefy_pos.amount1 * beefy_pos.share
+        pool_value = my_amount0 * p_now + my_amount1
+
+        from engine.pnl import compute_operation_pnl
+        breakdown = compute_operation_pnl(
+            op,
+            current_pool_value_usd=pool_value,
+            current_eth_price=p_now,
+            hedge_realized_since_baseline=self._hub.hedge_realized_pnl,
+            hedge_unrealized_since_baseline=self._hub.hedge_unrealized_pnl,
+        )
+
+        await self._db.close_operation(
+            op_id, ended_at=time.time(),
+            final_net_pnl=breakdown["net_pnl"], close_reason=close_reason,
+        )
+        self._hub.current_operation_id = None
+        self._hub.operation_state = OperationState.NONE.value
+        self._hub.operation_pnl_breakdown = {}
+        logger.info(f"Operation {op_id} closed; final PnL = {breakdown['net_pnl']:.2f}")
+        return {"id": op_id, "final_net_pnl": breakdown["net_pnl"], "breakdown": breakdown}
+
     async def _check_margin_and_alert(self, peak_short_size: float, p_now: float):
         required = compute_required_collateral(
             peak_short_size=peak_short_size, current_price=p_now,

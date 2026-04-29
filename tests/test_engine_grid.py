@@ -388,3 +388,87 @@ async def test_engine_recovery_reconciles_on_start():
     assert any("999" in args for args in cancelled_args)
 
     await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_engine_stop_operation(tmp_path):
+    """stop_operation cancela grade, fecha short via taker, grava final_pnl."""
+    from db import Database
+    from engine import GridMakerEngine
+    from state import StateHub
+
+    db = Database(str(tmp_path / "t3.db"))
+    await db.initialize()
+    state = StateHub(hedge_ratio=1.0)
+
+    # Pre-create active operation
+    op_id = await db.insert_operation(
+        started_at=1000.0, status="active",
+        baseline_eth_price=3000.0, baseline_pool_value_usd=300.0,
+        baseline_amount0=0.05, baseline_amount1=150.0, baseline_collateral=130.0,
+    )
+    state.current_operation_id = op_id
+    state.operation_state = "active"
+
+    # Pre-seed an active grid order
+    await db.insert_grid_order(
+        cloid="500", side="sell", target_price=2900.0, size=0.001, placed_at=1100.0,
+    )
+
+    cancelled_calls = []
+
+    async def fake_cancel(items):
+        cancelled_calls.extend(items)
+        return len(items)
+
+    closed_calls = []
+
+    async def fake_place(**kw):
+        closed_calls.append(kw)
+        from exchanges.base import Order
+        return Order(order_id=str(kw["cloid_int"]), symbol=kw["symbol"],
+                     side=kw["side"], size=kw["size"], price=kw["price"], status="open")
+
+    settings = MagicMock()
+    settings.dydx_symbol = "ETH-USD"
+    settings.alert_webhook_url = ""
+    settings.pool_token0_symbol = "WETH"
+    settings.pool_token1_symbol = "USDC"
+
+    exchange = MagicMock()
+    exchange.name = "dydx"
+    exchange.batch_cancel = AsyncMock(side_effect=fake_cancel)
+    exchange.place_long_term_order = AsyncMock(side_effect=fake_place)
+    exchange.get_position = AsyncMock(return_value=MagicMock(
+        side="short", size=0.05, entry_price=3000.0, unrealized_pnl=0.0,
+    ))
+    exchange.get_collateral = AsyncMock(return_value=128.0)
+
+    pool_reader = MagicMock()
+    pool_reader.read_price = AsyncMock(return_value=2950.0)
+    beefy_reader = MagicMock()
+    beefy_reader.read_position = AsyncMock(return_value=MagicMock(
+        tick_lower=-197310, tick_upper=-195303,
+        amount0=0.5, amount1=1500.0, share=0.01, raw_balance=10**16,
+    ))
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=exchange, pool_reader=pool_reader, beefy_reader=beefy_reader,
+    )
+
+    result = await engine.stop_operation()
+
+    assert state.current_operation_id is None
+    assert state.operation_state == "none"
+    op = await db.get_operation(op_id)
+    assert op["status"] == "closed"
+    assert op["close_reason"] == "user"
+    assert op["final_net_pnl"] is not None
+    # Cancelled the grid
+    assert len(cancelled_calls) >= 1
+    # Closed via taker (buy to cover the short)
+    assert len(closed_calls) >= 1
+    assert closed_calls[0]["side"] == "buy"
+
+    await db.close()
