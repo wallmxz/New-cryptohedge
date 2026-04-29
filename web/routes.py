@@ -166,3 +166,11 @@ async def stop_operation(request: Request):
         return JSONResponse(result, status_code=200)
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=404)
+
+
+from engine import metrics as engine_metrics
+
+
+async def metrics(request: Request):
+    body = engine_metrics.render_metrics()
+    return Response(body, media_type=engine_metrics.render_content_type())

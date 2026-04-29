@@ -53,3 +53,18 @@ def test_operations_endpoints_exist(app):
     # GET /operations/current should return 204 when none active
     resp = client.get("/operations/current", headers=headers)
     assert resp.status_code == 204
+
+
+def test_metrics_endpoint_no_auth(app):
+    """GET /metrics returns 200 with Prometheus content-type, NO auth required."""
+    from starlette.testclient import TestClient
+    client = TestClient(app)
+    resp = client.get("/metrics")
+    assert resp.status_code == 200
+    assert "text/plain" in resp.headers["content-type"]
+    # Note: prometheus-client 0.25+ uses version=1.0.0 by default (OpenMetrics).
+    # Just check we got Prometheus exposition format (any version).
+    assert "version=" in resp.headers["content-type"]
+    # The body should contain at least one of the registered metric names
+    body = resp.text
+    assert "bot_loop_duration_seconds" in body or "bot_margin_ratio" in body
