@@ -241,3 +241,31 @@ async def test_mock_exchange_position_tracks_fills():
     assert pos is not None
     assert pos.side == "short"
     assert abs(pos.size - 0.005) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_mock_pool_returns_current_price():
+    from backtest.chain_mock import MockPoolReader
+
+    pool = MockPoolReader()
+    pool.set_price(3000.0)
+    assert await pool.read_price() == 3000.0
+
+    pool.set_price(2950.5)
+    assert await pool.read_price() == 2950.5
+
+
+@pytest.mark.asyncio
+async def test_mock_beefy_returns_current_position():
+    from backtest.chain_mock import MockBeefyReader, _BeefyPosition
+
+    beefy = MockBeefyReader()
+    beefy.set_position(
+        tick_lower=-197310, tick_upper=-195303,
+        amount0=0.5, amount1=1500.0, share=0.01, raw_balance=10**16,
+    )
+    pos = await beefy.read_position()
+    assert pos.tick_lower == -197310
+    assert pos.tick_upper == -195303
+    assert abs(pos.amount0 - 0.5) < 1e-9
+    assert abs(pos.share - 0.01) < 1e-9
