@@ -75,18 +75,17 @@ class OperationLifecycle:
 
     async def _read_wallet_balance(self) -> dict[str, float]:
         """Returns {token0, token1, eth} balances in display units."""
-        eth_raw = await self._uniswap._w3.eth.get_balance(self._uniswap.address)
-        eth = eth_raw / 1e18
         token0 = self._uniswap._erc20(self._settings.token0_address)
         token1 = self._uniswap._erc20(self._settings.token1_address)
-        token0_raw, token1_raw = await asyncio.gather(
+        eth_raw, token0_raw, token1_raw = await asyncio.gather(
+            self._uniswap._w3.eth.get_balance(self._uniswap.address),
             token0.functions.balanceOf(self._uniswap.address).call(),
             token1.functions.balanceOf(self._uniswap.address).call(),
         )
         return {
             "token0": token0_raw / (10 ** self._decimals0),
             "token1": token1_raw / (10 ** self._decimals1),
-            "eth": eth,
+            "eth": eth_raw / 1e18,
         }
 
     async def _check_gas_balance(self) -> None:
@@ -132,7 +131,6 @@ class OperationLifecycle:
         self._hub.operation_state = OperationState.STARTING.value
 
         try:
-            # Step 1: Approvals
             await self._db.update_bootstrap_state(op_id, "approving")
             self._hub.bootstrap_progress = "Approving tokens..."
             await self._uniswap.ensure_approval(
@@ -147,7 +145,6 @@ class OperationLifecycle:
                 token_address=self._settings.token0_address, amount=2**256 - 1,
             )
 
-            # Step 2: Swap (if needed)
             if amount_weth_target > 0 and amount_usdc_target < usdc_budget:
                 await self._db.update_bootstrap_state(op_id, "swap_pending")
                 self._hub.bootstrap_progress = "Swapping USDC -> WETH..."
@@ -170,19 +167,23 @@ class OperationLifecycle:
             else:
                 await self._db.update_bootstrap_state(op_id, "swap_confirmed")
 
-            # Step 3: Deposit using REAL wallet balance (not computed)
+            # Use the wallet's actual post-swap balance, not the pre-swap
+            # target — slippage/rounding mean the swap may net more or less
+            # than amount_weth_target, and Beefy mints shares on what we send.
             await self._db.update_bootstrap_state(op_id, "deposit_pending")
             self._hub.bootstrap_progress = "Depositing in Beefy..."
             bal = await self._read_wallet_balance()
             amount0_raw = int(bal["token0"] * 10**self._decimals0)
             amount1_raw = int(bal["token1"] * 10**self._decimals1)
-            min_shares = 0  # MVP: accept any
             tx = await self._beefy.deposit(
-                amount0=amount0_raw, amount1=amount1_raw, min_shares=min_shares,
+                amount0=amount0_raw, amount1=amount1_raw, min_shares=0,
             )
             await self._db.update_bootstrap_state(op_id, "deposit_confirmed", deposit_tx_hash=tx)
 
-            # Step 4: Snapshot real baseline (post-deposit)
+            # Snapshot the real baseline AFTER the deposit settles. The
+            # Beefy strategy may rebalance ranges or skim dust on deposit,
+            # so the post-deposit position is the only authoritative starting
+            # point for the operation's PnL accounting.
             await self._db.update_bootstrap_state(op_id, "snapshot")
             self._hub.bootstrap_progress = "Snapshotting baseline..."
             beefy_pos_after = await self._beefy_reader.read_position()
@@ -195,7 +196,6 @@ class OperationLifecycle:
                 pool_value_usd=real_pool_value,
             )
 
-            # Step 5: Hedge
             await self._db.update_bootstrap_state(op_id, "hedge_pending")
             self._hub.bootstrap_progress = "Opening short on dYdX..."
             target_short = my_amount0 * self._hub.hedge_ratio
@@ -213,7 +213,6 @@ class OperationLifecycle:
                 )
             await self._db.update_bootstrap_state(op_id, "hedge_confirmed")
 
-            # Step 6: Active
             await self._db.update_bootstrap_state(op_id, "active")
             await self._db.update_operation_status(op_id, OperationState.ACTIVE.value)
             self._hub.operation_state = OperationState.ACTIVE.value
@@ -244,7 +243,6 @@ class OperationLifecycle:
         self._hub.bootstrap_progress = "Cancelling grid..."
 
         try:
-            # Step 1: Cancel all open grid orders
             await self._db.update_bootstrap_state(op_id, "teardown_grid_cancel")
             active_orders = await self._db.get_active_grid_orders()
             if active_orders:
@@ -255,7 +253,6 @@ class OperationLifecycle:
                 for r in active_orders:
                     await self._db.mark_grid_order_cancelled(r["cloid"], time.time())
 
-            # Step 2: Close short (taker)
             await self._db.update_bootstrap_state(op_id, "teardown_short_close")
             self._hub.bootstrap_progress = "Closing short..."
             pos = await self._exchange.get_position(self._settings.dydx_symbol)
@@ -271,7 +268,6 @@ class OperationLifecycle:
                 slippage = 0.0005 * pos.size * p_now
                 await self._db.add_to_operation_accumulator(op_id, "perp_fees_paid", slippage)
 
-            # Step 3: Withdraw from Beefy
             await self._db.update_bootstrap_state(op_id, "teardown_withdraw_pending")
             self._hub.bootstrap_progress = "Withdrawing Beefy..."
             beefy_pos = await self._beefy_reader.read_position()
@@ -284,7 +280,6 @@ class OperationLifecycle:
             else:
                 await self._db.update_bootstrap_state(op_id, "teardown_withdraw_confirmed")
 
-            # Step 4: Optional swap WETH -> USDC
             if swap_to_usdc:
                 await self._db.update_bootstrap_state(op_id, "teardown_swap_pending")
                 self._hub.bootstrap_progress = "Swapping WETH -> USDC..."
@@ -309,7 +304,6 @@ class OperationLifecycle:
                 else:
                     await self._db.update_bootstrap_state(op_id, "teardown_swap_confirmed")
 
-            # Step 5: Compute final PnL + close
             op = Operation.from_db_row(await self._db.get_operation(op_id))
             from engine.pnl import compute_operation_pnl
             my_amount0 = beefy_pos.amount0 * beefy_pos.share
@@ -341,6 +335,35 @@ class OperationLifecycle:
             self._hub.operation_state = OperationState.FAILED.value
             self._hub.bootstrap_progress = f"TEARDOWN FAILED: {e}"
             raise
+
+    async def cashout_residual(self) -> dict:
+        """Swap any residual token0 in the wallet to token1.
+
+        Used when an operation is closed but token0 (e.g. WETH) is still
+        sitting in the wallet — typically because teardown ran with
+        swap_to_usdc=False. Returns {tx_hash, swapped_amount} or
+        {swapped_amount: 0, message: "..."} if there's nothing to swap.
+        """
+        bal = await self._read_wallet_balance()
+        if bal["token0"] <= 0:
+            return {"swapped_amount": 0.0, "message": "No token0 balance to swap"}
+
+        p_now = await self._pool_reader.read_price()
+        slippage = self._settings.slippage_bps / 10000.0
+        amount_in_raw = int(bal["token0"] * 10 ** self._decimals0)
+        min_out = int(
+            bal["token0"] * p_now * (1 - slippage) * 10 ** self._decimals1
+        )
+        tx_hash = await self._uniswap.swap_exact_input(
+            token_in=self._settings.token0_address,
+            token_out=self._settings.token1_address,
+            fee=self._settings.uniswap_v3_pool_fee,
+            amount_in=amount_in_raw,
+            amount_out_minimum=min_out,
+            recipient=self._uniswap.address,
+            deadline=int(time.time()) + DEFAULT_DEADLINE_SECONDS,
+        )
+        return {"tx_hash": tx_hash, "swapped_amount": bal["token0"]}
 
     async def resume_in_flight(self) -> None:
         """Called at startup. For each in-flight operation:

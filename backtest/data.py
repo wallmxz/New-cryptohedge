@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 import httpx
 from backtest.cache import Cache
 
@@ -114,7 +114,7 @@ class DataFetcher:
         # Indexer paginates with effectiveBeforeOrAt; loop until covered
         records: list[tuple[float, float]] = []
         seen: set[float] = set()
-        cursor_iso = datetime.utcfromtimestamp(end).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        cursor_iso = datetime.fromtimestamp(end, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             while True:
@@ -128,8 +128,8 @@ class DataFetcher:
                 new_in_page = 0
                 for item in page:
                     ts = datetime.strptime(
-                        item["effectiveAt"].replace("Z", ""), "%Y-%m-%dT%H:%M:%S"
-                    ).timestamp()
+                        item["effectiveAt"].replace("Z", ""), "%Y-%m-%dT%H:%M:%S",
+                    ).replace(tzinfo=timezone.utc).timestamp()
                     if ts < start:
                         break
                     if ts in seen:
@@ -143,7 +143,7 @@ class DataFetcher:
                 last_ts = min(seen)
                 if last_ts <= start:
                     break
-                cursor_iso = datetime.utcfromtimestamp(last_ts - 1).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                cursor_iso = datetime.fromtimestamp(last_ts - 1, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
         records.sort(key=lambda r: r[0])
         await self._cache.set(cache_key, json.dumps(records))

@@ -377,14 +377,19 @@ class GridMakerEngine:
             await self._exchange.disconnect()
 
     async def _main_loop(self):
+        # Hold a stable 1Hz cadence: subtract the iteration's elapsed time so
+        # a slow iter doesn't compound into a 2Hz/0.5Hz drift.
+        period = 1.0
         while self._running:
+            iter_start = time.monotonic()
             try:
                 await self._iterate()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.exception(f"Engine loop error: {e}")
-            await asyncio.sleep(1.0)
+            elapsed = time.monotonic() - iter_start
+            await asyncio.sleep(max(0.0, period - elapsed))
 
     def _next_cloid(self, level_idx: int) -> int:
         """Generate unique cloid as int (dYdX requires int)."""
@@ -397,25 +402,23 @@ class GridMakerEngine:
         )
 
     async def _iterate(self):
-        """One cycle of the main loop."""
         iter_start = time.monotonic()
         self._iter_count += 1
         timings: dict[str, float] = {}
         try:
-            # Periodic reconciliation (runs regardless of in-range/out-of-range path).
             await self._maybe_reconcile()
 
-            # 1. Read on-chain state
             t = time.monotonic()
-            beefy_pos = await self._beefy_reader.read_position()
-            p_now = await self._pool_reader.read_price()
+            beefy_pos, p_now = await asyncio.gather(
+                self._beefy_reader.read_position(),
+                self._pool_reader.read_price(),
+            )
             timings["chain_read"] = (time.monotonic() - t) * 1000
             metrics.loop_duration.labels(step="chain_read").observe(timings["chain_read"] / 1000)
 
             p_a = tick_to_price(beefy_pos.tick_lower, self._decimals0, self._decimals1)
             p_b = tick_to_price(beefy_pos.tick_upper, self._decimals0, self._decimals1)
 
-            # User's portion of the pool
             my_amount0 = beefy_pos.amount0 * beefy_pos.share
             my_amount1 = beefy_pos.amount1 * beefy_pos.share
             my_value = my_amount0 * p_now + my_amount1
@@ -423,8 +426,6 @@ class GridMakerEngine:
                 return
 
             metrics.pool_value_usd.set(my_value)
-
-            # Update range state before any out-of-range short-circuit so dashboard sees current bounds.
             self._hub.range_lower = p_a
             self._hub.range_upper = p_b
             self._hub.pool_value_usd = my_value
@@ -433,17 +434,35 @@ class GridMakerEngine:
                 self._settings.pool_token1_symbol: my_amount1,
             }
 
-            # 2. Out-of-range handling (must precede compute_l_from_value, which
-            # divides by (2*sqrt(p) - sqrt(p_a) - p/sqrt(p_b)) and only holds for
-            # p strictly inside [p_a, p_b]). When out of range we still record the
-            # liquidity L derived from the all-one-token formula so the dashboard
-            # has a non-zero value to display.
+            # Read collateral and current position once per iteration; both are
+            # used by the margin check, the OOR branches, and the exposure
+            # delta below. Hoisting halves the indexer round-trips per loop.
+            collateral, pos = await asyncio.gather(
+                self._safe_get_collateral(),
+                self._safe_get_position(),
+            )
+            if collateral is not None:
+                self._hub.dydx_collateral = collateral
+            current_short = abs(pos.size) if pos else 0.0
+            if pos:
+                self._hub.hedge_position = {
+                    "side": pos.side, "size": pos.size, "entry": pos.entry_price,
+                }
+                self._hub.hedge_unrealized_pnl = pos.unrealized_pnl
+                metrics.hedge_position_size.set(pos.size)
+            else:
+                metrics.hedge_position_size.set(0.0)
+
+            # OOR handling must precede compute_l_from_value: that formula
+            # divides by (2*sqrt(p) - sqrt(p_a) - p/sqrt(p_b)) and only holds
+            # for p strictly inside [p_a, p_b]. Outside, derive L from the
+            # all-one-token formula so the dashboard has a value to display.
             if p_now >= p_b:
                 self._hub.out_of_range = True
                 metrics.out_of_range.set(1)
                 denom = sqrt(p_b) - sqrt(p_a)
                 self._hub.liquidity_l = my_amount1 / denom if denom > 0 else 0.0
-                await self._handle_out_of_range_upper()
+                await self._cancel_active_grid()
                 return
             if p_now <= p_a:
                 self._hub.out_of_range = True
@@ -451,22 +470,14 @@ class GridMakerEngine:
                 denom = (1.0 / sqrt(p_a)) - (1.0 / sqrt(p_b))
                 L_oor = my_amount0 / denom if denom > 0 else 0.0
                 self._hub.liquidity_l = L_oor
-                # Refresh collateral so the margin check below sees current value.
-                try:
-                    self._hub.dydx_collateral = await self._exchange.get_collateral()
-                except Exception:
-                    pass
-                # Peak short = max(LP-implied peak at p_a, current actual short).
-                # Captures risk whether driven by LP needs or already-open position.
-                peak_lp = compute_x(L_oor, p_a, p_b) * self._hub.hedge_ratio
-                try:
-                    pos_now = await self._exchange.get_position(self._settings.dydx_symbol)
-                    cur_short = abs(pos_now.size) if pos_now else 0.0
-                except Exception:
-                    cur_short = 0.0
-                peak_short = max(peak_lp, cur_short)
+                # Peak short = max(LP-implied peak at p_a, current short).
+                # Either could be the binding risk, so take the worse.
+                peak_short = max(
+                    compute_x(L_oor, p_a, p_b) * self._hub.hedge_ratio,
+                    current_short,
+                )
                 await self._check_margin_and_alert(peak_short, p_now)
-                await self._handle_out_of_range_lower(p_a, p_b, L_oor)
+                await self._cancel_active_grid()
                 return
 
             self._hub.out_of_range = False
@@ -474,18 +485,15 @@ class GridMakerEngine:
             L_user = compute_l_from_value(my_value, p_a, p_b, p_now)
             self._hub.liquidity_l = L_user
 
-            # 2.5. If no active operation, stop here — read state but skip grid
-            if self._hub.operation_state != "active":
+            if self._hub.operation_state != OperationState.ACTIVE.value:
                 return
 
-            # Live PnL breakdown for active operation
             if self._hub.current_operation_id is not None:
                 try:
                     op_row = await self._db.get_operation(self._hub.current_operation_id)
                     if op_row:
-                        op = Operation.from_db_row(op_row)
                         self._hub.operation_pnl_breakdown = compute_operation_pnl(
-                            op,
+                            Operation.from_db_row(op_row),
                             current_pool_value_usd=my_value,
                             current_eth_price=p_now,
                             hedge_realized_since_baseline=self._hub.hedge_realized_pnl,
@@ -494,23 +502,12 @@ class GridMakerEngine:
                 except Exception as e:
                     logger.error(f"PnL breakdown update failed: {e}")
 
-            # Refresh collateral so margin check sees current exchange value.
-            try:
-                self._hub.dydx_collateral = await self._exchange.get_collateral()
-            except Exception:
-                pass
-            # Peak short = max(LP-implied peak at p_a, current actual short).
-            # Captures risk whether driven by LP needs or already-open position.
-            peak_lp = compute_x(L_user, p_a, p_b) * self._hub.hedge_ratio
-            try:
-                pos_pre = await self._exchange.get_position(self._settings.dydx_symbol)
-                cur_short = abs(pos_pre.size) if pos_pre else 0.0
-            except Exception:
-                cur_short = 0.0
-            peak_short = max(peak_lp, cur_short)
+            peak_short = max(
+                compute_x(L_user, p_a, p_b) * self._hub.hedge_ratio,
+                current_short,
+            )
             await self._check_margin_and_alert(peak_short, p_now)
 
-            # 3. Compute target grid
             t = time.monotonic()
             meta = await self._exchange.get_market_meta(self._settings.dydx_symbol)
             target = compute_target_grid(
@@ -522,25 +519,12 @@ class GridMakerEngine:
             timings["grid_compute"] = (time.monotonic() - t) * 1000
             metrics.loop_duration.labels(step="grid_compute").observe(timings["grid_compute"] / 1000)
 
-            # 4. Reconcile current short with target
             target_short_at_now = compute_x(L_user, p_now, p_b) * self._hub.hedge_ratio
-            pos = await self._exchange.get_position(self._settings.dydx_symbol)
-            current_short = pos.size if pos else 0.0
-            if pos:
-                self._hub.hedge_position = {
-                    "side": pos.side, "size": pos.size, "entry": pos.entry_price,
-                }
-                self._hub.hedge_unrealized_pnl = pos.unrealized_pnl
-                metrics.hedge_position_size.set(pos.size)
-            else:
-                metrics.hedge_position_size.set(0.0)
-
-            # Exposure check
             token0_pool = my_amount0
-            if token0_pool > 0:
-                exposure_pct = abs(current_short - target_short_at_now) / token0_pool
-            else:
-                exposure_pct = 0.0
+            exposure_pct = (
+                abs(current_short - target_short_at_now) / token0_pool
+                if token0_pool > 0 else 0.0
+            )
 
             if exposure_pct > self._settings.threshold_aggressive:
                 now_ts = time.time()
@@ -557,21 +541,18 @@ class GridMakerEngine:
                 self._last_aggressive_correction_at = now_ts
                 return
 
-            # 5. Diff and place/cancel
             t = time.monotonic()
             active = await self._db.get_active_grid_orders()
             metrics.grid_orders_open.set(len(active))
-            # Convert DB rows back to GridLevel approximations for diff
-            current_levels = []
-            for row in active:
-                current_levels.append((row["cloid"], GridLevel(
-                    price=row["target_price"], size=row["size"],
-                    side=row["side"], target_short=0,  # not used in diff
-                )))
+            current_levels = [
+                (row["cloid"], GridLevel(
+                    price=row["target_price"], size=row["size"], side=row["side"],
+                ))
+                for row in active
+            ]
 
             diff = self._grid_mgr.diff(current=current_levels, target=target)
 
-            # Cancel
             if diff.to_cancel:
                 await self._exchange.batch_cancel([
                     dict(symbol=self._settings.dydx_symbol, cloid_int=int(c))
@@ -580,15 +561,13 @@ class GridMakerEngine:
                 for cloid in diff.to_cancel:
                     await self._db.mark_grid_order_cancelled(cloid, time.time())
 
-            # Place
             if diff.to_place:
                 specs = []
                 for idx, lv in enumerate(diff.to_place):
-                    cloid_int = self._next_cloid(idx)
                     specs.append(dict(
                         symbol=self._settings.dydx_symbol,
                         side=lv.side, size=lv.size, price=round(lv.price, 4),
-                        cloid_int=cloid_int,
+                        cloid_int=self._next_cloid(idx),
                     ))
                 placed = await self._exchange.batch_place(specs)
                 for spec, p in zip(specs, placed):
@@ -601,18 +580,26 @@ class GridMakerEngine:
                         )
             timings["grid_diff_apply"] = (time.monotonic() - t) * 1000
             metrics.loop_duration.labels(step="grid_diff_apply").observe(timings["grid_diff_apply"] / 1000)
-
-            # 6. Update margin/collateral
-            try:
-                self._hub.dydx_collateral = await self._exchange.get_collateral()
-            except Exception:
-                pass
         finally:
             timings["total"] = (time.monotonic() - iter_start) * 1000
             metrics.loop_duration.labels(step="total").observe(timings["total"] / 1000)
-            metrics.operation_state.set(1.0 if self._hub.operation_state == "active" else 0.0)
+            metrics.operation_state.set(
+                1.0 if self._hub.operation_state == OperationState.ACTIVE.value else 0.0
+            )
             self._hub.last_iter_timings = timings
             self._hub.last_update = time.time()
+
+    async def _safe_get_collateral(self) -> float | None:
+        try:
+            return await self._exchange.get_collateral()
+        except Exception:
+            return None
+
+    async def _safe_get_position(self):
+        try:
+            return await self._exchange.get_position(self._settings.dydx_symbol)
+        except Exception:
+            return None
 
     async def _aggressive_correct(self, current_short, target_short, p_now, meta):
         """Use taker orders to correct exposure quickly."""
@@ -678,24 +665,21 @@ class GridMakerEngine:
             reason=fill.liquidity, operation_id=op_id,
         )
 
-    async def _handle_out_of_range_upper(self):
-        """Price > p_b: pool is 100% USDC, target short = 0. Cancel grid."""
-        active = await self._db.get_active_grid_orders()
-        if active:
-            await self._exchange.batch_cancel([
-                dict(symbol=self._settings.dydx_symbol, cloid_int=int(r["cloid"]))
-                for r in active
-            ])
-            for r in active:
-                await self._db.mark_grid_order_cancelled(r["cloid"], time.time())
+    async def _cancel_active_grid(self) -> None:
+        """Cancel every order tracked as active in the DB.
 
-    async def _handle_out_of_range_lower(self, p_a, p_b, L):
-        """Price < p_a: pool is 100% WETH. Hold short at boundary x(p_a)."""
+        Used by both out-of-range branches (above p_b: pool is all token1, no
+        grid; below p_a: pool is all token0, hold the short at the boundary
+        and don't post new grid). The choice of "no grid" is the same in both
+        directions, so a single helper covers both.
+        """
         active = await self._db.get_active_grid_orders()
-        if active:
-            await self._exchange.batch_cancel([
-                dict(symbol=self._settings.dydx_symbol, cloid_int=int(r["cloid"]))
-                for r in active
-            ])
-            for r in active:
-                await self._db.mark_grid_order_cancelled(r["cloid"], time.time())
+        if not active:
+            return
+        await self._exchange.batch_cancel([
+            dict(symbol=self._settings.dydx_symbol, cloid_int=int(r["cloid"]))
+            for r in active
+        ])
+        now = time.time()
+        for r in active:
+            await self._db.mark_grid_order_cancelled(r["cloid"], now)
