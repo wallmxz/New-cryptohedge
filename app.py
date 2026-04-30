@@ -109,10 +109,16 @@ def create_app(start_engine: bool = True) -> Starlette:
                 except Exception as e:
                     logging.getLogger(__name__).exception(f"resume_in_flight failed: {e}")
 
+            factory_kwargs = {}
+            if account is not None:
+                factory_kwargs["pair_factory_w3"] = w3
+                factory_kwargs["pair_factory_account"] = account
+
             engine = GridMakerEngine(
                 settings=settings, hub=state, db=db,
                 exchange=exchange, pool_reader=pool_reader, beefy_reader=beefy_reader,
                 lifecycle=lifecycle,
+                **factory_kwargs,
             )
             await engine.start()
             app.state.engine = engine
