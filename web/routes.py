@@ -240,3 +240,73 @@ from engine import metrics as engine_metrics
 async def metrics(request: Request):
     body = engine_metrics.render_metrics()
     return Response(body, media_type=engine_metrics.render_content_type())
+
+
+async def list_pairs(request: Request):
+    """GET /pairs - returns USD/cross-pairs from cache + selected_vault_id."""
+    db = request.app.state.db
+    from engine.pair_resolver import build_pair_list
+    result = await build_pair_list(db=db)
+    return JSONResponse(result, status_code=200)
+
+
+async def select_pair(request: Request):
+    """POST /pairs/select - body {vault_id}: validate + persist."""
+    db = request.app.state.db
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid or missing JSON body"}, status_code=400)
+    vault_id = (body or {}).get("vault_id")
+    if not vault_id or not isinstance(vault_id, str):
+        return JSONResponse({"error": "vault_id required"}, status_code=400)
+
+    pair = await db.get_pair_from_cache(vault_id)
+    if pair is None:
+        return JSONResponse(
+            {"error": f"Vault {vault_id} not in cache. Refresh pair list first."},
+            status_code=400,
+        )
+    if not pair.get("is_usd_pair"):
+        return JSONResponse(
+            {"error": "Cross-pairs not selectable in MVP (Phase 3.x scope)"},
+            status_code=400,
+        )
+    decimals = (pair.get("token0_decimals"), pair.get("token1_decimals"))
+    if decimals != (18, 6):
+        return JSONResponse(
+            {"error": f"Unsupported decimals {decimals}; MVP only (18, 6)"},
+            status_code=400,
+        )
+
+    await db.set_selected_vault_id(vault_id)
+    return JSONResponse(
+        {"selected_vault_id": vault_id, "pair": pair},
+        status_code=200,
+    )
+
+
+async def refresh_pairs(request: Request):
+    """POST /pairs/refresh - re-fetch dYdX + Beefy and update caches."""
+    db = request.app.state.db
+    from chains.dydx_markets import DydxMarketsFetcher
+    from chains.beefy_api import BeefyApiFetcher
+
+    try:
+        dydx = DydxMarketsFetcher(db=db)
+        n_dydx = await dydx.refresh()
+        active = await dydx.get_active_tickers()
+
+        beefy = BeefyApiFetcher(db=db)
+        n_beefy = await beefy.refresh(active_dydx_tickers=active)
+
+        import time
+        return JSONResponse({
+            "dydx_markets_count": n_dydx,
+            "beefy_pairs_count": n_beefy,
+            "last_refresh_ts": time.time(),
+        }, status_code=200)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).exception(f"refresh_pairs failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)

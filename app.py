@@ -19,6 +19,7 @@ from web.routes import (
     dashboard, sse_state, sse_logs, update_settings, get_config,
     list_operations, get_current_operation, start_operation, stop_operation,
     metrics, cashout, wallet_balance,
+    list_pairs, select_pair, refresh_pairs,
 )
 
 setup_logging()
@@ -132,6 +133,9 @@ def create_app(start_engine: bool = True) -> Starlette:
         Route("/operations/start", start_operation, methods=["POST"]),
         Route("/operations/stop", stop_operation, methods=["POST"]),
         Route("/operations/cashout", cashout, methods=["POST"]),
+        Route("/pairs", list_pairs),
+        Route("/pairs/select", select_pair, methods=["POST"]),
+        Route("/pairs/refresh", refresh_pairs, methods=["POST"]),
         Route("/wallet", wallet_balance),
         Route("/metrics", metrics),
         Mount("/static", StaticFiles(directory="web/static"), name="static"),
