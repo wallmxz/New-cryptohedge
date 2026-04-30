@@ -4,7 +4,6 @@ Implements ExchangeAdapter interface but never makes network calls.
 Orders fill when simulated price crosses their level.
 """
 from __future__ import annotations
-import asyncio
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
@@ -113,25 +112,8 @@ class MockExchangeAdapter(ExchangeAdapter):
             status="open",
         )
 
-    async def place_limit_order(
-        self, symbol: str, side: str, size: float, price: float
-    ) -> Order:
-        return await self.place_long_term_order(
-            symbol=symbol,
-            side=side,
-            size=size,
-            price=price,
-            cloid_int=int(asyncio.get_event_loop().time() * 1000) % (2**31),
-        )
-
     async def cancel_long_term_order(self, *, symbol: str, cloid_int: int) -> None:
         self._open_orders.pop(cloid_int, None)
-
-    async def cancel_order(self, order_id: str) -> None:
-        try:
-            self._open_orders.pop(int(order_id), None)
-        except ValueError:
-            pass
 
     async def batch_place(self, orders: list[dict]) -> list[Order]:
         placed = []

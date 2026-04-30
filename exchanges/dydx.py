@@ -174,13 +174,6 @@ class DydxAdapter(ExchangeAdapter):
             status="open",
         )
 
-    async def place_limit_order(self, symbol, side, size, price):
-        """ABC-required compat. Delegates to place_long_term_order with auto-generated cloid."""
-        cloid = int(time.time() * 1000) % (2**31)
-        return await self.place_long_term_order(
-            symbol=symbol, side=side, size=size, price=price, cloid_int=cloid,
-        )
-
     async def cancel_long_term_order(self, *, symbol: str, cloid_int: int) -> None:
         """Cancel a long-term order by its client_id."""
         market_data = await self._indexer.markets.get_perpetual_markets(symbol)
@@ -196,10 +189,6 @@ class DydxAdapter(ExchangeAdapter):
         )
         if hasattr(self._wallet, "sequence"):
             self._wallet.sequence += 1
-
-    async def cancel_order(self, order_id: str) -> None:
-        """Generic cancel by string id (assumes default symbol)."""
-        raise NotImplementedError("Use cancel_long_term_order for long-term orders")
 
     async def batch_place(self, orders: list[dict]) -> list[Order]:
         """Place multiple orders sequentially with small delay to avoid rate limits.

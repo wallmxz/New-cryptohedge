@@ -699,7 +699,3 @@ class GridMakerEngine:
             ])
             for r in active:
                 await self._db.mark_grid_order_cancelled(r["cloid"], time.time())
-
-
-# Keep old Engine as alias for backwards compat (will be removed in cleanup task)
-Engine = GridMakerEngine

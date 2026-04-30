@@ -28,8 +28,6 @@ class Settings:
     active_exchange: str
     pool_token0_symbol: str
     pool_token1_symbol: str
-    pool_token1_is_stable: bool
-    pool_token1_usd_price: float
 
     # Phase 2.0 on-chain execution (renamed in pair-picker phase)
     uniswap_v3_router_address: str
@@ -63,8 +61,6 @@ class Settings:
             active_exchange=os.environ.get("ACTIVE_EXCHANGE", "dydx"),
             pool_token0_symbol=os.environ.get("POOL_TOKEN0_SYMBOL", "WETH"),
             pool_token1_symbol=os.environ.get("POOL_TOKEN1_SYMBOL", "USDC"),
-            pool_token1_is_stable=os.environ.get("POOL_TOKEN1_IS_STABLE", "true").lower() == "true",
-            pool_token1_usd_price=float(os.environ.get("POOL_TOKEN1_USD_PRICE", "1.0")),
             uniswap_v3_router_address=os.environ.get(
                 "UNISWAP_V3_ROUTER_ADDRESS",
                 "0xE592427A0AEce92De3Edee1F18E0157C05861564",  # Arbitrum SwapRouter
