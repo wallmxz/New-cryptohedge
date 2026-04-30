@@ -1,0 +1,117 @@
+<!-- web/templates/partials/pair_picker.html -->
+<div x-show="showPairPicker" x-cloak class="modal-overlay" @click.self="showPairPicker = false">
+    <div class="modal-box" @click.stop style="max-width: 800px;">
+        <div class="flex items-center justify-between mb-6">
+            <h2 class="text-lg font-bold text-slate-800">Trading Pair</h2>
+            <button @click="showPairPicker = false" class="text-slate-400 hover:text-slate-600 transition p-1 rounded-lg hover:bg-slate-100">
+                <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+            </button>
+        </div>
+
+        <!-- Toolbar: search, sort, refresh -->
+        <div class="flex flex-wrap items-center gap-3 mb-4">
+            <input type="text" x-model="pairSearch"
+                   placeholder="Filtrar por par (ex: ETH, ARB)"
+                   class="flex-1 px-3 py-2 border border-slate-200 rounded text-sm">
+            <select x-model="pairSort" class="px-3 py-2 border border-slate-200 rounded text-sm">
+                <option value="apy">Sort: APY ↓</option>
+                <option value="tvl">Sort: TVL ↓</option>
+                <option value="pair">Sort: Pair A→Z</option>
+            </select>
+            <button @click="refreshPairs()"
+                    :disabled="pairRefreshing"
+                    class="px-3 py-2 bg-indigo-600 text-white rounded text-sm hover:bg-indigo-700 disabled:opacity-50">
+                <span x-show="!pairRefreshing">🔄 Refresh</span>
+                <span x-show="pairRefreshing">Atualizando...</span>
+            </button>
+        </div>
+        <p class="text-xs text-slate-400 mb-4" x-show="pairsLastRefresh > 0">
+            Última atualização: <span x-text="formatRelativeTime(pairsLastRefresh)"></span>
+        </p>
+
+        <!-- USD-Pairs section -->
+        <div class="mb-6">
+            <h3 class="text-sm font-bold uppercase tracking-wider text-slate-600 mb-3">
+                USD-Pairs
+                <span class="text-slate-400 font-normal" x-text="'(' + filteredUsdPairs.length + ')'"></span>
+            </h3>
+            <div class="space-y-3" x-show="filteredUsdPairs.length > 0">
+                <template x-for="p in filteredUsdPairs" :key="p.vault_id">
+                    <div class="pair-card"
+                         :class="p.vault_id === pairsData.selected_vault_id ? 'pair-card-selected' : ''"
+                         @click="selectPair(p)">
+                        <div class="flex items-center justify-between">
+                            <div class="flex items-center gap-3">
+                                <div class="pair-logos">
+                                    <img :src="p.token0_logo_url" class="logo logo0" onerror="this.replaceWith(Object.assign(document.createElement('span'), {textContent:'💎', className:'logo-fallback'}))">
+                                    <img :src="p.token1_logo_url" class="logo logo1" onerror="this.replaceWith(Object.assign(document.createElement('span'), {textContent:'💵', className:'logo-fallback'}))">
+                                </div>
+                                <div>
+                                    <p class="font-semibold text-slate-800" x-text="p.pair"></p>
+                                    <p class="text-xs text-slate-500">
+                                        <span class="manager-badge" x-text="p.manager"></span>
+                                        ·
+                                        <span x-text="p.dex + ' ' + (p.pool_fee_pct * 100).toFixed(2) + '%'"></span>
+                                    </p>
+                                </div>
+                            </div>
+                            <div class="text-right">
+                                <div class="text-xs text-slate-400">TVL</div>
+                                <div class="text-sm font-semibold" x-text="formatTvl(p.tvl_usd)"></div>
+                            </div>
+                            <div class="text-right">
+                                <div class="text-xs text-slate-400">APY 30d</div>
+                                <div class="text-sm font-bold" :class="apyColorClass(p.apy_30d)"
+                                     x-text="formatApy(p.apy_30d)"></div>
+                            </div>
+                            <button class="px-3 py-1.5 text-xs bg-emerald-600 text-white rounded hover:bg-emerald-700"
+                                    x-show="p.vault_id !== pairsData.selected_vault_id">
+                                Select
+                            </button>
+                            <span x-show="p.vault_id === pairsData.selected_vault_id"
+                                  class="px-3 py-1.5 text-xs bg-slate-200 text-slate-700 rounded">
+                                ✓ Atual
+                            </span>
+                        </div>
+                    </div>
+                </template>
+            </div>
+            <div x-show="filteredUsdPairs.length === 0" class="text-sm text-slate-400 italic">
+                Nenhum par disponível. Clique Refresh.
+            </div>
+        </div>
+
+        <!-- Cross-Pairs section (display-only) -->
+        <div x-show="filteredCrossPairs.length > 0">
+            <h3 class="text-sm font-bold uppercase tracking-wider text-slate-600 mb-2">
+                Cross-Pairs
+                <span class="text-slate-400 font-normal" x-text="'(' + filteredCrossPairs.length + ')'"></span>
+                <span class="text-amber-600 font-normal text-xs">— Phase 3.x</span>
+            </h3>
+            <p class="text-xs text-slate-500 mb-3">
+                Cross-pairs (token1 não-stable) precisam hedge dual-leg, suportado em Phase 3.x.
+            </p>
+            <div class="space-y-2 opacity-50">
+                <template x-for="p in filteredCrossPairs" :key="p.vault_id">
+                    <div class="pair-card pair-card-disabled">
+                        <div class="flex items-center justify-between">
+                            <div class="flex items-center gap-3">
+                                <div class="pair-logos">
+                                    <img :src="p.token0_logo_url" class="logo logo0" onerror="this.replaceWith(Object.assign(document.createElement('span'), {textContent:'💎', className:'logo-fallback'}))">
+                                    <img :src="p.token1_logo_url" class="logo logo1" onerror="this.replaceWith(Object.assign(document.createElement('span'), {textContent:'💎', className:'logo-fallback'}))">
+                                </div>
+                                <div>
+                                    <p class="font-semibold text-slate-700" x-text="p.pair"></p>
+                                    <p class="text-xs text-slate-400" x-text="p.manager + ' · ' + p.dex"></p>
+                                </div>
+                            </div>
+                            <div class="text-sm font-semibold text-slate-500" x-text="formatTvl(p.tvl_usd)"></div>
+                            <div class="text-sm" :class="apyColorClass(p.apy_30d)" x-text="formatApy(p.apy_30d)"></div>
+                            <span class="text-xs text-slate-400 italic">não selecionável</span>
+                        </div>
+                    </div>
+                </template>
+            </div>
+        </div>
+    </div>
+</div>
