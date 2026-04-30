@@ -18,6 +18,20 @@
 
                 <div x-show="settingsTab === 'trading'" class="space-y-4">
                     <div class="cfg-group">
+                        <label class="cfg-label">Trading Pair</label>
+                        <div class="text-sm" x-show="pairsData.selected_vault_id">
+                            Selecionado: <span class="font-semibold" x-text="selectedPairLabel || '...'"></span>
+                        </div>
+                        <div class="text-sm text-slate-400" x-show="!pairsData.selected_vault_id">
+                            Nenhum par selecionado.
+                        </div>
+                        <button type="button" @click="showSettings = false; openPairPicker()"
+                                class="px-3 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded text-sm mt-2">
+                            Escolher Par
+                        </button>
+                        <p class="cfg-hint">Clique pra abrir lista de pares disponíveis (Beefy + dYdX).</p>
+                    </div>
+                    <div class="cfg-group">
                         <label class="cfg-label">Ratio do hedge</label>
                         <input type="number" name="hedge_ratio" step="0.01" min="0" max="1" :value="state.hedge_ratio" class="cfg-input">
                         <p class="cfg-hint">Percentual da posição hedgeado. 1.0 = 100%</p>

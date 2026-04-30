@@ -200,22 +200,22 @@ async def cashout(request: Request):
 
     try:
         bal = await engine._lifecycle._read_wallet_balance()
-        if bal["weth"] <= 0:
+        if bal["token0"] <= 0:
             return JSONResponse({"weth_swapped": 0.0, "message": "No WETH in wallet"}, status_code=200)
         import time
         p_now = await engine._lifecycle._pool_reader.read_price()
         slippage = engine._lifecycle._settings.slippage_bps / 10000.0
-        amount_in_raw = int(bal["weth"] * 10**engine._lifecycle._decimals0)
-        min_out = int(bal["weth"] * p_now * (1 - slippage) * 10**engine._lifecycle._decimals1)
+        amount_in_raw = int(bal["token0"] * 10**engine._lifecycle._decimals0)
+        min_out = int(bal["token0"] * p_now * (1 - slippage) * 10**engine._lifecycle._decimals1)
         tx_hash = await engine._lifecycle._uniswap.swap_exact_input(
-            token_in=engine._lifecycle._settings.weth_token_address,
-            token_out=engine._lifecycle._settings.usdc_token_address,
+            token_in=engine._lifecycle._settings.token0_address,
+            token_out=engine._lifecycle._settings.token1_address,
             fee=500,
             amount_in=amount_in_raw, amount_out_minimum=min_out,
             recipient=engine._lifecycle._uniswap.address,
             deadline=int(time.time()) + 300,
         )
-        return JSONResponse({"tx_hash": tx_hash, "weth_swapped": bal["weth"]}, status_code=200)
+        return JSONResponse({"tx_hash": tx_hash, "weth_swapped": bal["token0"]}, status_code=200)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -228,8 +228,8 @@ async def wallet_balance(request: Request):
         return JSONResponse({"usdc_balance": 0, "weth_balance": 0, "eth_balance": 0})
     bal = await engine._lifecycle._read_wallet_balance()
     return JSONResponse({
-        "usdc_balance": bal["usdc"],
-        "weth_balance": bal["weth"],
+        "usdc_balance": bal["token1"],
+        "weth_balance": bal["token0"],
         "eth_balance": bal["eth"],
     })
 
@@ -240,3 +240,73 @@ from engine import metrics as engine_metrics
 async def metrics(request: Request):
     body = engine_metrics.render_metrics()
     return Response(body, media_type=engine_metrics.render_content_type())
+
+
+async def list_pairs(request: Request):
+    """GET /pairs - returns USD/cross-pairs from cache + selected_vault_id."""
+    db = request.app.state.db
+    from engine.pair_resolver import build_pair_list
+    result = await build_pair_list(db=db)
+    return JSONResponse(result, status_code=200)
+
+
+async def select_pair(request: Request):
+    """POST /pairs/select - body {vault_id}: validate + persist."""
+    db = request.app.state.db
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid or missing JSON body"}, status_code=400)
+    vault_id = (body or {}).get("vault_id")
+    if not vault_id or not isinstance(vault_id, str):
+        return JSONResponse({"error": "vault_id required"}, status_code=400)
+
+    pair = await db.get_pair_from_cache(vault_id)
+    if pair is None:
+        return JSONResponse(
+            {"error": f"Vault {vault_id} not in cache. Refresh pair list first."},
+            status_code=400,
+        )
+    if not pair.get("is_usd_pair"):
+        return JSONResponse(
+            {"error": "Cross-pairs not selectable in MVP (Phase 3.x scope)"},
+            status_code=400,
+        )
+    decimals = (pair.get("token0_decimals"), pair.get("token1_decimals"))
+    if decimals != (18, 6):
+        return JSONResponse(
+            {"error": f"Unsupported decimals {decimals}; MVP only (18, 6)"},
+            status_code=400,
+        )
+
+    await db.set_selected_vault_id(vault_id)
+    return JSONResponse(
+        {"selected_vault_id": vault_id, "pair": pair},
+        status_code=200,
+    )
+
+
+async def refresh_pairs(request: Request):
+    """POST /pairs/refresh - re-fetch dYdX + Beefy and update caches."""
+    db = request.app.state.db
+    from chains.dydx_markets import DydxMarketsFetcher
+    from chains.beefy_api import BeefyApiFetcher
+
+    try:
+        dydx = DydxMarketsFetcher(db=db)
+        n_dydx = await dydx.refresh()
+        active = await dydx.get_active_tickers()
+
+        beefy = BeefyApiFetcher(db=db)
+        n_beefy = await beefy.refresh(active_dydx_tickers=active)
+
+        import time
+        return JSONResponse({
+            "dydx_markets_count": n_dydx,
+            "beefy_pairs_count": n_beefy,
+            "last_refresh_ts": time.time(),
+        }, status_code=200)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).exception(f"refresh_pairs failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)

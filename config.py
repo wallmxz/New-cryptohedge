@@ -31,10 +31,12 @@ class Settings:
     pool_token1_is_stable: bool
     pool_token1_usd_price: float
 
-    # Phase 2.0 on-chain execution
+    # Phase 2.0 on-chain execution (renamed in pair-picker phase)
     uniswap_v3_router_address: str
-    usdc_token_address: str
-    weth_token_address: str
+    token0_address: str         # was weth_token_address
+    token1_address: str         # was usdc_token_address
+    token0_decimals: int        # NEW (was hardcoded 18)
+    token1_decimals: int        # NEW (was hardcoded 6)
     slippage_bps: int  # default 30 = 0.3%
     uniswap_v3_pool_fee: int  # 500 = 0.05%, 3000 = 0.30%
 
@@ -67,14 +69,22 @@ class Settings:
                 "UNISWAP_V3_ROUTER_ADDRESS",
                 "0xE592427A0AEce92De3Edee1F18E0157C05861564",  # Arbitrum SwapRouter
             ),
-            usdc_token_address=os.environ.get(
-                "USDC_TOKEN_ADDRESS",
-                "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",  # Native USDC Arbitrum
+            token0_address=os.environ.get(
+                "TOKEN0_ADDRESS",
+                os.environ.get(
+                    "WETH_TOKEN_ADDRESS",
+                    "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",  # WETH Arbitrum
+                ),
             ),
-            weth_token_address=os.environ.get(
-                "WETH_TOKEN_ADDRESS",
-                "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",  # WETH Arbitrum
+            token1_address=os.environ.get(
+                "TOKEN1_ADDRESS",
+                os.environ.get(
+                    "USDC_TOKEN_ADDRESS",
+                    "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",  # Native USDC Arbitrum
+                ),
             ),
+            token0_decimals=int(os.environ.get("TOKEN0_DECIMALS", "18")),
+            token1_decimals=int(os.environ.get("TOKEN1_DECIMALS", "6")),
             slippage_bps=int(os.environ.get("SLIPPAGE_BPS", "30")),
             uniswap_v3_pool_fee=int(os.environ.get("UNISWAP_V3_POOL_FEE", "500")),
         )

@@ -41,6 +41,8 @@ class GridMakerEngine:
         pool_reader: UniswapV3PoolReader | None = None,
         beefy_reader: BeefyClmReader | None = None,
         lifecycle: "OperationLifecycle | None" = None,
+        pair_factory_w3=None,
+        pair_factory_account=None,
         decimals0: int = 18, decimals1: int = 6,
     ):
         self._settings = settings
@@ -50,6 +52,8 @@ class GridMakerEngine:
         self._pool_reader = pool_reader
         self._beefy_reader = beefy_reader
         self._lifecycle = lifecycle
+        self._pair_factory_w3 = pair_factory_w3
+        self._pair_factory_account = pair_factory_account
         self._decimals0 = decimals0
         self._decimals1 = decimals1
         self._grid_mgr = GridManager()
@@ -77,12 +81,39 @@ class GridMakerEngine:
         return self._reconciler
 
     async def start_operation(self, *, usdc_budget: float | None = None) -> int:
-        """Begin a new operation. Routes via lifecycle when configured.
+        """Begin a new operation. Routes via pair_factory > singleton lifecycle > legacy.
 
-        When lifecycle is configured, usdc_budget is REQUIRED. Missing budget
-        raises RuntimeError to prevent silent fallback to legacy snapshot-only.
-        Legacy path (no lifecycle) is preserved for backwards compat with tests.
+        When pair_factory is configured AND a vault is selected in DB, build a
+        fresh lifecycle for that vault and bootstrap. When the singleton
+        lifecycle is configured (Phase 2.0), use it. Otherwise fall back to the
+        legacy Phase 1.2 snapshot-only path.
+
+        usdc_budget is REQUIRED when either lifecycle path is used. Missing
+        budget raises RuntimeError to prevent silent fallback.
         """
+        # NEW: Pair-picker path (if user has selected a pair via UI)
+        selected_vault_id = await self._db.get_selected_vault_id()
+        if (
+            selected_vault_id
+            and self._pair_factory_w3 is not None
+            and self._pair_factory_account is not None
+        ):
+            if usdc_budget is None:
+                raise RuntimeError(
+                    "usdc_budget required when pair is selected. "
+                    "Pass {usdc_budget: <float>} in request body."
+                )
+            from engine.pair_factory import build_lifecycle
+            lifecycle = await build_lifecycle(
+                settings=self._settings, hub=self._hub, db=self._db,
+                exchange=self._exchange,
+                selected_vault_id=selected_vault_id,
+                w3=self._pair_factory_w3,
+                account=self._pair_factory_account,
+            )
+            return await lifecycle.bootstrap(usdc_budget=usdc_budget)
+
+        # Phase 2.0 path: singleton lifecycle if configured
         if self._lifecycle is not None:
             if usdc_budget is None:
                 raise RuntimeError(
@@ -151,8 +182,11 @@ class GridMakerEngine:
     async def stop_operation(
         self, *, close_reason: str = "user", swap_to_usdc: bool = False,
     ) -> dict:
-        """Stop the active operation. If lifecycle is configured AND this op was
-        bootstrapped through lifecycle, do full teardown. Otherwise legacy path.
+        """Stop the active operation. Routes via pair_factory > singleton > legacy.
+
+        If this op was bootstrapped through any lifecycle, do full teardown
+        (preferring pair_factory when available, else singleton). Otherwise
+        legacy path.
 
         Legacy ops (Phase 1.2) have bootstrap_state='pending' (default) since they
         never went through lifecycle.bootstrap. Routing them through lifecycle.teardown
@@ -163,10 +197,32 @@ class GridMakerEngine:
         bootstrap_state = (op_row or {}).get("bootstrap_state") or "pending"
         op_was_bootstrapped_via_lifecycle = bootstrap_state not in ("pending", None)
 
-        if self._lifecycle is not None and op_was_bootstrapped_via_lifecycle:
-            return await self._lifecycle.teardown(
-                swap_to_usdc=swap_to_usdc, close_reason=close_reason,
-            )
+        # If op went through lifecycle, route teardown via lifecycle
+        # (factory or singleton).
+        if op_was_bootstrapped_via_lifecycle:
+            # NEW: try pair_factory path first
+            selected_vault_id = await self._db.get_selected_vault_id()
+            if (
+                selected_vault_id
+                and self._pair_factory_w3 is not None
+                and self._pair_factory_account is not None
+            ):
+                from engine.pair_factory import build_lifecycle
+                lifecycle = await build_lifecycle(
+                    settings=self._settings, hub=self._hub, db=self._db,
+                    exchange=self._exchange,
+                    selected_vault_id=selected_vault_id,
+                    w3=self._pair_factory_w3,
+                    account=self._pair_factory_account,
+                )
+                return await lifecycle.teardown(
+                    swap_to_usdc=swap_to_usdc, close_reason=close_reason,
+                )
+            # Fallback to singleton lifecycle (Phase 2.0 path)
+            if self._lifecycle is not None:
+                return await self._lifecycle.teardown(
+                    swap_to_usdc=swap_to_usdc, close_reason=close_reason,
+                )
 
         # Legacy path
         if op_row is None:

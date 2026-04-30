@@ -53,6 +53,13 @@ function dashboard() {
         startBudget: 300.0,
         startBudgetMax: 0.0,
 
+        showPairPicker: false,
+        pairsData: { usd_pairs: [], cross_pairs: [], selected_vault_id: null, last_refresh_ts: 0 },
+        pairSearch: '',
+        pairSort: 'apy',
+        pairRefreshing: false,
+        pairsLastRefresh: 0,
+
         get hasBook() {
             return this.state.best_bid > 0 && this.state.best_ask > 0;
         },
@@ -123,6 +130,23 @@ function dashboard() {
                 if (name in t) out.push({ name, label, ms: t[name] });
             }
             return out;
+        },
+
+        get filteredUsdPairs() {
+            return this._filterAndSort(this.pairsData.usd_pairs);
+        },
+
+        get filteredCrossPairs() {
+            return this._filterAndSort(this.pairsData.cross_pairs);
+        },
+
+        get selectedPairLabel() {
+            const sel = this.pairsData.selected_vault_id;
+            if (!sel) return null;
+            const all = [...this.pairsData.usd_pairs, ...this.pairsData.cross_pairs];
+            const p = all.find(x => x.vault_id === sel);
+            if (!p) return sel.slice(0, 10) + '...';
+            return p.pair + ' (' + p.manager + ')';
         },
 
         _formatElapsed() {
@@ -224,6 +248,110 @@ function dashboard() {
             } catch (e) {}
         },
 
+        _filterAndSort(list) {
+            let out = list || [];
+            if (this.pairSearch) {
+                const q = this.pairSearch.toLowerCase();
+                out = out.filter(p => (p.pair || '').toLowerCase().includes(q));
+            }
+            const sort = this.pairSort;
+            out = [...out].sort((a, b) => {
+                if (sort === 'apy') return (b.apy_30d || 0) - (a.apy_30d || 0);
+                if (sort === 'tvl') return (b.tvl_usd || 0) - (a.tvl_usd || 0);
+                if (sort === 'pair') return (a.pair || '').localeCompare(b.pair || '');
+                return 0;
+            });
+            return out;
+        },
+
+        formatTvl(v) {
+            if (!v) return '—';
+            if (v >= 1e9) return '$' + (v / 1e9).toFixed(2) + 'B';
+            if (v >= 1e6) return '$' + (v / 1e6).toFixed(2) + 'M';
+            if (v >= 1e3) return '$' + (v / 1e3).toFixed(0) + 'K';
+            return '$' + v.toFixed(0);
+        },
+
+        formatApy(v) {
+            if (v == null) return 'N/A';
+            return (v * 100).toFixed(2) + '%';
+        },
+
+        apyColorClass(v) {
+            if (v == null) return 'text-slate-400';
+            if (v >= 0.6) return 'apy-high';
+            if (v >= 0.3) return 'apy-medium';
+            return 'apy-low';
+        },
+
+        formatRelativeTime(ts) {
+            if (!ts) return 'nunca';
+            const sec = Math.floor(Date.now() / 1000) - ts;
+            if (sec < 60) return sec + 's atrás';
+            if (sec < 3600) return Math.floor(sec / 60) + 'min atrás';
+            if (sec < 86400) return Math.floor(sec / 3600) + 'h atrás';
+            return Math.floor(sec / 86400) + 'd atrás';
+        },
+
+        async openPairPicker() {
+            this.showPairPicker = true;
+            await this.loadPairs();
+        },
+
+        async loadPairs() {
+            try {
+                const resp = await fetch('/pairs');
+                if (resp.ok) {
+                    const data = await resp.json();
+                    this.pairsData = data;
+                    this.pairsLastRefresh = data.last_refresh_ts || 0;
+                }
+            } catch (e) {}
+        },
+
+        async refreshPairs() {
+            this.pairRefreshing = true;
+            try {
+                const resp = await fetch('/pairs/refresh', { method: 'POST' });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    alert('Erro ao atualizar: ' + (data.error || resp.status));
+                } else {
+                    await this.loadPairs();
+                }
+            } catch (e) {
+                alert('Erro: ' + e);
+            }
+            this.pairRefreshing = false;
+        },
+
+        async selectPair(p) {
+            if (!p.selectable) {
+                alert('Não selecionável: ' + (p.reason || ''));
+                return;
+            }
+            if (p.vault_id === this.pairsData.selected_vault_id) {
+                return;
+            }
+            if (!confirm('Selecionar par ' + p.pair + ' (' + p.manager + ')?')) return;
+            try {
+                const resp = await fetch('/pairs/select', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ vault_id: p.vault_id }),
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    alert('Erro: ' + (data.error || resp.status));
+                    return;
+                }
+                this.pairsData.selected_vault_id = p.vault_id;
+                alert('Par selecionado! Aplica na próxima operação.');
+            } catch (e) {
+                alert('Erro: ' + e);
+            }
+        },
+
         init() {
             fetch('/config')
                 .then(r => r.json())
@@ -236,6 +364,8 @@ function dashboard() {
                     if (data) this._opStartedAt = data.started_at;
                 })
                 .catch(() => {});
+
+            this.loadPairs();
 
             const es = new EventSource('/sse/state');
             es.addEventListener('state-update', (e) => {

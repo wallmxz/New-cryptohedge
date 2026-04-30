@@ -64,6 +64,18 @@ Stack: Python 3.14, asyncio, Starlette + Alpine.js, web3.py, dydx-v4-client, aio
   - Spec: `docs/superpowers/specs/2026-04-29-backtesting-design.md`
   - Plan: `docs/superpowers/plans/2026-04-29-backtesting.md`
 
+- ✅ **Pair Picker** (tag `fase-pair-picker-completa`, branch feature/pair-picker)
+  - 13 tasks (T0–T13), 194 testes (170 base + 24 novos: stables, dydx_markets, beefy_api, pair_resolver, pair_factory, pair_picker_routes)
+  - Settings → tab "Trading" tem botão "Escolher Par" que abre modal Beefy-style com cards (logos hotlinkados, APY color-coded, TVL formatado, manager badge)
+  - Lista vem de live discovery: `chains/beefy_api.py` (cows + tvl + apy/breakdown) + `chains/dydx_markets.py` (perpetualMarkets)
+  - Filter: token0 com perp dYdX ativo, token1 stable (USDC/USDT/USDC.e/DAI), decimals (18,6) only
+  - Categoriza USD-Pairs (selectable) vs Cross-Pairs (Phase 3.x grayed)
+  - Hot-reload: `engine/pair_factory.py` constrói OperationLifecycle per-vault no momento do `start_operation`; sem restart
+  - REST: GET /pairs, POST /pairs/select, POST /pairs/refresh
+  - Refactor T0: WETH/USDC_TOKEN_ADDRESS → genéricos TOKEN0/1_ADDRESS + token0_decimals/token1_decimals (back-compat via fallback no `from_env`)
+  - Spec: `docs/superpowers/specs/2026-04-29-pair-picker-design.md`
+  - Plan: `docs/superpowers/plans/2026-04-29-pair-picker.md`
+
 - ✅ **Phase 2.0 — On-chain Execution Automatica** (tag `fase-2.0-completa`, branch feature/onchain-execution)
   - 13 tasks (T0–T12 + T13 follow-up), 170 testes (~33 novos: lp_math, chain_executor, uniswap_executor, beefy_executor, lifecycle, lifecycle_recovery)
   - **1-click start:** bot faz approve + swap USDC->WETH (same-pool 0,05%) + deposit Beefy CLM + snapshot + open dYdX short

@@ -140,6 +140,39 @@ class Database:
                 await self._conn.commit()
             except aiosqlite.OperationalError:
                 pass  # column already exists
+        # Phase pair-picker: cache tables for Beefy + dYdX market data
+        await self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS beefy_pairs_cache (
+                vault_id TEXT PRIMARY KEY,
+                chain TEXT NOT NULL,
+                pool_address TEXT NOT NULL,
+                token0_address TEXT NOT NULL,
+                token0_symbol TEXT NOT NULL,
+                token0_decimals INTEGER NOT NULL,
+                token1_address TEXT NOT NULL,
+                token1_symbol TEXT NOT NULL,
+                token1_decimals INTEGER NOT NULL,
+                pool_fee INTEGER NOT NULL,
+                manager TEXT,
+                tick_lower INTEGER,
+                tick_upper INTEGER,
+                tvl_usd REAL,
+                apy_30d REAL,
+                is_usd_pair INTEGER NOT NULL,
+                dydx_perp TEXT,
+                token0_logo_url TEXT,
+                token1_logo_url TEXT,
+                fetched_at REAL NOT NULL
+            )"""
+        )
+        await self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS dydx_markets_cache (
+                ticker TEXT PRIMARY KEY,
+                status TEXT,
+                fetched_at REAL NOT NULL
+            )"""
+        )
+        await self._conn.commit()
 
     async def close(self) -> None:
         if self._conn:
@@ -443,3 +476,88 @@ class Database:
         cols = [c[0] for c in cursor.description]
         rows = await cursor.fetchall()
         return [dict(zip(cols, r)) for r in rows]
+
+    # ---- Pair picker: Beefy cache ---------------------------------------
+
+    async def upsert_beefy_pair(self, *, pair: dict) -> None:
+        """Insert or replace a Beefy CLM in cache. `pair` dict must have all
+        columns of beefy_pairs_cache table."""
+        await self._conn.execute(
+            """INSERT OR REPLACE INTO beefy_pairs_cache (
+                vault_id, chain, pool_address,
+                token0_address, token0_symbol, token0_decimals,
+                token1_address, token1_symbol, token1_decimals,
+                pool_fee, manager, tick_lower, tick_upper,
+                tvl_usd, apy_30d, is_usd_pair, dydx_perp,
+                token0_logo_url, token1_logo_url, fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                pair["vault_id"], pair["chain"], pair["pool_address"],
+                pair["token0_address"], pair["token0_symbol"], pair["token0_decimals"],
+                pair["token1_address"], pair["token1_symbol"], pair["token1_decimals"],
+                pair["pool_fee"], pair.get("manager"),
+                pair.get("tick_lower"), pair.get("tick_upper"),
+                pair.get("tvl_usd"), pair.get("apy_30d"),
+                int(bool(pair["is_usd_pair"])), pair.get("dydx_perp"),
+                pair.get("token0_logo_url"), pair.get("token1_logo_url"),
+                pair["fetched_at"],
+            ),
+        )
+        await self._conn.commit()
+
+    async def get_pair_from_cache(self, vault_id: str) -> dict | None:
+        """Returns pair dict for a vault_id (case-insensitive on address), or None."""
+        cursor = await self._conn.execute(
+            "SELECT * FROM beefy_pairs_cache WHERE LOWER(vault_id) = LOWER(?)",
+            (vault_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        cols = [c[0] for c in cursor.description]
+        return dict(zip(cols, row))
+
+    async def list_cached_pairs(self) -> list[dict]:
+        """Returns all cached Beefy pairs, ordered by APY descending (NULLs last)."""
+        cursor = await self._conn.execute(
+            "SELECT * FROM beefy_pairs_cache ORDER BY (apy_30d IS NULL), apy_30d DESC"
+        )
+        cols = [c[0] for c in cursor.description]
+        rows = await cursor.fetchall()
+        return [dict(zip(cols, r)) for r in rows]
+
+    async def clear_beefy_cache(self) -> None:
+        """Wipe Beefy cache. Used before a full refresh."""
+        await self._conn.execute("DELETE FROM beefy_pairs_cache")
+        await self._conn.commit()
+
+    # ---- Pair picker: dYdX market cache ---------------------------------
+
+    async def upsert_dydx_market(self, *, ticker: str, status: str, fetched_at: float) -> None:
+        await self._conn.execute(
+            "INSERT OR REPLACE INTO dydx_markets_cache (ticker, status, fetched_at) VALUES (?, ?, ?)",
+            (ticker, status, fetched_at),
+        )
+        await self._conn.commit()
+
+    async def get_active_dydx_tickers(self) -> set[str]:
+        """Returns set of ticker strings whose status is 'ACTIVE'."""
+        cursor = await self._conn.execute(
+            "SELECT ticker FROM dydx_markets_cache WHERE status = 'ACTIVE'"
+        )
+        rows = await cursor.fetchall()
+        return {r[0] for r in rows}
+
+    async def clear_dydx_cache(self) -> None:
+        await self._conn.execute("DELETE FROM dydx_markets_cache")
+        await self._conn.commit()
+
+    # ---- Pair picker: selected vault ------------------------------------
+
+    async def set_selected_vault_id(self, vault_id: str) -> None:
+        """Persist the selected pair's vault_id in the config table."""
+        await self.set_config("selected_vault_id", vault_id)
+
+    async def get_selected_vault_id(self) -> str | None:
+        """Returns the persisted selected_vault_id, or None if unset."""
+        return await self.get_config("selected_vault_id")

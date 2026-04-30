@@ -74,18 +74,18 @@ class OperationLifecycle:
         return (base * 1_000_000) + self._cloid_seq + (int(time.time()) & 0xFFFF)
 
     async def _read_wallet_balance(self) -> dict[str, float]:
-        """Returns {weth, usdc, eth} balances in display units."""
+        """Returns {token0, token1, eth} balances in display units."""
         eth_raw = await self._uniswap._w3.eth.get_balance(self._uniswap.address)
         eth = eth_raw / 1e18
-        weth_token = self._uniswap._erc20(self._settings.weth_token_address)
-        usdc_token = self._uniswap._erc20(self._settings.usdc_token_address)
-        weth_raw, usdc_raw = await asyncio.gather(
-            weth_token.functions.balanceOf(self._uniswap.address).call(),
-            usdc_token.functions.balanceOf(self._uniswap.address).call(),
+        token0 = self._uniswap._erc20(self._settings.token0_address)
+        token1 = self._uniswap._erc20(self._settings.token1_address)
+        token0_raw, token1_raw = await asyncio.gather(
+            token0.functions.balanceOf(self._uniswap.address).call(),
+            token1.functions.balanceOf(self._uniswap.address).call(),
         )
         return {
-            "weth": weth_raw / (10 ** self._decimals0),
-            "usdc": usdc_raw / (10 ** self._decimals1),
+            "token0": token0_raw / (10 ** self._decimals0),
+            "token1": token1_raw / (10 ** self._decimals1),
             "eth": eth,
         }
 
@@ -136,15 +136,15 @@ class OperationLifecycle:
             await self._db.update_bootstrap_state(op_id, "approving")
             self._hub.bootstrap_progress = "Approving tokens..."
             await self._uniswap.ensure_approval(
-                token_address=self._settings.usdc_token_address,
+                token_address=self._settings.token1_address,
                 amount=2**256 - 1,
                 spender=self._settings.uniswap_v3_router_address,
             )
             await self._beefy.ensure_approval(
-                token_address=self._settings.usdc_token_address, amount=2**256 - 1,
+                token_address=self._settings.token1_address, amount=2**256 - 1,
             )
             await self._beefy.ensure_approval(
-                token_address=self._settings.weth_token_address, amount=2**256 - 1,
+                token_address=self._settings.token0_address, amount=2**256 - 1,
             )
 
             # Step 2: Swap (if needed)
@@ -158,8 +158,8 @@ class OperationLifecycle:
                 amount_out_raw = int(amount_weth_target * 10**self._decimals0)
                 deadline = int(time.time()) + DEFAULT_DEADLINE_SECONDS
                 tx = await self._uniswap.swap_exact_output(
-                    token_in=self._settings.usdc_token_address,
-                    token_out=self._settings.weth_token_address,
+                    token_in=self._settings.token1_address,
+                    token_out=self._settings.token0_address,
                     fee=self._settings.uniswap_v3_pool_fee,
                     amount_out=amount_out_raw,
                     amount_in_maximum=amount_in_max,
@@ -174,8 +174,8 @@ class OperationLifecycle:
             await self._db.update_bootstrap_state(op_id, "deposit_pending")
             self._hub.bootstrap_progress = "Depositing in Beefy..."
             bal = await self._read_wallet_balance()
-            amount0_raw = int(bal["weth"] * 10**self._decimals0)
-            amount1_raw = int(bal["usdc"] * 10**self._decimals1)
+            amount0_raw = int(bal["token0"] * 10**self._decimals0)
+            amount1_raw = int(bal["token1"] * 10**self._decimals1)
             min_shares = 0  # MVP: accept any
             tx = await self._beefy.deposit(
                 amount0=amount0_raw, amount1=amount1_raw, min_shares=min_shares,
@@ -289,14 +289,14 @@ class OperationLifecycle:
                 await self._db.update_bootstrap_state(op_id, "teardown_swap_pending")
                 self._hub.bootstrap_progress = "Swapping WETH -> USDC..."
                 bal = await self._read_wallet_balance()
-                if bal["weth"] > 0:
-                    amount_in_raw = int(bal["weth"] * 10**self._decimals0)
+                if bal["token0"] > 0:
+                    amount_in_raw = int(bal["token0"] * 10**self._decimals0)
                     p_now = await self._pool_reader.read_price()
                     slippage = self._settings.slippage_bps / 10000.0
-                    min_out = int(bal["weth"] * p_now * (1 - slippage) * 10**self._decimals1)
+                    min_out = int(bal["token0"] * p_now * (1 - slippage) * 10**self._decimals1)
                     tx = await self._uniswap.swap_exact_input(
-                        token_in=self._settings.weth_token_address,
-                        token_out=self._settings.usdc_token_address,
+                        token_in=self._settings.token0_address,
+                        token_out=self._settings.token1_address,
                         fee=self._settings.uniswap_v3_pool_fee,
                         amount_in=amount_in_raw,
                         amount_out_minimum=min_out,
