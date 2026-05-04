@@ -33,11 +33,31 @@ def format_text_report(
         result["net_pnl"] / capital_lp if capital_lp > 0 else 0.0
     )
 
+    ex_stats = result.get("exchange_stats", {}) or {}
+    is_per_leg = len(ex_stats) > 1
+
     lines = [
         f"Backtest {symbol} | {start_iso} -> {end_iso} ({days:.1f} days)",
         f"Capital: ${capital_lp:.0f} LP + ${capital_dydx:.0f} dYdX margin",
         "",
-        f"Fills:          {result['fills_maker']} maker, {result['fills_taker']} taker",
+    ]
+
+    if is_per_leg:
+        lines.append("Per-leg final positions:")
+        for sym, stats in ex_stats.items():
+            sz = stats.get("position_size", 0.0)
+            sd = stats.get("side") or "flat"
+            lines.append(f"  {sym:<10}  {sd:<6}  size={sz:>10.4f}")
+        lines.append("")
+        lines.append(
+            f"Total fills: {result['fills_maker']} maker, {result['fills_taker']} taker (across all legs)"
+        )
+    else:
+        lines.append(
+            f"Fills:          {result['fills_maker']} maker, {result['fills_taker']} taker"
+        )
+
+    lines.extend([
         f"Range resets:   {result['range_resets']} (Beefy)",
         f"Out-of-range:   {out_of_range_hours:.1f} hours total",
         "",
@@ -46,7 +66,7 @@ def format_text_report(
         f"Max drawdown:   ${result['max_drawdown']:.2f}",
         "",
         "Note: best-case simulation; real-world may be 5-15% worse due to latency/slippage.",
-    ]
+    ])
     return "\n".join(lines)
 
 
