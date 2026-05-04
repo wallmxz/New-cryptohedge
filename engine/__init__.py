@@ -602,29 +602,87 @@ class GridMakerEngine:
         except Exception:
             return None
 
-    async def _aggressive_correct(self, current_short, target_short, p_now, meta):
-        """Use taker orders to correct exposure quickly."""
-        delta = target_short - current_short
+    async def _maybe_rebalance_leg(
+        self, *, symbol: str, target: float, current: float,
+        min_notional: float, ref_price: float,
+    ) -> None:
+        """Level-triggered taker: fire market order when |drift| * ref_price >= min_notional.
+
+        target: desired short size in token base units (e.g. 100.0 ARB).
+        current: current absolute short size in same units.
+        min_notional: exchange minimum order notional in USD.
+        ref_price: USD price of the leg's token (used both as the filter
+          threshold and to compute the cross-spread price for the market order).
+
+        Cross-spread convention for taker:
+          side=sell -> price = ref_price * 0.999 (cross the bid)
+          side=buy  -> price = ref_price * 1.001 (cross the ask)
+        """
+        drift = target - current
+        notional_drift_usd = abs(drift) * ref_price
+        if notional_drift_usd < min_notional:
+            return  # sub-level, idle
+
+        side = "sell" if drift > 0 else "buy"
+        size = abs(drift)
+        cross_price = ref_price * (0.999 if side == "sell" else 1.001)
+        cloid = self._next_cloid_for_leg(symbol)
         metrics.aggressive_corrections_total.inc()
-        side = "sell" if delta > 0 else "buy"
-        size = abs(delta)
-        price = p_now * (1.001 if side == "sell" else 0.999)  # cross spread
-        cloid = self._next_cloid(999)
         try:
             await self._exchange.place_long_term_order(
-                symbol=self._settings.dydx_symbol,
-                side=side, size=size, price=price,
+                symbol=symbol, side=side, size=size, price=cross_price,
                 cloid_int=cloid, ttl_seconds=60,
             )
+            op_id = self._hub.current_operation_id
+            if op_id is not None:
+                slippage_usd = 0.0005 * size * ref_price
+                field = (
+                    "perp_fees_paid_token0"
+                    if symbol == self._settings.dydx_symbol_token0
+                    else "perp_fees_paid_token1"
+                )
+                await self._db.add_to_operation_accumulator(op_id, field, slippage_usd)
             await self._db.insert_order_log(
                 timestamp=time.time(), exchange=self._exchange.name,
-                action="place", side=side, size=size, price=price,
-                reason="aggressive_correction",
+                action="place", side=side, size=size, price=cross_price,
+                reason=f"level_triggered_{symbol}",
                 operation_id=self._hub.current_operation_id,
             )
-            logger.warning(f"Aggressive correction: {side} {size} @ {price}")
+            logger.info(
+                f"Rebalance fire [{symbol}]: {side} {size:.6f} @ ~{cross_price:.4f}"
+            )
         except Exception as e:
-            logger.exception(f"Aggressive order failed: {e}")
+            logger.exception(f"Rebalance fire failed [{symbol}]: {e}")
+
+    def _next_cloid_for_leg(self, symbol: str) -> int:
+        """Generate a cloid scoped per leg so concurrent fires from different
+        legs never collide. Encodes a byte for the leg identity."""
+        self._cloid_seq += 1
+        leg_byte = 0xA0 if symbol == self._settings.dydx_symbol_token0 else 0xA1
+        return (
+            ((self._run_id & 0xFFFF) << 16) |
+            (leg_byte << 8) |
+            (self._cloid_seq & 0xFF)
+        )
+
+    async def _aggressive_correct(self, current_short, target_short, p_now, meta):
+        """Deprecated thin wrapper: delegates to _maybe_rebalance_leg for the
+        single-leg (token0) symbol. Task 10 refactors `_iterate` to call
+        `_maybe_rebalance_leg` directly per leg; until then, keep this wrapper
+        so the existing single-leg `_iterate` call site and its tests still
+        work.
+        """
+        symbol = self._settings.dydx_symbol_token0
+        min_notional = (
+            meta.min_notional * p_now if meta is not None else 0.0
+        )
+        await self._maybe_rebalance_leg(
+            symbol=symbol,
+            target=target_short,
+            current=current_short,
+            min_notional=min_notional,
+            ref_price=p_now,
+        )
 
     async def _on_fill(self, fill):
         """Handle a fill event from the exchange WS, attribute to active operation."""
