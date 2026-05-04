@@ -6,9 +6,10 @@ flags non-selectable pairs with reason.
 """
 from __future__ import annotations
 
-# Currently-supported decimals combo for USD-Pairs.
-# WBTC (8 dec) and exotic tokens are excluded until math is generalized.
-SUPPORTED_DECIMALS_PAIR = {(18, 6)}
+# Currently-supported decimals combos. (18, 6) covers WETH/USDC and similar
+# USD-pairs; (18, 18) covers cross-pairs like ARB/WETH.
+# WBTC (8 dec) and other exotic tokens are excluded until math is generalized.
+SUPPORTED_DECIMALS_PAIR = {(18, 6), (18, 18)}
 
 
 async def build_pair_list(*, db) -> dict:
@@ -40,17 +41,30 @@ def format_pair_for_ui(raw: dict) -> dict:
     """Convert a raw cached pair dict to UI shape with selectability + reason."""
     is_usd = bool(raw.get("is_usd_pair"))
     decimals_combo = (raw.get("token0_decimals", 0), raw.get("token1_decimals", 0))
+    perp_token1 = raw.get("dydx_perp_token1")
 
     # Determine selectability + reason
-    if not is_usd:
-        selectable = False
-        reason = "Phase 3.x — cross-pair requires dual-leg hedge"
-    elif decimals_combo not in SUPPORTED_DECIMALS_PAIR:
-        selectable = False
-        reason = f"Decimals {decimals_combo} not supported in MVP (only (18,6))"
+    if is_usd:
+        if decimals_combo not in SUPPORTED_DECIMALS_PAIR:
+            selectable = False
+            reason = (
+                f"Decimals {decimals_combo} not supported in MVP "
+                f"(only {sorted(SUPPORTED_DECIMALS_PAIR)})"
+            )
+        else:
+            selectable = True
+            reason = None
     else:
-        selectable = True
-        reason = None
+        # Cross-pair (token1 not stable) — needs token1 perp for dual-leg hedge
+        if not perp_token1:
+            selectable = False
+            reason = "Cross-pair: token1 sem perp dYdX ativo"
+        elif decimals_combo not in SUPPORTED_DECIMALS_PAIR:
+            selectable = False
+            reason = f"Decimals {decimals_combo} not supported in MVP"
+        else:
+            selectable = True
+            reason = None
 
     # Convert pool_fee from bps to pct (e.g., 500 -> 0.05)
     pool_fee_pct = (raw.get("pool_fee") or 0) / 10000.0
@@ -75,6 +89,7 @@ def format_pair_for_ui(raw: dict) -> dict:
         "token0_logo_url": raw.get("token0_logo_url"),
         "token1_logo_url": raw.get("token1_logo_url"),
         "dydx_perp": raw.get("dydx_perp"),
+        "dydx_perp_token1": raw.get("dydx_perp_token1"),
         "selectable": selectable,
         "reason": reason,
     }

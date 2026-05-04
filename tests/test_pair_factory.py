@@ -76,17 +76,19 @@ async def test_build_lifecycle_raises_when_vault_not_in_cache(
 
 
 @pytest.mark.asyncio
-async def test_build_lifecycle_raises_for_cross_pair(
+async def test_build_lifecycle_raises_for_cross_pair_without_token1_perp(
     mock_settings, mock_hub, mock_db, mock_exchange, mock_w3, mock_account,
 ):
+    """Cross-pair without dydx_perp_token1 cannot dual-leg-hedge."""
     mock_db.get_pair_from_cache = AsyncMock(return_value={
         "vault_id": "0xV2", "is_usd_pair": 0,
         "token0_address": "0xARB", "token1_address": "0xWETH",
         "token0_decimals": 18, "token1_decimals": 18,
         "pool_address": "0xPOOL", "pool_fee": 3000, "dydx_perp": "ARB-USD",
+        "dydx_perp_token1": None,  # token1 sem perp ativo
         "token0_symbol": "ARB", "token1_symbol": "WETH",
     })
-    with pytest.raises(ValueError, match="cross-pair"):
+    with pytest.raises(ValueError, match="token1.*sem perp"):
         await build_lifecycle(
             settings=mock_settings, hub=mock_hub, db=mock_db,
             exchange=mock_exchange,

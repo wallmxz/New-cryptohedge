@@ -3,7 +3,7 @@
 Replaces the singleton lifecycle pattern. When user picks a pair,
 DB stores selected_vault_id. At start_operation time, build_lifecycle()
 reads pair info from cache and constructs the OperationLifecycle with
-the right token addresses, decimals, fee tier, dYdX symbol.
+the right token addresses, decimals, fee tier, and dYdX symbol(s).
 """
 from __future__ import annotations
 import dataclasses
@@ -20,6 +20,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Decimals combos supported in MVP. WBTC (8 dec) and exotic combos are
+# rejected at the factory; broaden as the curve math gets generalized.
+SUPPORTED_DECIMALS_PAIR = {(18, 6), (18, 18)}
+
 
 async def build_lifecycle(
     *, settings, hub, db, exchange,
@@ -28,16 +32,15 @@ async def build_lifecycle(
 ):
     """Build a fresh OperationLifecycle for the given vault_id.
 
-    Reads pair metadata from beefy_pairs_cache. Constructs UniswapExecutor,
-    BeefyExecutor, pool_reader, beefy_reader with the pair's addresses
-    and decimals. Returns an OperationLifecycle ready to bootstrap().
+    Reads pair metadata from beefy_pairs_cache. Validates token0 perp
+    (always required), token1 perp (cross-pair only), and decimals combo.
+    Returns an OperationLifecycle ready to bootstrap().
 
-    Raises ValueError if:
+    Raises ValueError on:
     - vault_id not in cache (need refresh first)
-    - pair is cross-pair (Phase 3.x scope)
-    - pair has unsupported decimals
+    - cross-pair with no token1 perp (cannot dual-leg-hedge)
+    - unsupported decimals combo
     """
-    # Lazy import to avoid circular
     from engine.lifecycle import OperationLifecycle
 
     pair = await db.get_pair_from_cache(selected_vault_id)
@@ -46,31 +49,40 @@ async def build_lifecycle(
             f"Vault {selected_vault_id} not in cache. "
             f"Refresh pair list (POST /pairs/refresh)."
         )
-    if not pair.get("is_usd_pair"):
+
+    is_usd = bool(pair.get("is_usd_pair"))
+    perp0 = pair["dydx_perp"]
+    perp1 = pair.get("dydx_perp_token1") or ""
+
+    if not is_usd and not perp1:
         raise ValueError(
-            f"Vault {selected_vault_id} is cross-pair (token1 not stable); "
-            f"requires Phase 3.x dual-leg hedge."
+            f"Cross-pair {selected_vault_id}: token1 "
+            f"{pair.get('token1_symbol')} sem perp dYdX ativo, "
+            f"não suporta dual-leg hedge."
         )
 
     decimals0 = int(pair["token0_decimals"])
     decimals1 = int(pair["token1_decimals"])
-    if (decimals0, decimals1) != (18, 6):
+    if (decimals0, decimals1) not in SUPPORTED_DECIMALS_PAIR:
         raise ValueError(
             f"Vault {selected_vault_id} has unsupported decimals "
-            f"({decimals0}, {decimals1}); MVP supports (18, 6) only."
+            f"({decimals0}, {decimals1}); MVP supports "
+            f"{sorted(SUPPORTED_DECIMALS_PAIR)} only."
         )
 
-    # Patch settings with pair-specific overrides
     pair_settings = dataclasses.replace(
         settings,
+        dydx_symbol_token0=perp0,
+        dydx_symbol_token1=perp1,
         token0_address=pair["token0_address"],
         token1_address=pair["token1_address"],
         token0_decimals=decimals0,
         token1_decimals=decimals1,
+        pool_token0_symbol=pair["token0_symbol"],
+        pool_token1_symbol=pair["token1_symbol"],
         clm_vault_address=pair["vault_id"],
         clm_pool_address=pair["pool_address"],
         uniswap_v3_pool_fee=int(pair["pool_fee"]),
-        dydx_symbol_token0=pair["dydx_perp"],
     )
 
     pool_reader = UniswapV3PoolReader(
@@ -87,8 +99,7 @@ async def build_lifecycle(
         router_address=settings.uniswap_v3_router_address,
     )
     beefy_exec = BeefyExecutor(
-        w3=w3, account=account,
-        strategy_address=pair["vault_id"],
+        w3=w3, account=account, strategy_address=pair["vault_id"],
     )
 
     lifecycle = OperationLifecycle(
@@ -99,6 +110,7 @@ async def build_lifecycle(
     )
     logger.info(
         f"Built lifecycle for vault {selected_vault_id} "
-        f"({pair.get('token0_symbol')}/{pair.get('token1_symbol')})"
+        f"({pair['token0_symbol']}/{pair['token1_symbol']}, "
+        f"{'USD-pair' if is_usd else 'cross-pair (dual-leg)'})"
     )
     return lifecycle
