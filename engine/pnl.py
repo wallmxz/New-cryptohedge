@@ -1,41 +1,131 @@
-from __future__ import annotations
+"""Per-leg PnL breakdown for cross-pair operations.
 
+Single-leg (token1 stable): pass current_eth_price + hedge_*_since_baseline.
+Cross-pair (both volatile): pass current_token0_usd_price + current_token1_usd_price
+  + hedge_*_per_symbol dicts.
+
+Aggregates (hedge_pnl, perp_fees_paid, funding) are always present and equal
+the sum of per-leg components. Per-leg fields exist only in the breakdown
+when called with the cross-pair signature.
+"""
+from __future__ import annotations
 from engine.operation import Operation
 
 
-BEEFY_PERF_FEE_RATE = 0.10  # Beefy takes ~10% of fees
+BEEFY_PERF_FEE_RATE = 0.10
 
 
 def compute_operation_pnl(
     op: Operation,
     *,
     current_pool_value_usd: float,
-    current_eth_price: float,
-    hedge_realized_since_baseline: float,
-    hedge_unrealized_since_baseline: float,
+    # cross-pair signature (preferred):
+    current_token0_usd_price: float | None = None,
+    current_token1_usd_price: float | None = None,
+    hedge_realized_per_symbol: dict[str, float] | None = None,
+    hedge_unrealized_per_symbol: dict[str, float] | None = None,
+    # legacy single-leg signature (kept for backwards compat):
+    current_eth_price: float | None = None,
+    hedge_realized_since_baseline: float | None = None,
+    hedge_unrealized_since_baseline: float | None = None,
 ) -> dict:
-    """Returns the live PnL breakdown for an active operation.
+    """Returns the live PnL breakdown for an operation.
 
-    Sign convention: positive = profit, negative = loss.
-    funding: positive if bot received (longs paid), negative if bot paid.
-    op.funding_paid stores it as "paid by us" so we negate to get the breakdown.
+    For cross-pair (dual-leg) ops, pass the cross-pair signature.
+    For single-leg (legacy) ops, pass current_eth_price + hedge_*_since_baseline.
     """
-    hodl_value = op.baseline_amount0 * current_eth_price + op.baseline_amount1
-    # IL natural is the loss vs HODL — express as gain/loss vs baseline pool
+    is_cross_pair = (
+        current_token0_usd_price is not None
+        and current_token1_usd_price is not None
+    )
+
+    # Resolve current prices for the IL calc.
+    if is_cross_pair:
+        p0_now = current_token0_usd_price
+        p1_now = current_token1_usd_price
+    else:
+        # Single-leg: token0 is volatile (USD price = current_eth_price);
+        # token1 is USDC (= $1).
+        if current_eth_price is None:
+            raise ValueError(
+                "compute_operation_pnl needs either cross-pair signature "
+                "(current_token0_usd_price + current_token1_usd_price) or "
+                "legacy signature (current_eth_price)."
+            )
+        p0_now = current_eth_price
+        p1_now = 1.0
+
+    # IL natural: LP USD value - HODL USD value at current prices.
+    hodl_value = op.baseline_amount0 * p0_now + op.baseline_amount1 * p1_now
     il_natural = current_pool_value_usd - hodl_value
 
-    hedge_pnl = hedge_realized_since_baseline + hedge_unrealized_since_baseline
+    # Hedge PnL — per-leg dicts in cross-pair, single aggregate in legacy.
+    if is_cross_pair:
+        rps = hedge_realized_per_symbol or {}
+        ups = hedge_unrealized_per_symbol or {}
+        # Symbol order is whatever's in the dicts; we pick keys deterministically
+        # by sorted order so token0 vs token1 attribution is stable across calls.
+        keys = sorted(set(rps) | set(ups))
+        token0_key = keys[0] if keys else None
+        token1_key = keys[1] if len(keys) > 1 else None
+
+        hedge_pnl_t0 = (
+            (rps.get(token0_key, 0.0) + ups.get(token0_key, 0.0))
+            if token0_key else 0.0
+        )
+        hedge_pnl_t1 = (
+            (rps.get(token1_key, 0.0) + ups.get(token1_key, 0.0))
+            if token1_key else 0.0
+        )
+    else:
+        hedge_pnl_t0 = (
+            (hedge_realized_since_baseline or 0.0)
+            + (hedge_unrealized_since_baseline or 0.0)
+        )
+        hedge_pnl_t1 = 0.0
+
+    hedge_pnl = hedge_pnl_t0 + hedge_pnl_t1
+
+    # Funding — convention: stored as "paid by us" so we negate to get the
+    # signed amount in the breakdown (positive = received).
+    if is_cross_pair:
+        funding_t0 = -op.funding_paid_token0
+        funding_t1 = -op.funding_paid_token1
+    else:
+        # Legacy: aggregate funding_paid (single-leg field) lives on token0 side.
+        funding_t0 = -op.funding_paid
+        funding_t1 = 0.0
+    funding = funding_t0 + funding_t1
+
+    # Perp fees — same shape as funding.
+    if is_cross_pair:
+        perp_fees_t0 = op.perp_fees_paid_token0
+        perp_fees_t1 = op.perp_fees_paid_token1
+    else:
+        perp_fees_t0 = op.perp_fees_paid
+        perp_fees_t1 = 0.0
+    perp_fees = perp_fees_t0 + perp_fees_t1
 
     beefy_perf = -BEEFY_PERF_FEE_RATE * op.lp_fees_earned
 
-    breakdown = {
+    breakdown: dict = {
         "lp_fees_earned": op.lp_fees_earned,
         "beefy_perf_fee": beefy_perf,
-        "il_natural": il_natural,
+        "il_natural": round(il_natural, 4),
         "hedge_pnl": hedge_pnl,
-        "funding": -op.funding_paid,  # negate: stored as paid, breakdown shows received
-        "perp_fees_paid": -op.perp_fees_paid,
+        "hedge_pnl_token0": hedge_pnl_t0,
+        "hedge_pnl_token1": hedge_pnl_t1,
+        "funding": funding,
+        "funding_token0": funding_t0,
+        "funding_token1": funding_t1,
+        "perp_fees_paid": -perp_fees,
+        "perp_fees_paid_token0": -perp_fees_t0,
+        "perp_fees_paid_token1": -perp_fees_t1,
         "bootstrap_slippage": -op.bootstrap_slippage,
     }
-    breakdown["net_pnl"] = sum(breakdown.values())
+    # net_pnl sums only the AGGREGATE fields (not per-leg, to avoid double-counting)
+    breakdown["net_pnl"] = sum(
+        v for k, v in breakdown.items()
+        if not (k.endswith("_token0") or k.endswith("_token1"))
+    )
     return breakdown

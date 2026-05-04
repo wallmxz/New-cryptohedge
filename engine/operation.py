@@ -50,6 +50,13 @@ class Operation:
     bootstrap_deposit_tx_hash: str | None = None
     teardown_withdraw_tx_hash: str | None = None
     teardown_swap_tx_hash: str | None = None
+    # Cross-pair dual-leg fields (Task 6)
+    baseline_token0_usd_price: float | None = None
+    baseline_token1_usd_price: float | None = None
+    perp_fees_paid_token0: float = 0.0
+    perp_fees_paid_token1: float = 0.0
+    funding_paid_token0: float = 0.0
+    funding_paid_token1: float = 0.0
 
     def is_active(self) -> bool:
         return self.state in (
@@ -80,4 +87,10 @@ class Operation:
             bootstrap_deposit_tx_hash=row.get("bootstrap_deposit_tx_hash"),
             teardown_withdraw_tx_hash=row.get("teardown_withdraw_tx_hash"),
             teardown_swap_tx_hash=row.get("teardown_swap_tx_hash"),
+            baseline_token0_usd_price=row.get("baseline_token0_usd_price"),
+            baseline_token1_usd_price=row.get("baseline_token1_usd_price"),
+            perp_fees_paid_token0=row.get("perp_fees_paid_token0", 0.0) or 0.0,
+            perp_fees_paid_token1=row.get("perp_fees_paid_token1", 0.0) or 0.0,
+            funding_paid_token0=row.get("funding_paid_token0", 0.0) or 0.0,
+            funding_paid_token1=row.get("funding_paid_token1", 0.0) or 0.0,
         )
