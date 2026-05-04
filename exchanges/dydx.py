@@ -131,10 +131,27 @@ class DydxAdapter(ExchangeAdapter):
 
     async def get_oracle_prices(self, symbols: list[str]) -> dict[str, float]:
         """Returns {symbol: oracle_price_usd} for each requested symbol.
-        Reads from /v4/perpetualMarkets indexer endpoint.
-        Implemented in Task 4.
+
+        Single round-trip to /v4/perpetualMarkets (returns all markets); we
+        filter to the requested set. Symbols absent from the indexer response
+        are silently dropped — caller should treat missing keys as transient
+        failures and re-try on the next iteration.
         """
-        raise NotImplementedError("get_oracle_prices is implemented in Task 4")
+        response = await self._indexer.markets.get_perpetual_markets()
+        markets = response.get("markets", {})
+        result: dict[str, float] = {}
+        for sym in symbols:
+            m = markets.get(sym)
+            if m is None:
+                continue
+            oracle = m.get("oraclePrice")
+            if oracle is None:
+                continue
+            try:
+                result[sym] = float(oracle)
+            except (ValueError, TypeError):
+                continue
+        return result
 
     # The remaining methods on ExchangeAdapter ABC are placeholder stubs.
     # They will be implemented in Tasks 10-13.
