@@ -250,15 +250,21 @@ async def select_pair(request: Request):
             {"error": f"Vault {vault_id} not in cache. Refresh pair list first."},
             status_code=400,
         )
-    if not pair.get("is_usd_pair"):
+
+    decimals = (pair.get("token0_decimals"), pair.get("token1_decimals"))
+    # Supported: (18, 6) USD-pairs (WETH/USDC) and (18, 18) cross-pairs (ARB/WETH)
+    SUPPORTED_DECIMALS = {(18, 6), (18, 18)}
+    if decimals not in SUPPORTED_DECIMALS:
         return JSONResponse(
-            {"error": "Cross-pairs not selectable in MVP (Phase 3.x scope)"},
+            {"error": f"Unsupported decimals {decimals}; MVP supports {sorted(SUPPORTED_DECIMALS)}"},
             status_code=400,
         )
-    decimals = (pair.get("token0_decimals"), pair.get("token1_decimals"))
-    if decimals != (18, 6):
+
+    # Cross-pair (is_usd_pair=False) requires token1's perp to be active
+    # so the bot can hedge both legs.
+    if not pair.get("is_usd_pair") and not pair.get("dydx_perp_token1"):
         return JSONResponse(
-            {"error": f"Unsupported decimals {decimals}; MVP only (18, 6)"},
+            {"error": "Cross-pair: token1 sem perp dYdX ativo"},
             status_code=400,
         )
 

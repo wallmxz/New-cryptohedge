@@ -81,19 +81,17 @@
             </div>
         </div>
 
-        <!-- Cross-Pairs section (display-only) -->
+        <!-- Cross-Pairs section -->
         <div x-show="filteredCrossPairs.length > 0">
-            <h3 class="text-sm font-bold uppercase tracking-wider text-slate-600 mb-2">
+            <h3 class="text-sm font-bold uppercase tracking-wider text-slate-600 mb-3">
                 Cross-Pairs
                 <span class="text-slate-400 font-normal" x-text="'(' + filteredCrossPairs.length + ')'"></span>
-                <span class="text-amber-600 font-normal text-xs">— Phase 3.x</span>
             </h3>
-            <p class="text-xs text-slate-500 mb-3">
-                Cross-pairs (token1 não-stable) precisam hedge dual-leg, suportado em Phase 3.x.
-            </p>
-            <div class="space-y-2 opacity-50">
+            <div class="space-y-3">
                 <template x-for="p in filteredCrossPairs" :key="p.vault_id">
-                    <div class="pair-card pair-card-disabled">
+                    <div class="pair-card"
+                         :class="p.vault_id === pairsData.selected_vault_id ? 'pair-card-selected' : (p.selectable ? '' : 'pair-card-disabled opacity-50')"
+                         @click="p.selectable && selectPair(p)">
                         <div class="flex items-center justify-between">
                             <div class="flex items-center gap-3">
                                 <div class="pair-logos">
@@ -101,13 +99,32 @@
                                     <img :src="p.token1_logo_url" class="logo logo1" onerror="this.replaceWith(Object.assign(document.createElement('span'), {textContent:'💎', className:'logo-fallback'}))">
                                 </div>
                                 <div>
-                                    <p class="font-semibold text-slate-700" x-text="p.pair"></p>
-                                    <p class="text-xs text-slate-400" x-text="p.manager + ' · ' + p.dex"></p>
+                                    <p class="font-semibold text-slate-800" x-text="p.pair"></p>
+                                    <p class="text-xs text-slate-500">
+                                        <span class="manager-badge" x-text="p.manager"></span>
+                                        ·
+                                        <span x-text="p.dex + ' ' + (p.pool_fee_pct * 100).toFixed(2) + '%'"></span>
+                                    </p>
                                 </div>
                             </div>
-                            <div class="text-sm font-semibold text-slate-500" x-text="formatTvl(p.tvl_usd)"></div>
-                            <div class="text-sm" :class="apyColorClass(p.apy_30d)" x-text="formatApy(p.apy_30d)"></div>
-                            <span class="text-xs text-slate-400 italic">não selecionável</span>
+                            <div class="text-right">
+                                <div class="text-xs text-slate-400">TVL</div>
+                                <div class="text-sm font-semibold" x-text="formatTvl(p.tvl_usd)"></div>
+                            </div>
+                            <div class="text-right">
+                                <div class="text-xs text-slate-400">APY 30d</div>
+                                <div class="text-sm font-bold" :class="apyColorClass(p.apy_30d)"
+                                     x-text="formatApy(p.apy_30d)"></div>
+                            </div>
+                            <span x-show="!p.selectable" class="text-xs text-slate-400 italic" x-text="p.reason"></span>
+                            <button class="px-3 py-1.5 text-xs bg-emerald-600 text-white rounded hover:bg-emerald-700"
+                                    x-show="p.selectable && p.vault_id !== pairsData.selected_vault_id">
+                                Select
+                            </button>
+                            <span x-show="p.vault_id === pairsData.selected_vault_id"
+                                  class="px-3 py-1.5 text-xs bg-slate-200 text-slate-700 rounded">
+                                ✓ Atual
+                            </span>
                         </div>
                     </div>
                 </template>
