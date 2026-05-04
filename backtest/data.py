@@ -51,7 +51,10 @@ class DataFetcher:
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             while cur_end > int(start):
-                params = {"start": int(start), "end": cur_end, "granularity": interval}
+                # Coinbase rejects ranges containing >300 candles per request,
+                # so cap each page's start to (cur_end - 300 * interval).
+                page_start = max(int(start), cur_end - COINBASE_MAX_CANDLES_PER_PAGE * interval)
+                params = {"start": page_start, "end": cur_end, "granularity": interval}
                 resp = await client.get(url, params=params)
                 resp.raise_for_status()
                 candles = resp.json()
@@ -135,9 +138,10 @@ class DataFetcher:
                     break
                 new_in_page = 0
                 for item in page:
-                    ts = datetime.strptime(
-                        item["effectiveAt"].replace("Z", ""), "%Y-%m-%dT%H:%M:%S",
-                    ).replace(tzinfo=timezone.utc).timestamp()
+                    # dYdX may return fractional seconds (e.g. "...:00.338Z");
+                    # fromisoformat handles both with and without fractions.
+                    iso = item["effectiveAt"].replace("Z", "+00:00")
+                    ts = datetime.fromisoformat(iso).timestamp()
                     if ts < start:
                         break
                     if ts in seen:

@@ -103,10 +103,18 @@ async def main(argv: list[str] | None = None) -> int:
                 dydx_symbol_token0=args.symbol_token0,
                 dydx_symbol_token1=args.symbol_token1,
             )
+            # Derive ticks from p_a/p_b for cross-pair (assume both tokens 18-decimal):
+            # the engine reconstructs p_a/p_b via tick_to_price(tick, 18, 18) and
+            # would get values orders of magnitude off if we kept the WETH/USDC
+            # default ticks. tick = log(p) / log(1.0001) for (18, 18).
+            import math
+            tick_lower_dual = int(math.log(args.p_a) / math.log(1.0001))
+            tick_upper_dual = int(math.log(args.p_b) / math.log(1.0001))
             static_range = {
                 "p_a": args.p_a, "p_b": args.p_b, "L": args.liquidity_l,
                 "share": args.share,
-                "tick_lower": args.tick_lower, "tick_upper": args.tick_upper,
+                "tick_lower": tick_lower_dual,
+                "tick_upper": tick_upper_dual,
             }
 
             print("Running simulator...", flush=True)

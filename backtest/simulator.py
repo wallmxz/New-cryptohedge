@@ -263,9 +263,16 @@ class Simulator:
         db.get_operation = get_operation
         db.add_to_operation_accumulator = add_to_operation_accumulator
 
+        # Pass decimals so tick_to_price scales correctly: (18, 6) for USD pairs
+        # (WETH/USDC), (18, 18) for cross-pairs (ARB/WETH). Without this, the
+        # engine defaults to (18, 6) and reports range_lower/range_upper that are
+        # 12 orders of magnitude off for cross-pairs → permanent out-of-range.
+        engine_decimals0 = 18
+        engine_decimals1 = 18 if self._is_dual_leg else 6
         engine = GridMakerEngine(
             settings=settings, hub=state, db=db,
             exchange=exchange, pool_reader=pool, beefy_reader=beefy,
+            decimals0=engine_decimals0, decimals1=engine_decimals1,
         )
 
         # Wrap engine._on_fill so we count maker/taker before delegating.
