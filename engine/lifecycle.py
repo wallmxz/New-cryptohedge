@@ -27,6 +27,10 @@ GAS_RESERVE_ETH = 0.005  # ~$15 at $3000/ETH; alert if below
 DEPOSIT_MIN_SHARES_TOLERANCE = 0.99  # accept >= 99% of computed expected shares
 DEFAULT_DEADLINE_SECONDS = 300  # 5 min
 
+# Arbitrum native USDC. Used as the swap-input token in cross-pair (dual-leg)
+# bootstrap, where neither token0 nor token1 is the user's holding currency.
+_USDC_ADDRESS_ARBITRUM = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+
 # State -> next-step continuation map.
 # - 'with_hash' means: if tx_hash exists, wait for receipt, then continue.
 # - 'without_hash' means: re-execute the step (safe because on-chain state hasn't changed).
@@ -34,11 +38,18 @@ _BOOTSTRAP_STATES_RESUMABLE = {
     "approving",
     "swap_pending",
     "swap_confirmed",
+    # Dual-leg states (cross-pair): two sequential swaps replace the single swap.
+    "swap_token0_pending",
+    "swap_token0_done",
+    "swap_token1_pending",
+    "swaps_done",
     "deposit_pending",
     "deposit_confirmed",
+    "deposit_done",
     "snapshot",
     "hedge_pending",
     "hedge_confirmed",
+    "hedge_done",
     "teardown_grid_cancel",
     "teardown_short_close",
     "teardown_withdraw_pending",
@@ -98,7 +109,18 @@ class OperationLifecycle:
             )
 
     async def bootstrap(self, *, usdc_budget: float) -> int:
-        """Execute swap -> deposit -> snapshot -> hedge. Returns operation_id."""
+        """Execute swap -> deposit -> snapshot -> hedge. Returns operation_id.
+
+        Dispatches on `settings.dydx_symbol_token1`:
+          - empty (single-leg): token1 is a stable; existing path with one swap
+            and one short.
+          - non-empty (dual-leg / cross-pair): user holds USDC; performs two
+            sequential swaps (USDC->token0, USDC->token1) and opens two perp
+            shorts in parallel via asyncio.gather.
+        """
+        if bool(self._settings.dydx_symbol_token1):
+            return await self._bootstrap_dual_leg(usdc_budget=usdc_budget)
+
         existing = await self._db.get_active_operation()
         if existing is not None:
             raise RuntimeError(f"Operation {existing['id']} already active")
@@ -222,6 +244,204 @@ class OperationLifecycle:
 
         except Exception as e:
             logger.exception(f"Bootstrap failed at op_id={op_id}: {e}")
+            await self._db.update_bootstrap_state(op_id, "failed")
+            await self._db.update_operation_status(op_id, OperationState.FAILED.value)
+            self._hub.operation_state = OperationState.FAILED.value
+            self._hub.bootstrap_progress = f"FAILED: {e}"
+            raise
+
+    async def _bootstrap_dual_leg(self, *, usdc_budget: float) -> int:
+        """Cross-pair bootstrap: USDC -> token0 swap, then USDC -> token1 swap,
+        deposit into Beefy, snapshot baseline, open BOTH perp shorts in parallel.
+
+        Differs from single-leg in three ways:
+        1. Two sequential Uniswap swaps from USDC into token0 and token1 (USDC
+           is neither token0 nor token1 in this path).
+        2. Baseline pool value computed using both tokens' USD oracle prices
+           (token1 is no longer assumed to be 1.0 USD/unit).
+        3. Two `place_long_term_order` calls dispatched in parallel via
+           asyncio.gather, one per perp symbol.
+        """
+        existing = await self._db.get_active_operation()
+        if existing is not None:
+            raise RuntimeError(f"Operation {existing['id']} already active")
+        await self._check_gas_balance()
+
+        p_now = await self._pool_reader.read_price()
+        beefy_pos = await self._beefy_reader.read_position()
+        p_a = tick_to_price(beefy_pos.tick_lower, self._decimals0, self._decimals1)
+        p_b = tick_to_price(beefy_pos.tick_upper, self._decimals0, self._decimals1)
+
+        amount_t0_target, amount_t1_target = compute_optimal_split(
+            p=p_now, p_a=p_a, p_b=p_b, total_value_usdc=usdc_budget,
+        )
+
+        token0_sym = self._settings.dydx_symbol_token0
+        token1_sym = self._settings.dydx_symbol_token1
+        oracle_prices = await self._exchange.get_oracle_prices([token0_sym, token1_sym])
+        baseline_t0_usd = float(oracle_prices.get(token0_sym, 0.0) or 0.0)
+        baseline_t1_usd = float(oracle_prices.get(token1_sym, 0.0) or 0.0)
+        logger.info(
+            f"Dual-leg bootstrap budget=${usdc_budget:.2f} "
+            f"oracle[{token0_sym}]={baseline_t0_usd} oracle[{token1_sym}]={baseline_t1_usd} "
+            f"-> t0={amount_t0_target:.6f}, t1={amount_t1_target:.6f}"
+        )
+
+        op_id = await self._db.insert_operation(
+            started_at=time.time(),
+            status=OperationState.STARTING.value,
+            baseline_eth_price=p_now,
+            baseline_pool_value_usd=usdc_budget,
+            baseline_amount0=amount_t0_target,
+            baseline_amount1=amount_t1_target,
+            baseline_collateral=self._hub.dydx_collateral,
+            usdc_budget=usdc_budget,
+        )
+        # Persist per-leg baseline oracle prices (cols added in Task 2).
+        await self._db._conn.execute(
+            "UPDATE operations SET baseline_token0_usd_price = ?, "
+            "baseline_token1_usd_price = ? WHERE id = ?",
+            (baseline_t0_usd, baseline_t1_usd, op_id),
+        )
+        await self._db._conn.commit()
+
+        self._hub.current_operation_id = op_id
+        self._hub.operation_state = OperationState.STARTING.value
+
+        try:
+            await self._db.update_bootstrap_state(op_id, "approving")
+            self._hub.bootstrap_progress = "Approving tokens (dual-leg)..."
+            # USDC must be approved for the router (we spend USDC twice).
+            await self._uniswap.ensure_approval(
+                token_address=_USDC_ADDRESS_ARBITRUM,
+                amount=2**256 - 1,
+                spender=self._settings.uniswap_v3_router_address,
+            )
+            # Both pool tokens must be approved for the Beefy strategy.
+            await self._beefy.ensure_approval(
+                token_address=self._settings.token0_address, amount=2**256 - 1,
+            )
+            await self._beefy.ensure_approval(
+                token_address=self._settings.token1_address, amount=2**256 - 1,
+            )
+
+            slippage = self._settings.slippage_bps / 10000.0
+
+            # ---- Swap 1: USDC -> token0 ----
+            # In dual-leg, both legs must execute their swap call (cross-pair
+            # holds USDC, neither token is USDC). When `compute_optimal_split`
+            # returns 0 for a leg (price outside range), the call is still
+            # issued but with amount_out=0 — the router will treat it as a
+            # no-op or revert; we surface either via the standard failure path.
+            await self._db.update_bootstrap_state(op_id, "swap_token0_pending")
+            self._hub.bootstrap_progress = f"Swapping USDC -> {self._settings.pool_token0_symbol}..."
+            usdc_for_t0 = amount_t0_target * baseline_t0_usd
+            amount_in_max_t0 = int(usdc_for_t0 * (1 + slippage) * 10**6)  # USDC = 6 decimals
+            amount_out_t0 = int(amount_t0_target * 10**self._decimals0)
+            tx0 = await self._uniswap.swap_exact_output(
+                token_in=_USDC_ADDRESS_ARBITRUM,
+                token_out=self._settings.token0_address,
+                fee=self._settings.uniswap_v3_pool_fee,
+                amount_out=amount_out_t0,
+                amount_in_maximum=amount_in_max_t0,
+                recipient=self._uniswap.address,
+                deadline=int(time.time()) + DEFAULT_DEADLINE_SECONDS,
+            )
+            await self._db.update_bootstrap_state(
+                op_id, "swap_token0_done", swap_tx_hash=tx0,
+            )
+
+            # ---- Swap 2: USDC -> token1 ----
+            await self._db.update_bootstrap_state(op_id, "swap_token1_pending")
+            self._hub.bootstrap_progress = f"Swapping USDC -> {self._settings.pool_token1_symbol}..."
+            usdc_for_t1 = amount_t1_target * baseline_t1_usd
+            amount_in_max_t1 = int(usdc_for_t1 * (1 + slippage) * 10**6)
+            amount_out_t1 = int(amount_t1_target * 10**self._decimals1)
+            tx1 = await self._uniswap.swap_exact_output(
+                token_in=_USDC_ADDRESS_ARBITRUM,
+                token_out=self._settings.token1_address,
+                fee=self._settings.uniswap_v3_pool_fee,
+                amount_out=amount_out_t1,
+                amount_in_maximum=amount_in_max_t1,
+                recipient=self._uniswap.address,
+                deadline=int(time.time()) + DEFAULT_DEADLINE_SECONDS,
+            )
+            await self._db.update_bootstrap_state(op_id, "swaps_done", swap_tx_hash=tx1)
+
+            # ---- Deposit on Beefy with actual post-swap balances ----
+            await self._db.update_bootstrap_state(op_id, "deposit_pending")
+            self._hub.bootstrap_progress = "Depositing in Beefy..."
+            bal = await self._read_wallet_balance()
+            amount0_raw = int(bal["token0"] * 10**self._decimals0)
+            amount1_raw = int(bal["token1"] * 10**self._decimals1)
+            tx_dep = await self._beefy.deposit(
+                amount0=amount0_raw, amount1=amount1_raw, min_shares=0,
+            )
+            await self._db.update_bootstrap_state(
+                op_id, "deposit_done", deposit_tx_hash=tx_dep,
+            )
+
+            # ---- Snapshot post-deposit baseline ----
+            await self._db.update_bootstrap_state(op_id, "snapshot")
+            self._hub.bootstrap_progress = "Snapshotting baseline..."
+            beefy_pos_after = await self._beefy_reader.read_position()
+            my_amount0 = beefy_pos_after.amount0 * beefy_pos_after.share
+            my_amount1 = beefy_pos_after.amount1 * beefy_pos_after.share
+            real_pool_value = my_amount0 * baseline_t0_usd + my_amount1 * baseline_t1_usd
+            await self._db.update_baseline_amounts(
+                op_id,
+                amount0=my_amount0, amount1=my_amount1,
+                pool_value_usd=real_pool_value,
+            )
+
+            # ---- Hedge: open BOTH perp shorts in parallel ----
+            await self._db.update_bootstrap_state(op_id, "hedge_pending")
+            self._hub.bootstrap_progress = "Opening shorts on dYdX (dual-leg)..."
+            target_short_t0 = my_amount0 * self._hub.hedge_ratio
+            target_short_t1 = my_amount1 * self._hub.hedge_ratio
+
+            async def _open_short_t0() -> None:
+                if target_short_t0 <= 0 or baseline_t0_usd <= 0:
+                    return
+                await self._exchange.place_long_term_order(
+                    symbol=token0_sym,
+                    side="sell", size=target_short_t0,
+                    price=baseline_t0_usd * 0.999,  # taker
+                    cloid_int=self._next_cloid(998),
+                    ttl_seconds=60,
+                )
+                slippage_usd = 0.0005 * target_short_t0 * baseline_t0_usd
+                await self._db.add_to_operation_accumulator(
+                    op_id, "perp_fees_paid_token0", slippage_usd,
+                )
+
+            async def _open_short_t1() -> None:
+                if target_short_t1 <= 0 or baseline_t1_usd <= 0:
+                    return
+                await self._exchange.place_long_term_order(
+                    symbol=token1_sym,
+                    side="sell", size=target_short_t1,
+                    price=baseline_t1_usd * 0.999,  # taker
+                    cloid_int=self._next_cloid(996),
+                    ttl_seconds=60,
+                )
+                slippage_usd = 0.0005 * target_short_t1 * baseline_t1_usd
+                await self._db.add_to_operation_accumulator(
+                    op_id, "perp_fees_paid_token1", slippage_usd,
+                )
+
+            await asyncio.gather(_open_short_t0(), _open_short_t1())
+            await self._db.update_bootstrap_state(op_id, "hedge_done")
+
+            await self._db.update_bootstrap_state(op_id, "active")
+            await self._db.update_operation_status(op_id, OperationState.ACTIVE.value)
+            self._hub.operation_state = OperationState.ACTIVE.value
+            self._hub.bootstrap_progress = ""
+            logger.info(f"Operation {op_id} bootstrapped (dual-leg) and ACTIVE")
+            return op_id
+
+        except Exception as e:
+            logger.exception(f"Dual-leg bootstrap failed at op_id={op_id}: {e}")
             await self._db.update_bootstrap_state(op_id, "failed")
             await self._db.update_operation_status(op_id, OperationState.FAILED.value)
             self._hub.operation_state = OperationState.FAILED.value
