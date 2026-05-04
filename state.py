@@ -9,11 +9,11 @@ class StateHub:
     pool_value_usd: float = 0.0
     pool_tokens: dict = field(default_factory=dict)
 
-    # Hedge
-    hedge_position: dict | None = None
-    hedge_unrealized_pnl: float = 0.0
-    hedge_realized_pnl: float = 0.0
-    funding_total: float = 0.0
+    # Hedge — dict per symbol (cross-pair has 2 entries)
+    hedge_positions: dict = field(default_factory=dict)
+    hedge_unrealized_pnls: dict = field(default_factory=dict)
+    hedge_realized_pnls: dict = field(default_factory=dict)
+    funding_totals: dict = field(default_factory=dict)
 
     # Orderbook (legacy fields kept for dashboard partials that haven't been
     # rewritten for the grid model; engine never writes them — they always
@@ -63,6 +63,25 @@ class StateHub:
     # Phase 2.0 on-chain execution
     wallet_eth_balance: float = 0.0
     bootstrap_progress: str = ""  # human-readable string for UI ("Swapping...", "Depositing...")
+
+    @property
+    def hedge_position(self) -> dict | None:
+        """Legacy compat: returns first hedge position (single-leg) or None."""
+        if not self.hedge_positions:
+            return None
+        return next(iter(self.hedge_positions.values()))
+
+    @property
+    def hedge_unrealized_pnl(self) -> float:
+        return sum(self.hedge_unrealized_pnls.values())
+
+    @property
+    def hedge_realized_pnl(self) -> float:
+        return sum(self.hedge_realized_pnls.values())
+
+    @property
+    def funding_total(self) -> float:
+        return sum(self.funding_totals.values())
 
     def to_dict(self) -> dict:
         self.last_update = time.time()

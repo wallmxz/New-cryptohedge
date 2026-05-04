@@ -445,10 +445,11 @@ class GridMakerEngine:
                 self._hub.dydx_collateral = collateral
             current_short = abs(pos.size) if pos else 0.0
             if pos:
-                self._hub.hedge_position = {
+                sym = self._settings.dydx_symbol
+                self._hub.hedge_positions[sym] = {
                     "side": pos.side, "size": pos.size, "entry": pos.entry_price,
                 }
-                self._hub.hedge_unrealized_pnl = pos.unrealized_pnl
+                self._hub.hedge_unrealized_pnls[sym] = pos.unrealized_pnl
                 metrics.hedge_position_size.set(pos.size)
             else:
                 metrics.hedge_position_size.set(0.0)
@@ -650,7 +651,10 @@ class GridMakerEngine:
             self._hub.total_taker_fills += 1
             self._hub.total_taker_volume += fill.size
         self._hub.total_fees_paid += fill.fee
-        self._hub.hedge_realized_pnl += fill.realized_pnl
+        sym = fill.symbol
+        self._hub.hedge_realized_pnls[sym] = (
+            self._hub.hedge_realized_pnls.get(sym, 0.0) + fill.realized_pnl
+        )
         self._hub.last_update = time.time()
 
         metrics.fills_total.labels(liquidity=fill.liquidity, side=fill.side).inc()
