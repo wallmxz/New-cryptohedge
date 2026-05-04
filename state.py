@@ -85,4 +85,12 @@ class StateHub:
 
     def to_dict(self) -> dict:
         self.last_update = time.time()
-        return asdict(self)
+        snap = asdict(self)
+        # Backwards-compat for UI/SSE consumers that read singular hedge_*
+        # field names. These are properties on the dataclass, so asdict()
+        # doesn't capture them; we add them manually here.
+        snap["hedge_position"] = self.hedge_position
+        snap["hedge_unrealized_pnl"] = self.hedge_unrealized_pnl
+        snap["hedge_realized_pnl"] = self.hedge_realized_pnl
+        snap["funding_total"] = self.funding_total
+        return snap

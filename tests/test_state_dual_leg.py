@@ -35,3 +35,25 @@ def test_to_dict_includes_per_leg_dicts():
     snap = s.to_dict()
     assert "hedge_positions" in snap
     assert snap["hedge_positions"]["ARB-USD"]["size"] == 100.0
+
+
+def test_to_dict_preserves_legacy_singular_keys():
+    """SSE snapshot must keep the legacy hedge_position / hedge_unrealized_pnl
+    / hedge_realized_pnl / funding_total keys for UI compat."""
+    s = StateHub()
+    s.hedge_positions = {"ETH-USD": {"side": "short", "size": 0.05, "entry": 4000.0}}
+    s.hedge_unrealized_pnls = {"ETH-USD": -2.5}
+    s.hedge_realized_pnls = {"ETH-USD": 3.0}
+    s.funding_totals = {"ETH-USD": 0.5}
+
+    snap = s.to_dict()
+
+    # New dict keys still there
+    assert "hedge_positions" in snap
+    assert snap["hedge_positions"]["ETH-USD"]["size"] == 0.05
+
+    # Legacy singular keys also present (UI compat)
+    assert snap["hedge_position"] == {"side": "short", "size": 0.05, "entry": 4000.0}
+    assert snap["hedge_unrealized_pnl"] == -2.5
+    assert snap["hedge_realized_pnl"] == 3.0
+    assert snap["funding_total"] == 0.5
