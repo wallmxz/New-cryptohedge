@@ -18,7 +18,12 @@ from state import StateHub
 
 @pytest.mark.asyncio
 async def test_engine_full_loop_in_range(tmp_path):
-    """End-to-end: engine starts, reads chain, places grid, handles fill, updates state."""
+    """End-to-end: engine starts, reads chain, processes fill, updates state.
+
+    After Task 10 refactor: engine no longer pre-posts a grid; instead it fires
+    level-triggered taker rebalances when notional drift exceeds min_notional.
+    Test now verifies fill processing path end-to-end without grid placement.
+    """
     from db import Database
     from engine import GridMakerEngine
     from exchanges.base import Fill, Order
@@ -30,53 +35,37 @@ async def test_engine_full_loop_in_range(tmp_path):
 
     settings = MagicMock()
     settings.dydx_symbol = "ETH-USD"
+    settings.dydx_symbol_token0 = "ETH-USD"
+    settings.dydx_symbol_token1 = ""
     settings.alert_webhook_url = ""
     settings.threshold_aggressive = 0.05
     settings.max_open_orders = 50
     settings.pool_token0_symbol = "WETH"
     settings.pool_token1_symbol = "USDC"
 
-    placed_orders = []
-
-    async def fake_batch_place(specs):
-        result = []
-        for s in specs:
-            placed_orders.append(s)
-            result.append(Order(
-                order_id=str(s["cloid_int"]),
-                symbol=s["symbol"], side=s["side"], size=s["size"],
-                price=s["price"], status="open",
-            ))
-        return result
-
     exchange = MagicMock()
     exchange.name = "dydx"
-    # min_notional is in token0 display units (e.g., WETH); engine multiplies
-    # by p_now to obtain USD. 0.001 WETH * $3000 = $3 min order USD.
     exchange.get_market_meta = AsyncMock(return_value=MagicMock(
         tick_size=0.1, step_size=0.001, min_notional=0.001,
     ))
-    # Existing short approximately matches the target at p_now, so exposure_pct
-    # stays under threshold_aggressive and the engine takes the in-range
-    # grid-placement path (rather than the taker fallback).
-    # target_short_at_now = compute_x(L=5.597, p=3000, p_b=3300) ~= 0.00476.
+    # Position exactly matches target so no rebalance fires (drift < min_notional).
+    # target = compute_x(L=5.597, p=3000, p_b=3300) ~= 0.00476.
     exchange.get_position = AsyncMock(return_value=MagicMock(
         symbol="ETH-USD", side="short", size=0.00476,
         entry_price=3000.0, unrealized_pnl=0.0,
     ))
     exchange.get_collateral = AsyncMock(return_value=130.0)
-    exchange.batch_place = AsyncMock(side_effect=fake_batch_place)
+    exchange.batch_place = AsyncMock(return_value=[])
     exchange.batch_cancel = AsyncMock(return_value=0)
     exchange.get_open_orders_cloids = AsyncMock(return_value=[])
     exchange.subscribe_fills = AsyncMock()
-    # Safety: even if aggressive path were ever taken, this is awaitable.
     exchange.place_long_term_order = AsyncMock()
+    exchange.get_oracle_prices = AsyncMock(return_value={"ETH-USD": 3000.0})
 
     pool_reader = MagicMock()
     pool_reader.read_price = AsyncMock(return_value=3000.0)
     beefy_reader = MagicMock()
     # Real ETH/USDC ticks for [$2700, $3300] with decimals0=18, decimals1=6.
-    # See module docstring for derivation.
     beefy_reader.read_position = AsyncMock(return_value=MagicMock(
         tick_lower=-197310, tick_upper=-195303,
         amount0=0.5, amount1=1500.0, share=0.01, raw_balance=10**16,
@@ -88,8 +77,6 @@ async def test_engine_full_loop_in_range(tmp_path):
     )
     await engine._iterate()
 
-    # Grid was placed (in-range path executed)
-    assert len(placed_orders) > 0, "expected grid orders to be placed in-range"
     # State was updated
     assert state.range_lower > 0
     assert state.range_upper > state.range_lower
@@ -97,16 +84,11 @@ async def test_engine_full_loop_in_range(tmp_path):
     assert state.pool_value_usd > 0
     assert not state.out_of_range
 
-    # DB persisted the placed orders
-    active = await db.get_active_grid_orders()
-    assert len(active) == len(placed_orders)
-
-    # Simulate a fill on one of the orders
-    cloid = placed_orders[0]["cloid_int"]
+    # Simulate a fill (e.g. from a prior taker that filled at exchange)
     fill = Fill(
-        fill_id="f1", order_id=str(cloid), symbol="ETH-USD",
-        side=placed_orders[0]["side"], size=placed_orders[0]["size"],
-        price=placed_orders[0]["price"], fee=0.0001, fee_currency="USDC",
+        fill_id="f1", order_id="100", symbol="ETH-USD",
+        side="sell", size=0.001, price=2999.0,
+        fee=0.0001, fee_currency="USDC",
         liquidity="maker", realized_pnl=0.0, timestamp=1000.0,
     )
     await engine._on_fill(fill)
@@ -114,47 +96,41 @@ async def test_engine_full_loop_in_range(tmp_path):
     assert state.total_maker_volume == pytest.approx(fill.size)
     assert state.total_fees_paid == pytest.approx(fill.fee)
 
-    # The corresponding grid order should now be marked as filled
-    active_after = await db.get_active_grid_orders()
-    assert len(active_after) == len(placed_orders) - 1
-
     await db.close()
 
 
 @pytest.mark.asyncio
-async def test_engine_out_of_range_upper_cancels_grid(tmp_path):
-    """Price > p_b: bot cancels grid, sets out_of_range = True."""
+async def test_engine_out_of_range_upper_sets_flag(tmp_path):
+    """Price > p_b: out_of_range = True, no rebalance fires.
+
+    After Task 10 refactor: taker-only engine has no grid to cancel; OOR is
+    just an idle state with the flag set.
+    """
     from db import Database
     from engine import GridMakerEngine
 
     db = Database(str(tmp_path / "t2.db"))
     await db.initialize()
-    # Insert a stale grid order
-    await db.insert_grid_order(
-        cloid="500", side="buy", target_price=3010.0, size=0.001, placed_at=1000.0,
-    )
 
     state = StateHub(hedge_ratio=1.0)
     settings = MagicMock()
     settings.dydx_symbol = "ETH-USD"
+    settings.dydx_symbol_token0 = "ETH-USD"
+    settings.dydx_symbol_token1 = ""
     settings.alert_webhook_url = ""
     settings.threshold_aggressive = 0.05
     settings.max_open_orders = 200
     settings.pool_token0_symbol = "WETH"
     settings.pool_token1_symbol = "USDC"
 
-    cancelled_calls = []
-
-    async def fake_cancel(specs):
-        cancelled_calls.extend(specs)
-        return len(specs)
-
     exchange = MagicMock()
     exchange.name = "dydx"
-    exchange.batch_cancel = AsyncMock(side_effect=fake_cancel)
+    exchange.batch_cancel = AsyncMock(return_value=0)
     exchange.get_position = AsyncMock(return_value=None)
     exchange.get_collateral = AsyncMock(return_value=130.0)
     exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+    exchange.place_long_term_order = AsyncMock()
+    exchange.get_oracle_prices = AsyncMock(return_value={"ETH-USD": 3500.0})
 
     pool_reader = MagicMock()
     # ETH at $3500 — above the [$2700, $3300] range
@@ -172,7 +148,8 @@ async def test_engine_out_of_range_upper_cancels_grid(tmp_path):
     )
     await engine._iterate()
     assert state.out_of_range is True
-    assert len(cancelled_calls) >= 1  # the stale order 500 was cancelled
+    # No taker fired (out of range -> idle)
+    exchange.place_long_term_order.assert_not_awaited()
     await db.close()
 
 
@@ -188,6 +165,8 @@ async def test_engine_out_of_range_lower_holds_short(tmp_path):
     state = StateHub(hedge_ratio=1.0)
     settings = MagicMock()
     settings.dydx_symbol = "ETH-USD"
+    settings.dydx_symbol_token0 = "ETH-USD"
+    settings.dydx_symbol_token1 = ""
     settings.alert_webhook_url = ""
     settings.threshold_aggressive = 0.05
     settings.max_open_orders = 200
@@ -202,6 +181,8 @@ async def test_engine_out_of_range_lower_holds_short(tmp_path):
     ))
     exchange.get_collateral = AsyncMock(return_value=130.0)
     exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+    exchange.place_long_term_order = AsyncMock()
+    exchange.get_oracle_prices = AsyncMock(return_value={"ETH-USD": 2500.0})
 
     pool_reader = MagicMock()
     # ETH at $2500 — below the [$2700, $3300] range

@@ -134,3 +134,120 @@ async def test_rebalance_leg_does_not_attribute_fee_when_no_active_operation(eng
     )
     exchange.place_long_term_order.assert_awaited_once()  # taker still fires
     db.add_to_operation_accumulator.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_iterate_dual_leg_calls_rebalance_for_both_legs():
+    from engine import GridMakerEngine
+    state = StateHub(hedge_ratio=1.0)
+    state.operation_state = "active"
+    state.current_operation_id = 1
+
+    settings = MagicMock()
+    settings.dydx_symbol_token0 = "ARB-USD"
+    settings.dydx_symbol_token1 = "ETH-USD"
+    settings.threshold_aggressive = 0.01
+    settings.max_open_orders = 200
+    settings.pool_token0_symbol = "ARB"
+    settings.pool_token1_symbol = "WETH"
+    settings.alert_webhook_url = ""
+    settings.dydx_symbol = "ARB-USD"  # legacy property; some callers read it
+
+    db = MagicMock()
+    db.get_active_grid_orders = AsyncMock(return_value=[])
+    db.add_to_operation_accumulator = AsyncMock()
+    db.insert_order_log = AsyncMock()
+    db.get_operation = AsyncMock(return_value=None)
+
+    exchange = MagicMock()
+    exchange.name = "dydx"
+    exchange.place_long_term_order = AsyncMock()
+    exchange.get_collateral = AsyncMock(return_value=130.0)
+    exchange.get_position = AsyncMock(return_value=None)
+    exchange.get_market_meta = AsyncMock(return_value=MagicMock(min_notional=1.0))
+    exchange.get_oracle_prices = AsyncMock(return_value={"ARB-USD": 1.50, "ETH-USD": 4000.0})
+    exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+
+    pool = MagicMock()
+    pool.read_price = AsyncMock(return_value=0.000375)  # ARB/WETH ratio
+    beefy = MagicMock()
+    beefy.read_position = AsyncMock(return_value=MagicMock(
+        tick_lower=-81121, tick_upper=-76012,  # ~0.0003-0.0005 ARB/WETH (decimals 18,18)
+        amount0=100.0, amount1=0.0375, share=1.0, raw_balance=10**18,
+    ))
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=exchange, pool_reader=pool, beefy_reader=beefy,
+        decimals0=18, decimals1=18,  # ARB and WETH both 18 decimals
+    )
+
+    # Spy on _maybe_rebalance_leg
+    rebalance_calls = []
+    original = engine._maybe_rebalance_leg
+    async def spy(*args, **kwargs):
+        rebalance_calls.append(kwargs.get("symbol"))
+        return await original(*args, **kwargs)
+    engine._maybe_rebalance_leg = spy
+
+    await engine._iterate()
+    assert "ARB-USD" in rebalance_calls
+    assert "ETH-USD" in rebalance_calls
+
+
+@pytest.mark.asyncio
+async def test_iterate_single_leg_only_calls_token0():
+    from engine import GridMakerEngine
+    state = StateHub(hedge_ratio=1.0)
+    state.operation_state = "active"
+    state.current_operation_id = 1
+
+    settings = MagicMock()
+    settings.dydx_symbol_token0 = "ETH-USD"
+    settings.dydx_symbol_token1 = ""  # single-leg
+    settings.threshold_aggressive = 0.01
+    settings.max_open_orders = 200
+    settings.pool_token0_symbol = "WETH"
+    settings.pool_token1_symbol = "USDC"
+    settings.alert_webhook_url = ""
+    settings.dydx_symbol = "ETH-USD"
+
+    db = MagicMock()
+    db.get_active_grid_orders = AsyncMock(return_value=[])
+    db.add_to_operation_accumulator = AsyncMock()
+    db.insert_order_log = AsyncMock()
+    db.get_operation = AsyncMock(return_value=None)
+
+    exchange = MagicMock()
+    exchange.name = "dydx"
+    exchange.place_long_term_order = AsyncMock()
+    exchange.get_collateral = AsyncMock(return_value=130.0)
+    exchange.get_position = AsyncMock(return_value=None)
+    exchange.get_market_meta = AsyncMock(return_value=MagicMock(min_notional=1.0))
+    exchange.get_oracle_prices = AsyncMock(return_value={"ETH-USD": 4000.0})
+    exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+
+    pool = MagicMock()
+    pool.read_price = AsyncMock(return_value=3000.0)  # in range [2700, 3300]
+    beefy = MagicMock()
+    beefy.read_position = AsyncMock(return_value=MagicMock(
+        tick_lower=-197310, tick_upper=-195303,  # ~$2700-$3300 with decimals 18,6
+        amount0=0.05, amount1=200.0, share=1.0, raw_balance=10**18,
+    ))
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=exchange, pool_reader=pool, beefy_reader=beefy,
+    )
+    # Update oracle price to match in-range price
+    exchange.get_oracle_prices = AsyncMock(return_value={"ETH-USD": 3000.0})
+
+    rebalance_calls = []
+    original = engine._maybe_rebalance_leg
+    async def spy(*args, **kwargs):
+        rebalance_calls.append(kwargs.get("symbol"))
+        return await original(*args, **kwargs)
+    engine._maybe_rebalance_leg = spy
+
+    await engine._iterate()
+    assert rebalance_calls == ["ETH-USD"]  # only token0 leg

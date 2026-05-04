@@ -11,7 +11,7 @@ from chains.uniswap import UniswapV3PoolReader, tick_to_price
 from chains.beefy import BeefyClmReader
 from exchanges.dydx import DydxAdapter
 from exchanges.base import ExchangeAdapter
-from engine.curve import compute_l_from_value, compute_x, compute_target_grid, GridLevel
+from engine.curve import compute_l_from_value, compute_x, compute_y, compute_target_grid, GridLevel
 from engine.grid import GridManager
 from engine.operation import Operation, OperationState
 from engine.pnl import compute_operation_pnl
@@ -421,166 +421,123 @@ class GridMakerEngine:
 
             my_amount0 = beefy_pos.amount0 * beefy_pos.share
             my_amount1 = beefy_pos.amount1 * beefy_pos.share
-            my_value = my_amount0 * p_now + my_amount1
-            if my_value <= 0:
+            my_value_t1 = my_amount0 * p_now + my_amount1
+            if my_value_t1 <= 0:
                 return
 
-            metrics.pool_value_usd.set(my_value)
+            # Determine active legs
+            symbols = [self._settings.dydx_symbol_token0]
+            is_dual_leg = bool(self._settings.dydx_symbol_token1)
+            if is_dual_leg:
+                symbols.append(self._settings.dydx_symbol_token1)
+
+            # One round-trip each: positions per symbol, oracle prices, collateral
+            positions, oracle_prices, collateral = await asyncio.gather(
+                asyncio.gather(*[self._safe_get_position(s) for s in symbols]),
+                self._exchange.get_oracle_prices(symbols),
+                self._safe_get_collateral(),
+            )
+            if collateral is not None:
+                self._hub.dydx_collateral = collateral
+
+            # Update hub state for each leg
+            for sym, pos in zip(symbols, positions):
+                if pos:
+                    self._hub.hedge_positions[sym] = {
+                        "side": pos.side, "size": pos.size, "entry": pos.entry_price,
+                    }
+                    self._hub.hedge_unrealized_pnls[sym] = pos.unrealized_pnl
+                    metrics.hedge_position_size.set(pos.size)
+                else:
+                    self._hub.hedge_positions.pop(sym, None)
+                    self._hub.hedge_unrealized_pnls[sym] = 0.0
+
+            # Compute USD pool value
+            if is_dual_leg:
+                p0_usd = oracle_prices.get(symbols[0], p_now)
+                p1_usd = oracle_prices.get(symbols[1], 1.0)
+                pool_value_usd = my_amount0 * p0_usd + my_amount1 * p1_usd
+            else:
+                p0_usd = oracle_prices.get(symbols[0], p_now)
+                p1_usd = 1.0
+                pool_value_usd = my_value_t1
+
+            metrics.pool_value_usd.set(pool_value_usd)
             self._hub.range_lower = p_a
             self._hub.range_upper = p_b
-            self._hub.pool_value_usd = my_value
+            self._hub.pool_value_usd = pool_value_usd
             self._hub.pool_tokens = {
                 self._settings.pool_token0_symbol: my_amount0,
                 self._settings.pool_token1_symbol: my_amount1,
             }
 
-            # Read collateral and current position once per iteration; both are
-            # used by the margin check, the OOR branches, and the exposure
-            # delta below. Hoisting halves the indexer round-trips per loop.
-            collateral, pos = await asyncio.gather(
-                self._safe_get_collateral(),
-                self._safe_get_position(),
-            )
-            if collateral is not None:
-                self._hub.dydx_collateral = collateral
-            current_short = abs(pos.size) if pos else 0.0
-            if pos:
-                sym = self._settings.dydx_symbol
-                self._hub.hedge_positions[sym] = {
-                    "side": pos.side, "size": pos.size, "entry": pos.entry_price,
-                }
-                self._hub.hedge_unrealized_pnls[sym] = pos.unrealized_pnl
-                metrics.hedge_position_size.set(pos.size)
-            else:
-                metrics.hedge_position_size.set(0.0)
-
-            # OOR handling must precede compute_l_from_value: that formula
-            # divides by (2*sqrt(p) - sqrt(p_a) - p/sqrt(p_b)) and only holds
-            # for p strictly inside [p_a, p_b]. Outside, derive L from the
-            # all-one-token formula so the dashboard has a value to display.
-            if p_now >= p_b:
+            # Out-of-range: taker-only has no grid to cancel; just idle
+            if not (p_a < p_now < p_b):
                 self._hub.out_of_range = True
                 metrics.out_of_range.set(1)
-                denom = sqrt(p_b) - sqrt(p_a)
-                self._hub.liquidity_l = my_amount1 / denom if denom > 0 else 0.0
-                await self._cancel_active_grid()
                 return
-            if p_now <= p_a:
-                self._hub.out_of_range = True
-                metrics.out_of_range.set(1)
-                denom = (1.0 / sqrt(p_a)) - (1.0 / sqrt(p_b))
-                L_oor = my_amount0 / denom if denom > 0 else 0.0
-                self._hub.liquidity_l = L_oor
-                # Peak short = max(LP-implied peak at p_a, current short).
-                # Either could be the binding risk, so take the worse.
-                peak_short = max(
-                    compute_x(L_oor, p_a, p_b) * self._hub.hedge_ratio,
-                    current_short,
-                )
-                await self._check_margin_and_alert(peak_short, p_now)
-                await self._cancel_active_grid()
-                return
-
             self._hub.out_of_range = False
             metrics.out_of_range.set(0)
-            L_user = compute_l_from_value(my_value, p_a, p_b, p_now)
+
+            L_user = compute_l_from_value(my_value_t1, p_a, p_b, p_now)
             self._hub.liquidity_l = L_user
 
             if self._hub.operation_state != OperationState.ACTIVE.value:
                 return
 
+            # Live PnL breakdown
             if self._hub.current_operation_id is not None:
                 try:
                     op_row = await self._db.get_operation(self._hub.current_operation_id)
                     if op_row:
-                        self._hub.operation_pnl_breakdown = compute_operation_pnl(
-                            Operation.from_db_row(op_row),
-                            current_pool_value_usd=my_value,
-                            current_eth_price=p_now,
-                            hedge_realized_since_baseline=self._hub.hedge_realized_pnl,
-                            hedge_unrealized_since_baseline=self._hub.hedge_unrealized_pnl,
-                        )
+                        op = Operation.from_db_row(op_row)
+                        if is_dual_leg:
+                            self._hub.operation_pnl_breakdown = compute_operation_pnl(
+                                op,
+                                current_pool_value_usd=pool_value_usd,
+                                current_token0_usd_price=p0_usd,
+                                current_token1_usd_price=p1_usd,
+                                hedge_realized_per_symbol=dict(self._hub.hedge_realized_pnls),
+                                hedge_unrealized_per_symbol=dict(self._hub.hedge_unrealized_pnls),
+                            )
+                        else:
+                            self._hub.operation_pnl_breakdown = compute_operation_pnl(
+                                op,
+                                current_pool_value_usd=pool_value_usd,
+                                current_eth_price=p_now,
+                                hedge_realized_since_baseline=self._hub.hedge_realized_pnl,
+                                hedge_unrealized_since_baseline=self._hub.hedge_unrealized_pnl,
+                            )
                 except Exception as e:
                     logger.error(f"PnL breakdown update failed: {e}")
 
-            peak_short = max(
-                compute_x(L_user, p_a, p_b) * self._hub.hedge_ratio,
-                current_short,
-            )
-            await self._check_margin_and_alert(peak_short, p_now)
+            # Margin check: peak short notional summed across legs, in token1 units
+            peak_short_notional_usd = 0.0
+            for sym, pos in zip(symbols, positions):
+                cur = abs(pos.size) if pos else 0.0
+                peak_short_notional_usd += cur * oracle_prices.get(sym, 0.0)
+            peak_eth_equiv = peak_short_notional_usd / max(p1_usd, 1e-9)
+            await self._check_margin_and_alert(peak_eth_equiv, p1_usd)
 
-            t = time.monotonic()
-            meta = await self._exchange.get_market_meta(self._settings.dydx_symbol)
-            target = compute_target_grid(
-                L=L_user, p_a=p_a, p_b=p_b, p_now=p_now,
-                hedge_ratio=self._hub.hedge_ratio,
-                min_notional_usd=meta.min_notional * p_now,
-                max_orders=self._settings.max_open_orders,
-            )
-            timings["grid_compute"] = (time.monotonic() - t) * 1000
-            metrics.loop_duration.labels(step="grid_compute").observe(timings["grid_compute"] / 1000)
+            # Compute targets per leg
+            targets: dict[str, float] = {
+                symbols[0]: compute_x(L_user, p_now, p_b) * self._hub.hedge_ratio,
+            }
+            if is_dual_leg:
+                targets[symbols[1]] = compute_y(L_user, p_now, p_a) * self._hub.hedge_ratio
 
-            target_short_at_now = compute_x(L_user, p_now, p_b) * self._hub.hedge_ratio
-            token0_pool = my_amount0
-            exposure_pct = (
-                abs(current_short - target_short_at_now) / token0_pool
-                if token0_pool > 0 else 0.0
-            )
-
-            if exposure_pct > self._settings.threshold_aggressive:
-                now_ts = time.time()
-                seconds_since_last = now_ts - self._last_aggressive_correction_at
-                if seconds_since_last < self.AGGRESSIVE_CORRECTION_COOLDOWN_SECONDS:
-                    logger.info(
-                        f"Aggressive correction in cooldown "
-                        f"({seconds_since_last:.0f}s < "
-                        f"{self.AGGRESSIVE_CORRECTION_COOLDOWN_SECONDS:.0f}s); "
-                        f"skipping re-fire (exposure={exposure_pct:.4f})"
-                    )
-                    return
-                await self._aggressive_correct(current_short, target_short_at_now, p_now, meta)
-                self._last_aggressive_correction_at = now_ts
-                return
-
-            t = time.monotonic()
-            active = await self._db.get_active_grid_orders()
-            metrics.grid_orders_open.set(len(active))
-            current_levels = [
-                (row["cloid"], GridLevel(
-                    price=row["target_price"], size=row["size"], side=row["side"],
-                ))
-                for row in active
-            ]
-
-            diff = self._grid_mgr.diff(current=current_levels, target=target)
-
-            if diff.to_cancel:
-                await self._exchange.batch_cancel([
-                    dict(symbol=self._settings.dydx_symbol, cloid_int=int(c))
-                    for c in diff.to_cancel
-                ])
-                for cloid in diff.to_cancel:
-                    await self._db.mark_grid_order_cancelled(cloid, time.time())
-
-            if diff.to_place:
-                specs = []
-                for idx, lv in enumerate(diff.to_place):
-                    specs.append(dict(
-                        symbol=self._settings.dydx_symbol,
-                        side=lv.side, size=lv.size, price=round(lv.price, 4),
-                        cloid_int=self._next_cloid(idx),
-                    ))
-                placed = await self._exchange.batch_place(specs)
-                for spec, p in zip(specs, placed):
-                    if p.status == "open":
-                        await self._db.insert_grid_order(
-                            cloid=str(spec["cloid_int"]),
-                            side=spec["side"], target_price=spec["price"],
-                            size=spec["size"], placed_at=time.time(),
-                            operation_id=self._hub.current_operation_id,
-                        )
-            timings["grid_diff_apply"] = (time.monotonic() - t) * 1000
-            metrics.loop_duration.labels(step="grid_diff_apply").observe(timings["grid_diff_apply"] / 1000)
+            # Fire rebalance per leg
+            for sym in symbols:
+                meta = await self._exchange.get_market_meta(sym)
+                idx = symbols.index(sym)
+                current = abs(positions[idx].size) if positions[idx] else 0.0
+                ref_price = oracle_prices.get(sym, 0.0)
+                if ref_price <= 0:
+                    continue
+                await self._maybe_rebalance_leg(
+                    symbol=sym, target=targets[sym], current=current,
+                    min_notional=meta.min_notional, ref_price=ref_price,
+                )
         finally:
             timings["total"] = (time.monotonic() - iter_start) * 1000
             metrics.loop_duration.labels(step="total").observe(timings["total"] / 1000)
@@ -596,9 +553,10 @@ class GridMakerEngine:
         except Exception:
             return None
 
-    async def _safe_get_position(self):
+    async def _safe_get_position(self, symbol: str | None = None):
+        sym = symbol if symbol is not None else self._settings.dydx_symbol
         try:
-            return await self._exchange.get_position(self._settings.dydx_symbol)
+            return await self._exchange.get_position(sym)
         except Exception:
             return None
 

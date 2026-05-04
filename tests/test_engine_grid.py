@@ -15,6 +15,8 @@ async def test_engine_skips_grid_when_operation_state_none():
 
     settings = MagicMock()
     settings.dydx_symbol = "ETH-USD"
+    settings.dydx_symbol_token0 = "ETH-USD"
+    settings.dydx_symbol_token1 = ""
     settings.alert_webhook_url = ""
     settings.threshold_aggressive = 0.05
     settings.max_open_orders = 50
@@ -23,6 +25,7 @@ async def test_engine_skips_grid_when_operation_state_none():
 
     db = MagicMock()
     db.get_active_grid_orders = AsyncMock(return_value=[])
+    db.get_operation = AsyncMock(return_value=None)
 
     exchange = MagicMock()
     exchange.name = "dydx"
@@ -37,6 +40,8 @@ async def test_engine_skips_grid_when_operation_state_none():
     exchange.batch_place = AsyncMock(return_value=[])
     exchange.batch_cancel = AsyncMock(return_value=0)
     exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+    exchange.place_long_term_order = AsyncMock()
+    exchange.get_oracle_prices = AsyncMock(return_value={"ETH-USD": 3000.0})
 
     pool_reader = MagicMock()
     pool_reader.read_price = AsyncMock(return_value=3000.0)
@@ -70,6 +75,8 @@ async def test_engine_iteration_in_range_builds_grid():
     settings = MagicMock()
     settings.active_exchange = "dydx"
     settings.dydx_symbol = "ETH-USD"
+    settings.dydx_symbol_token0 = "ETH-USD"
+    settings.dydx_symbol_token1 = ""
     settings.pool_token0_symbol = "WETH"
     settings.pool_token1_symbol = "USDC"
     settings.threshold_aggressive = 0.05
@@ -77,11 +84,14 @@ async def test_engine_iteration_in_range_builds_grid():
     settings.clm_vault_address = "0xvault"
     settings.clm_pool_address = "0xpool"
     settings.wallet_address = "0xwallet"
+    settings.alert_webhook_url = ""
 
     db = MagicMock()
     db.insert_grid_order = AsyncMock()
     db.get_active_grid_orders = AsyncMock(return_value=[])
     db.insert_order_log = AsyncMock()
+    db.add_to_operation_accumulator = AsyncMock()
+    db.get_operation = AsyncMock(return_value=None)
 
     exchange = MagicMock()
     exchange.name = "dydx"
@@ -92,13 +102,15 @@ async def test_engine_iteration_in_range_builds_grid():
     exchange.get_collateral = AsyncMock(return_value=130.0)
     exchange.batch_place = AsyncMock(return_value=[])
     exchange.batch_cancel = AsyncMock(return_value=0)
+    exchange.place_long_term_order = AsyncMock()
+    exchange.get_oracle_prices = AsyncMock(return_value={"ETH-USD": 3000.0})
 
     pool_reader = MagicMock()
     pool_reader.read_price = AsyncMock(return_value=3000.0)
 
     beefy_reader = MagicMock()
     beefy_reader.read_position = AsyncMock(return_value=MagicMock(
-        tick_lower=78240, tick_upper=80580,  # ~$2700-$3300 range
+        tick_lower=-197310, tick_upper=-195303,  # ~$2700-$3300 range with decimals 18,6
         amount0=0.5, amount1=1500.0, share=0.01, raw_balance=10**16,
     ))
 
@@ -159,13 +171,17 @@ async def test_engine_reconcile_runs_periodically():
     state = StateHub()
     settings = MagicMock()
     settings.dydx_symbol = "ETH-USD"
+    settings.dydx_symbol_token0 = "ETH-USD"
+    settings.dydx_symbol_token1 = ""
     settings.threshold_aggressive = 0.05
     settings.max_open_orders = 200
     settings.pool_token0_symbol = "WETH"
     settings.pool_token1_symbol = "USDC"
+    settings.alert_webhook_url = ""
 
     db = MagicMock()
     db.get_active_grid_orders = AsyncMock(return_value=[])
+    db.get_operation = AsyncMock(return_value=None)
 
     exchange = MagicMock()
     exchange.name = "dydx"
@@ -176,6 +192,8 @@ async def test_engine_reconcile_runs_periodically():
     exchange.get_collateral = AsyncMock(return_value=130.0)
     exchange.batch_place = AsyncMock(return_value=[])
     exchange.batch_cancel = AsyncMock(return_value=0)
+    exchange.place_long_term_order = AsyncMock()
+    exchange.get_oracle_prices = AsyncMock(return_value={"ETH-USD": 3000.0})
 
     pool_reader = MagicMock()
     pool_reader.read_price = AsyncMock(return_value=3000.0)
@@ -207,8 +225,11 @@ async def test_engine_fires_warning_alert_when_margin_low(monkeypatch):
 
     state = StateHub()
     state.hedge_ratio = 1.0
+    state.operation_state = "active"  # need active for margin path to run
     settings = MagicMock()
     settings.dydx_symbol = "ETH-USD"
+    settings.dydx_symbol_token0 = "ETH-USD"
+    settings.dydx_symbol_token1 = ""
     settings.alert_webhook_url = "https://hooks.test/x"
     settings.threshold_aggressive = 0.05
     settings.max_open_orders = 200
@@ -217,6 +238,9 @@ async def test_engine_fires_warning_alert_when_margin_low(monkeypatch):
 
     db = MagicMock()
     db.get_active_grid_orders = AsyncMock(return_value=[])
+    db.get_operation = AsyncMock(return_value=None)
+    db.add_to_operation_accumulator = AsyncMock()
+    db.insert_order_log = AsyncMock()
 
     exchange = MagicMock()
     exchange.name = "dydx"
@@ -229,13 +253,15 @@ async def test_engine_fires_warning_alert_when_margin_low(monkeypatch):
     exchange.batch_place = AsyncMock(return_value=[])
     exchange.batch_cancel = AsyncMock(return_value=0)
     exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+    exchange.place_long_term_order = AsyncMock()
+    exchange.get_oracle_prices = AsyncMock(return_value={"ETH-USD": 3000.0})
 
     pool_reader = MagicMock()
     pool_reader.read_price = AsyncMock(return_value=3000.0)
     beefy_reader = MagicMock()
     beefy_reader.read_position = AsyncMock(return_value=MagicMock(
-        tick_lower=78240, tick_upper=80580, amount0=0.5, amount1=1500.0,
-        share=0.01, raw_balance=10**16,
+        tick_lower=-197310, tick_upper=-195303,  # ~$2700-$3300 (decimals 18,6)
+        amount0=0.5, amount1=1500.0, share=0.01, raw_balance=10**16,
     ))
 
     engine = GridMakerEngine(
@@ -539,6 +565,8 @@ async def test_engine_updates_live_pnl_breakdown(tmp_path):
 
     settings = MagicMock()
     settings.dydx_symbol = "ETH-USD"
+    settings.dydx_symbol_token0 = "ETH-USD"
+    settings.dydx_symbol_token1 = ""
     settings.alert_webhook_url = ""
     settings.threshold_aggressive = 0.05
     settings.max_open_orders = 50
@@ -555,6 +583,8 @@ async def test_engine_updates_live_pnl_breakdown(tmp_path):
     exchange.batch_place = AsyncMock(return_value=[])
     exchange.batch_cancel = AsyncMock(return_value=0)
     exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+    exchange.place_long_term_order = AsyncMock()
+    exchange.get_oracle_prices = AsyncMock(return_value={"ETH-USD": 3000.0})
 
     pool_reader = MagicMock()
     pool_reader.read_price = AsyncMock(return_value=3000.0)
@@ -589,6 +619,8 @@ async def test_engine_populates_last_iter_timings(tmp_path):
 
     settings = MagicMock()
     settings.dydx_symbol = "ETH-USD"
+    settings.dydx_symbol_token0 = "ETH-USD"
+    settings.dydx_symbol_token1 = ""
     settings.alert_webhook_url = ""
     settings.threshold_aggressive = 0.05
     settings.max_open_orders = 50
@@ -605,6 +637,8 @@ async def test_engine_populates_last_iter_timings(tmp_path):
     exchange.batch_place = AsyncMock(return_value=[])
     exchange.batch_cancel = AsyncMock(return_value=0)
     exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+    exchange.place_long_term_order = AsyncMock()
+    exchange.get_oracle_prices = AsyncMock(return_value={"ETH-USD": 3000.0})
 
     pool_reader = MagicMock()
     pool_reader.read_price = AsyncMock(return_value=3000.0)
@@ -621,9 +655,9 @@ async def test_engine_populates_last_iter_timings(tmp_path):
     await engine._iterate()
 
     timings = state.last_iter_timings
+    # After Task 10 refactor: only chain_read and total are populated;
+    # grid_compute / grid_diff_apply are removed (no grid placement).
     assert "chain_read" in timings
-    assert "grid_compute" in timings
-    assert "grid_diff_apply" in timings
     assert "total" in timings
     # All values should be non-negative ms
     for k, v in timings.items():
@@ -645,6 +679,8 @@ async def test_engine_updates_gauge_metrics(tmp_path):
 
     settings = MagicMock()
     settings.dydx_symbol = "ETH-USD"
+    settings.dydx_symbol_token0 = "ETH-USD"
+    settings.dydx_symbol_token1 = ""
     settings.alert_webhook_url = ""
     settings.threshold_aggressive = 0.05
     settings.max_open_orders = 50
@@ -661,6 +697,8 @@ async def test_engine_updates_gauge_metrics(tmp_path):
     exchange.batch_place = AsyncMock(return_value=[])
     exchange.batch_cancel = AsyncMock(return_value=0)
     exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+    exchange.place_long_term_order = AsyncMock()
+    exchange.get_oracle_prices = AsyncMock(return_value={"ETH-USD": 3000.0})
 
     pool_reader = MagicMock()
     pool_reader.read_price = AsyncMock(return_value=3000.0)
@@ -778,6 +816,8 @@ def _build_engine_for_aggressive_test(state, db_mock=None):
 
     settings = MagicMock()
     settings.dydx_symbol = "ETH-USD"
+    settings.dydx_symbol_token0 = "ETH-USD"
+    settings.dydx_symbol_token1 = ""
     settings.alert_webhook_url = ""
     settings.threshold_aggressive = 0.01  # 1%
     settings.max_open_orders = 50
@@ -791,6 +831,8 @@ def _build_engine_for_aggressive_test(state, db_mock=None):
         db.insert_order_log = AsyncMock()
     if not isinstance(db.add_to_operation_accumulator, AsyncMock):
         db.add_to_operation_accumulator = AsyncMock()
+    if not isinstance(db.get_operation, AsyncMock):
+        db.get_operation = AsyncMock(return_value=None)
 
     exchange = MagicMock()
     exchange.name = "dydx"
@@ -804,6 +846,7 @@ def _build_engine_for_aggressive_test(state, db_mock=None):
     exchange.batch_cancel = AsyncMock(return_value=0)
     exchange.get_open_orders_cloids = AsyncMock(return_value=[])
     exchange.place_long_term_order = AsyncMock()
+    exchange.get_oracle_prices = AsyncMock(return_value={"ETH-USD": 3000.0})
     exchange.get_tick_size = MagicMock(return_value=0.1)
     exchange.get_min_notional = MagicMock(return_value=0.001)
 
@@ -822,6 +865,11 @@ def _build_engine_for_aggressive_test(state, db_mock=None):
     return engine, exchange
 
 
+@pytest.mark.skip(
+    reason="Task 10 removed iterate-level cooldown; level-triggered taker has "
+    "no cooldown — it fires only when notional drift >= min_notional, which "
+    "is itself a self-rate-limiting filter."
+)
 @pytest.mark.asyncio
 async def test_aggressive_correction_first_iter_fires():
     """First time exposure breach is detected, aggressive correction fires."""
@@ -836,6 +884,11 @@ async def test_aggressive_correction_first_iter_fires():
     assert engine._last_aggressive_correction_at > 0
 
 
+@pytest.mark.skip(
+    reason="Task 10 removed iterate-level cooldown; level-triggered taker has "
+    "no cooldown — it fires only when notional drift >= min_notional, which "
+    "is itself a self-rate-limiting filter."
+)
 @pytest.mark.asyncio
 async def test_aggressive_correction_cooldown_blocks_refire():
     """Within cooldown window, subsequent breaches do not re-fire."""
@@ -852,6 +905,11 @@ async def test_aggressive_correction_cooldown_blocks_refire():
     assert exchange.place_long_term_order.await_count == 1
 
 
+@pytest.mark.skip(
+    reason="Task 10 removed iterate-level cooldown; level-triggered taker has "
+    "no cooldown — it fires only when notional drift >= min_notional, which "
+    "is itself a self-rate-limiting filter."
+)
 @pytest.mark.asyncio
 async def test_aggressive_correction_refires_after_cooldown_elapses():
     """After cooldown window elapses, a fresh breach fires another correction."""
