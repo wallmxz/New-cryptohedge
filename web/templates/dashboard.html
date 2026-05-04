@@ -38,6 +38,9 @@
 
     <!-- Tab: Painel -->
     <div x-show="activeTab === 'painel'" x-cloak class="space-y-5">
+        <!-- Trading Pair (primary action, lives at top of home) -->
+        {% include "partials/trading_pair.html" %}
+
         <!-- Operação atual -->
         {% include "partials/operation.html" %}
 

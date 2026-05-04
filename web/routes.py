@@ -276,17 +276,34 @@ async def select_pair(request: Request):
 
 
 async def refresh_pairs(request: Request):
-    """POST /pairs/refresh - re-fetch dYdX + Beefy and update caches."""
+    """POST /pairs/refresh - re-fetch dYdX + Beefy and update caches.
+
+    Builds an async Web3 client from settings.arbitrum_rpc_url so the Beefy
+    fetcher can resolve ERC20 metadata (symbol/decimals) on-chain for any
+    token addresses not yet in the DB cache.
+    """
     db = request.app.state.db
+    settings = request.app.state.settings
     from chains.dydx_markets import DydxMarketsFetcher
     from chains.beefy_api import BeefyApiFetcher
+
+    w3 = None
+    try:
+        from web3 import AsyncWeb3, AsyncHTTPProvider
+        if settings.arbitrum_rpc_url:
+            w3 = AsyncWeb3(AsyncHTTPProvider(settings.arbitrum_rpc_url))
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"Could not init w3 for ERC20 reads ({e}); will rely on cache only"
+        )
 
     try:
         dydx = DydxMarketsFetcher(db=db)
         n_dydx = await dydx.refresh()
         active = await dydx.get_active_tickers()
 
-        beefy = BeefyApiFetcher(db=db)
+        beefy = BeefyApiFetcher(db=db, w3=w3)
         n_beefy = await beefy.refresh(active_dydx_tickers=active)
 
         import time

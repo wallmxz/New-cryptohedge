@@ -196,6 +196,39 @@ class Database:
         except aiosqlite.OperationalError:
             pass
 
+        # ERC20 (symbol, decimals) metadata cache. Filled on-demand from on-chain
+        # reads when the Beefy fetcher encounters new token addresses; rows are
+        # immutable per address (ERC20 metadata never changes for a given
+        # contract), so no eviction is needed.
+        await self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS token_metadata_cache (
+                address TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                decimals INTEGER NOT NULL,
+                fetched_at REAL NOT NULL
+            )"""
+        )
+        await self._conn.commit()
+
+    async def get_token_metadata(self, address: str) -> dict | None:
+        """Returns {symbol, decimals} for an address, or None if not cached."""
+        cursor = await self._conn.execute(
+            "SELECT symbol, decimals FROM token_metadata_cache WHERE address = ?",
+            (address.lower(),),
+        )
+        row = await cursor.fetchone()
+        return {"symbol": row["symbol"], "decimals": int(row["decimals"])} if row else None
+
+    async def upsert_token_metadata(
+        self, *, address: str, symbol: str, decimals: int,
+    ) -> None:
+        await self._conn.execute(
+            """INSERT OR REPLACE INTO token_metadata_cache
+               (address, symbol, decimals, fetched_at) VALUES (?, ?, ?, ?)""",
+            (address.lower(), symbol, int(decimals), time.time()),
+        )
+        await self._conn.commit()
+
     async def close(self) -> None:
         if self._conn:
             await self._conn.close()
