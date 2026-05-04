@@ -129,6 +129,13 @@ class DydxAdapter(ExchangeAdapter):
         self._market_metas[symbol] = meta
         return meta
 
+    async def get_oracle_prices(self, symbols: list[str]) -> dict[str, float]:
+        """Returns {symbol: oracle_price_usd} for each requested symbol.
+        Reads from /v4/perpetualMarkets indexer endpoint.
+        Implemented in Task 4.
+        """
+        raise NotImplementedError("get_oracle_prices is implemented in Task 4")
+
     # The remaining methods on ExchangeAdapter ABC are placeholder stubs.
     # They will be implemented in Tasks 10-13.
 

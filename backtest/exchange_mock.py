@@ -144,6 +144,12 @@ class MockExchangeAdapter(ExchangeAdapter):
             unrealized_pnl=unreal,
         )
 
+    async def get_oracle_prices(self, symbols: list[str]) -> dict[str, float]:
+        """Returns the simulator-driven price per symbol.
+        Single-symbol stub for now; multi-symbol refactor lands in Task 11.
+        """
+        return {s: self._last_price for s in symbols}
+
     async def get_collateral(self) -> float:
         return self._collateral
 
