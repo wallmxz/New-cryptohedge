@@ -25,16 +25,15 @@ class DataFetcher:
         self._cache = cache
         self._fallback_apr = fallback_apr
 
-    async def fetch_eth_prices(
-        self, *, start: float, end: float, interval: int = 300,
-        product_id: str = "ETH-USD",
+    async def fetch_token_prices(
+        self, *, symbol: str, start: float, end: float, interval: int = 300,
     ) -> list[tuple[float, float]]:
-        """Fetch ETH/USD candles between start..end (unix seconds). Returns sorted (ts, close_price).
+        """Fetch <symbol> candles between start..end (unix seconds). Returns sorted (ts, close_price).
 
         Coinbase Exchange caps responses at 300 candles per request, so we paginate
         backward from `end` until we cross `start` or the API runs out of data.
         """
-        cache_key = f"eth_prices:{int(start)}:{int(end)}:{interval}"
+        cache_key = f"prices:{symbol}:{int(start)}:{int(end)}:{interval}"
         cached = await self._cache.get(cache_key)
         if cached is not None:
             data = json.loads(cached)
@@ -43,7 +42,7 @@ class DataFetcher:
         # Coinbase Exchange API: /products/<id>/candles
         # Returns: [[time, low, high, open, close, volume], ...] (descending by time)
         # granularity in seconds: 60, 300, 900, 3600, 21600, 86400
-        url = f"{COINBASE_BASE}/products/{product_id}/candles"
+        url = f"{COINBASE_BASE}/products/{symbol}/candles"
 
         seen: set[float] = set()
         records: list[tuple[float, float]] = []
@@ -95,6 +94,15 @@ class DataFetcher:
         records.sort(key=lambda r: r[0])
         await self._cache.set(cache_key, json.dumps(records))
         return records
+
+    async def fetch_eth_prices(
+        self, *, start: float, end: float, interval: int = 300,
+        product_id: str = "ETH-USD",
+    ) -> list[tuple[float, float]]:
+        """Legacy wrapper. Use fetch_token_prices(symbol=...) for new code."""
+        return await self.fetch_token_prices(
+            symbol=product_id, start=start, end=end, interval=interval,
+        )
 
     async def fetch_dydx_funding(
         self, *, symbol: str, start: float, end: float,

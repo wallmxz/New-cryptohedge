@@ -49,7 +49,7 @@ async def test_fetch_eth_prices_uses_cache(tmp_path):
 
     # Pre-populate cache with a known result
     cached_payload = json.dumps([[1700000000.0, 2000.5], [1700000300.0, 2001.0]])
-    await cache.set("eth_prices:1700000000:1700000600:300", cached_payload)
+    await cache.set("prices:ETH-USD:1700000000:1700000600:300", cached_payload)
 
     result = await fetcher.fetch_eth_prices(start=1700000000, end=1700000600, interval=300)
     assert result == [(1700000000.0, 2000.5), (1700000300.0, 2001.0)]
@@ -87,7 +87,7 @@ async def test_fetch_eth_prices_calls_api_on_miss(tmp_path):
     # Sorted ascending by timestamp
     assert result[0][0] < result[1][0] < result[2][0]
     # Cached
-    cached = await cache.get("eth_prices:1700000000:1700000600:300")
+    cached = await cache.get("prices:ETH-USD:1700000000:1700000600:300")
     assert cached is not None
     await cache.close()
 
@@ -447,3 +447,46 @@ async def test_end_to_end_synthetic_run(tmp_path):
     assert "Net PnL" in text
     assert "WETH/USDC" in text
     assert "7.0 days" in text or "7 days" in text
+
+
+@pytest.mark.asyncio
+async def test_fetch_token_prices_works_for_arb_usd(tmp_path):
+    """fetch_token_prices(symbol="ARB-USD") hits Coinbase /products/ARB-USD/candles."""
+    from backtest.cache import Cache
+    from backtest.data import DataFetcher
+    from unittest.mock import AsyncMock, patch
+
+    cache = Cache(str(tmp_path / "c.db"))
+    await cache.initialize()
+    fetcher = DataFetcher(cache=cache)
+
+    # Mock httpx.AsyncClient.get
+    fake_candles = [[1700003600, 1.45, 1.55, 1.50, 1.52, 100]] * 5
+
+    with patch("backtest.data.httpx.AsyncClient") as mock_client:
+        instance = AsyncMock()
+        mock_client.return_value.__aenter__.return_value = instance
+        instance.get = AsyncMock(return_value=AsyncMock(
+            json=lambda: fake_candles,
+            raise_for_status=lambda: None,
+        ))
+        prices = await fetcher.fetch_token_prices(
+            symbol="ARB-USD", start=1700000000, end=1700004000,
+        )
+
+    assert len(prices) == 1  # dedupe
+    assert prices[0][1] == 1.52  # close price
+
+
+@pytest.mark.asyncio
+async def test_fetch_eth_prices_still_works(tmp_path):
+    """Legacy fetch_eth_prices delegates to fetch_token_prices('ETH-USD')."""
+    from backtest.cache import Cache
+    from backtest.data import DataFetcher
+
+    cache = Cache(str(tmp_path / "c.db"))
+    await cache.initialize()
+    fetcher = DataFetcher(cache=cache)
+    # We don't actually hit the API — just make sure the method exists
+    assert hasattr(fetcher, "fetch_eth_prices")
+    assert hasattr(fetcher, "fetch_token_prices")
