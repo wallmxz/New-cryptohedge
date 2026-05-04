@@ -70,7 +70,7 @@ async def build_lifecycle(
         clm_vault_address=pair["vault_id"],
         clm_pool_address=pair["pool_address"],
         uniswap_v3_pool_fee=int(pair["pool_fee"]),
-        dydx_symbol=pair["dydx_perp"],
+        dydx_symbol_token0=pair["dydx_perp"],
     )
 
     pool_reader = UniswapV3PoolReader(

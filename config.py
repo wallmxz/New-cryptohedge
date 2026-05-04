@@ -17,7 +17,8 @@ class Settings:
     dydx_address: str
     dydx_network: str
     dydx_subaccount: int
-    dydx_symbol: str
+    dydx_symbol_token0: str
+    dydx_symbol_token1: str  # "" when single-leg (token1 is stable)
     alert_webhook_url: str
     hedge_ratio: float
     # max grid orders open at once on dYdX (caps grid density)
@@ -38,6 +39,12 @@ class Settings:
     slippage_bps: int  # default 30 = 0.3%
     uniswap_v3_pool_fee: int  # 500 = 0.05%, 3000 = 0.30%
 
+    @property
+    def dydx_symbol(self) -> str:
+        """Legacy alias for dydx_symbol_token0. Use the typed field directly
+        in new code; kept here for compat with Phase 1.2 callsites."""
+        return self.dydx_symbol_token0
+
     @classmethod
     def from_env(cls) -> Settings:
         return cls(
@@ -53,7 +60,11 @@ class Settings:
             dydx_address=os.environ.get("DYDX_ADDRESS", ""),
             dydx_network=os.environ.get("DYDX_NETWORK", "mainnet"),
             dydx_subaccount=int(os.environ.get("DYDX_SUBACCOUNT", "0")),
-            dydx_symbol=os.environ.get("DYDX_SYMBOL", "ETH-USD"),
+            dydx_symbol_token0=os.environ.get(
+                "DYDX_SYMBOL_TOKEN0",
+                os.environ.get("DYDX_SYMBOL", "ETH-USD"),
+            ),
+            dydx_symbol_token1=os.environ.get("DYDX_SYMBOL_TOKEN1", ""),
             alert_webhook_url=os.environ.get("ALERT_WEBHOOK_URL", ""),
             hedge_ratio=float(os.environ.get("HEDGE_RATIO", "1.0")),
             max_open_orders=int(os.environ.get("MAX_OPEN_ORDERS", "200")),

@@ -14,7 +14,7 @@ def mock_settings():
         arbitrum_rpc_url="https://rpc", arbitrum_rpc_fallback="",
         clm_vault_address="0xVAULT_OLD", clm_pool_address="0xPOOL_OLD",
         dydx_mnemonic="m", dydx_address="d", dydx_network="mainnet",
-        dydx_subaccount=0, dydx_symbol="ETH-USD",
+        dydx_subaccount=0, dydx_symbol_token0="ETH-USD", dydx_symbol_token1="",
         alert_webhook_url="",
         max_open_orders=200, hedge_ratio=1.0,
         threshold_aggressive=0.01,
