@@ -97,6 +97,14 @@ class BeefyApiFetcher:
 
         is_usd = is_stable(token1_address)
 
+        # In cross-pair (token1 not stable), check whether token1 has a dYdX perp too.
+        token1_perp = None
+        if not is_usd:
+            token1_sym_upper = (token1.get("symbol") or "").upper()
+            candidate = dydx_perp_for(token1_sym_upper)
+            if candidate is not None and candidate in active_dydx_tickers:
+                token1_perp = candidate
+
         # Resolve TVL
         chain_tvls = tvl_data.get(TARGET_CHAIN) or {}
         tvl_usd = chain_tvls.get(clm.get("id"))
@@ -123,6 +131,7 @@ class BeefyApiFetcher:
             "apy_30d": apy_30d,
             "is_usd_pair": is_usd,
             "dydx_perp": dydx_perp,
+            "dydx_perp_token1": token1_perp,
             "token0_logo_url": f"{BEEFY_API_BASE}/token/{TARGET_CHAIN}/{token0_symbol}",
             "token1_logo_url": f"{BEEFY_API_BASE}/token/{TARGET_CHAIN}/{(token1.get('symbol') or '').upper()}",
             "fetched_at": now,

@@ -189,3 +189,61 @@ async def test_refresh_skips_vaults_without_dydx_perp(mock_db):
 
     assert n == 0  # RAREUNKNOWN has no perp -> filtered
     mock_db.upsert_beefy_pair.assert_not_awaited()
+
+
+def test_extract_pair_populates_dydx_perp_token1_for_cross_pair():
+    """When token1 is volatile (WETH) and has dYdX perp active, populate dydx_perp_token1."""
+    from chains.beefy_api import BeefyApiFetcher
+    fetcher = BeefyApiFetcher(db=None)
+
+    clm = {
+        "earnContractAddress": "0xV1",
+        "id": "test-arb-weth",
+        "chain": "arbitrum",
+        "lpAddress": "0xPOOL",
+        "tokens": [
+            {"symbol": "ARB", "address": "0xARB", "decimals": 18},
+            {"symbol": "WETH", "address": "0xWETH", "decimals": 18},
+        ],
+        "feeTier": 3000,
+    }
+    pair = fetcher._extract_pair(
+        clm,
+        tvl_data={"arbitrum": {"test-arb-weth": 1000}},
+        apy_data={"test-arb-weth": {"vaultApr": 0.5}},
+        active_dydx_tickers={"ARB-USD", "ETH-USD"},
+        now=0,
+    )
+    assert pair is not None
+    assert pair["dydx_perp"] == "ARB-USD"
+    assert pair["dydx_perp_token1"] == "ETH-USD"
+    assert pair["is_usd_pair"] is False
+
+
+def test_extract_pair_dydx_perp_token1_null_for_usd_pair():
+    """USD-pair (token1 stable) leaves dydx_perp_token1 as None."""
+    from chains.beefy_api import BeefyApiFetcher
+    fetcher = BeefyApiFetcher(db=None)
+
+    clm = {
+        "earnContractAddress": "0xV2",
+        "id": "test-weth-usdc",
+        "chain": "arbitrum",
+        "lpAddress": "0xPOOL2",
+        "tokens": [
+            {"symbol": "WETH", "address": "0xWETH", "decimals": 18},
+            {"symbol": "USDC", "address": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831", "decimals": 6},
+        ],
+        "feeTier": 500,
+    }
+    pair = fetcher._extract_pair(
+        clm,
+        tvl_data={"arbitrum": {"test-weth-usdc": 1_000_000}},
+        apy_data={"test-weth-usdc": {"vaultApr": 0.15}},
+        active_dydx_tickers={"ETH-USD"},
+        now=0,
+    )
+    assert pair is not None
+    assert pair["dydx_perp"] == "ETH-USD"
+    assert pair["dydx_perp_token1"] is None
+    assert pair["is_usd_pair"] is True
