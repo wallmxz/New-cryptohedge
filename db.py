@@ -173,6 +173,28 @@ class Database:
             )"""
         )
         await self._conn.commit()
+        # Cross-pair dual-leg fields
+        for col_def in (
+            "ADD COLUMN baseline_token0_usd_price REAL",
+            "ADD COLUMN baseline_token1_usd_price REAL",
+            "ADD COLUMN perp_fees_paid_token0 REAL DEFAULT 0",
+            "ADD COLUMN perp_fees_paid_token1 REAL DEFAULT 0",
+            "ADD COLUMN funding_paid_token0 REAL DEFAULT 0",
+            "ADD COLUMN funding_paid_token1 REAL DEFAULT 0",
+        ):
+            try:
+                await self._conn.execute(f"ALTER TABLE operations {col_def}")
+                await self._conn.commit()
+            except aiosqlite.OperationalError:
+                pass
+
+        try:
+            await self._conn.execute(
+                "ALTER TABLE beefy_pairs_cache ADD COLUMN dydx_perp_token1 TEXT"
+            )
+            await self._conn.commit()
+        except aiosqlite.OperationalError:
+            pass
 
     async def close(self) -> None:
         if self._conn:
@@ -415,8 +437,13 @@ class Database:
 
     async def add_to_operation_accumulator(self, op_id: int, field: str, delta: float) -> None:
         """Atomically add `delta` to one of: perp_fees_paid, funding_paid,
-        lp_fees_earned, bootstrap_slippage."""
-        allowed = {"perp_fees_paid", "funding_paid", "lp_fees_earned", "bootstrap_slippage"}
+        lp_fees_earned, bootstrap_slippage, or per-leg variants
+        perp_fees_paid_token0/1, funding_paid_token0/1."""
+        allowed = {
+            "perp_fees_paid", "funding_paid", "lp_fees_earned", "bootstrap_slippage",
+            "perp_fees_paid_token0", "perp_fees_paid_token1",
+            "funding_paid_token0", "funding_paid_token1",
+        }
         if field not in allowed:
             raise ValueError(f"field must be one of {allowed}, got {field}")
         await self._conn.execute(
