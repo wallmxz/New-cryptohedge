@@ -56,6 +56,13 @@ _BOOTSTRAP_STATES_RESUMABLE = {
     "teardown_withdraw_confirmed",
     "teardown_swap_pending",
     "teardown_swap_confirmed",
+    # Dual-leg teardown states
+    "teardown_close_pending",
+    "teardown_close_done",
+    "teardown_swap_token0_pending",
+    "teardown_swap_token0_done",
+    "teardown_swap_token1_pending",
+    "teardown_swap_done",
 }
 
 
@@ -452,11 +459,23 @@ class OperationLifecycle:
         """Cancel grid -> close short -> withdraw Beefy -> (optional) swap WETH to USDC.
 
         Returns final PnL breakdown dict.
+
+        Dispatches on `settings.dydx_symbol_token1`:
+          - empty (single-leg): existing path with one short close + optional WETH->USDC swap.
+          - non-empty (dual-leg / cross-pair): closes BOTH shorts in parallel via
+            asyncio.gather; optional swap_to_usdc does TWO sequential swaps
+            (token0 -> USDC, token1 -> USDC).
         """
         op_row = await self._db.get_active_operation()
         if op_row is None:
             raise RuntimeError("No active operation to teardown")
         op_id = op_row["id"]
+        is_dual_leg = bool(self._settings.dydx_symbol_token1)
+
+        if is_dual_leg:
+            return await self._teardown_dual_leg(
+                op_id=op_id, swap_to_usdc=swap_to_usdc, close_reason=close_reason,
+            )
 
         await self._db.update_operation_status(op_id, OperationState.STOPPING.value)
         self._hub.operation_state = OperationState.STOPPING.value
@@ -555,6 +574,181 @@ class OperationLifecycle:
             self._hub.operation_state = OperationState.FAILED.value
             self._hub.bootstrap_progress = f"TEARDOWN FAILED: {e}"
             raise
+
+    async def _teardown_dual_leg(
+        self, *, op_id: int, swap_to_usdc: bool, close_reason: str,
+    ) -> dict:
+        """Cross-pair teardown: cancel grid, close BOTH shorts in parallel via
+        asyncio.gather, withdraw Beefy, optionally do TWO sequential swaps
+        (token0 -> USDC, token1 -> USDC), and compute cross-pair PnL using
+        both legs' oracle prices.
+        """
+        await self._db.update_operation_status(op_id, OperationState.STOPPING.value)
+        self._hub.operation_state = OperationState.STOPPING.value
+        self._hub.bootstrap_progress = "Cancelling grid (dual-leg)..."
+
+        try:
+            # Defensive: cancel any active grid orders. A future engine
+            # implementation may post grid orders even in cross-pair mode;
+            # here we keep the same shape as single-leg.
+            await self._db.update_bootstrap_state(op_id, "teardown_grid_cancel")
+            active_orders = await self._db.get_active_grid_orders()
+            if active_orders:
+                await self._exchange.batch_cancel([
+                    dict(symbol=self._settings.dydx_symbol_token0, cloid_int=int(r["cloid"]))
+                    for r in active_orders
+                ])
+                for r in active_orders:
+                    await self._db.mark_grid_order_cancelled(r["cloid"], time.time())
+
+            token0_sym = self._settings.dydx_symbol_token0
+            token1_sym = self._settings.dydx_symbol_token1
+
+            await self._db.update_bootstrap_state(op_id, "teardown_close_pending")
+            self._hub.bootstrap_progress = "Closing shorts (dual-leg)..."
+
+            oracle_prices = await self._exchange.get_oracle_prices(
+                [token0_sym, token1_sym]
+            )
+
+            async def _close_leg(sym: str, accumulator_field: str) -> None:
+                pos = await self._exchange.get_position(sym)
+                if not pos or pos.size <= 0:
+                    return
+                ref = float(oracle_prices.get(sym, 0.0) or 0.0)
+                if ref <= 0:
+                    return
+                side = "buy" if pos.side == "short" else "sell"
+                price = ref * 1.001 if side == "buy" else ref * 0.999
+                await self._exchange.place_long_term_order(
+                    symbol=sym, side=side, size=pos.size, price=price,
+                    cloid_int=self._next_cloid(997), ttl_seconds=60,
+                )
+                slippage_usd = 0.0005 * pos.size * ref
+                await self._db.add_to_operation_accumulator(
+                    op_id, accumulator_field, slippage_usd,
+                )
+
+            await asyncio.gather(
+                _close_leg(token0_sym, "perp_fees_paid_token0"),
+                _close_leg(token1_sym, "perp_fees_paid_token1"),
+            )
+            await self._db.update_bootstrap_state(op_id, "teardown_close_done")
+
+            # Withdraw Beefy
+            await self._db.update_bootstrap_state(op_id, "teardown_withdraw_pending")
+            self._hub.bootstrap_progress = "Withdrawing Beefy..."
+            beefy_pos = await self._beefy_reader.read_position()
+            shares = beefy_pos.raw_balance
+            if shares > 0:
+                tx = await self._beefy.withdraw(
+                    shares=shares, min_amount0=0, min_amount1=0,
+                )
+                await self._db.update_bootstrap_state(
+                    op_id, "teardown_withdraw_confirmed", withdraw_tx_hash=tx,
+                )
+            else:
+                await self._db.update_bootstrap_state(op_id, "teardown_withdraw_confirmed")
+
+            # Optional: two sequential swaps back to USDC.
+            if swap_to_usdc:
+                await self._swap_residuals_to_usdc(op_id, is_dual_leg=True)
+
+            # Compute final PnL via cross-pair signature.
+            op = Operation.from_db_row(await self._db.get_operation(op_id))
+            from engine.pnl import compute_operation_pnl
+            my_amount0 = beefy_pos.amount0 * beefy_pos.share
+            my_amount1 = beefy_pos.amount1 * beefy_pos.share
+            p0_now = float(oracle_prices.get(token0_sym, 0.0) or 0.0)
+            p1_now = float(oracle_prices.get(token1_sym, 0.0) or 0.0)
+            pool_value = my_amount0 * p0_now + my_amount1 * p1_now
+            breakdown = compute_operation_pnl(
+                op,
+                current_pool_value_usd=pool_value,
+                current_token0_usd_price=p0_now,
+                current_token1_usd_price=p1_now,
+                hedge_realized_per_symbol=dict(self._hub.hedge_realized_pnls),
+                hedge_unrealized_per_symbol=dict(self._hub.hedge_unrealized_pnls),
+            )
+
+            await self._db.close_operation(
+                op_id, ended_at=time.time(),
+                final_net_pnl=breakdown["net_pnl"], close_reason=close_reason,
+            )
+            await self._db.update_bootstrap_state(op_id, "closed")
+            self._hub.current_operation_id = None
+            self._hub.operation_state = OperationState.NONE.value
+            self._hub.bootstrap_progress = ""
+            self._hub.operation_pnl_breakdown = {}
+            return {
+                "id": op_id,
+                "final_net_pnl": breakdown["net_pnl"],
+                "breakdown": breakdown,
+            }
+
+        except Exception as e:
+            logger.exception(f"Dual-leg teardown failed at op_id={op_id}: {e}")
+            await self._db.update_bootstrap_state(op_id, "failed")
+            await self._db.update_operation_status(op_id, OperationState.FAILED.value)
+            self._hub.operation_state = OperationState.FAILED.value
+            self._hub.bootstrap_progress = f"TEARDOWN FAILED: {e}"
+            raise
+
+    async def _swap_residuals_to_usdc(
+        self, op_id: int, *, is_dual_leg: bool,
+    ) -> None:
+        """Swap residual token0 (and token1 in dual-leg) back to USDC, sequencial.
+
+        Single-leg path: token0 -> token1 (token1 is USDC stable).
+        Dual-leg path: token0 -> USDC, then token1 -> USDC. Uses min_out=0
+        in dual-leg (no slippage check; accept the hit on residual cleanup).
+        """
+        bal = await self._read_wallet_balance()
+        deadline = int(time.time()) + DEFAULT_DEADLINE_SECONDS
+        slippage = self._settings.slippage_bps / 10000.0
+        p_now = await self._pool_reader.read_price()
+
+        if bal["token0"] > 0:
+            await self._db.update_bootstrap_state(op_id, "teardown_swap_token0_pending")
+            self._hub.bootstrap_progress = "Swapping token0 -> USDC..."
+            amount_in = int(bal["token0"] * 10**self._decimals0)
+            if is_dual_leg:
+                token_out = _USDC_ADDRESS_ARBITRUM
+                min_out = 0
+            else:
+                token_out = self._settings.token1_address
+                min_out = int(
+                    bal["token0"] * p_now * (1 - slippage) * 10**self._decimals1
+                )
+            tx = await self._uniswap.swap_exact_input(
+                token_in=self._settings.token0_address,
+                token_out=token_out,
+                fee=self._settings.uniswap_v3_pool_fee,
+                amount_in=amount_in,
+                amount_out_minimum=min_out,
+                recipient=self._uniswap.address,
+                deadline=deadline,
+            )
+            await self._db.update_bootstrap_state(
+                op_id, "teardown_swap_token0_done", teardown_swap_tx_hash=tx,
+            )
+
+        if is_dual_leg and bal["token1"] > 0:
+            await self._db.update_bootstrap_state(op_id, "teardown_swap_token1_pending")
+            self._hub.bootstrap_progress = "Swapping token1 -> USDC..."
+            amount_in = int(bal["token1"] * 10**self._decimals1)
+            tx = await self._uniswap.swap_exact_input(
+                token_in=self._settings.token1_address,
+                token_out=_USDC_ADDRESS_ARBITRUM,
+                fee=self._settings.uniswap_v3_pool_fee,
+                amount_in=amount_in,
+                amount_out_minimum=0,
+                recipient=self._uniswap.address,
+                deadline=int(time.time()) + DEFAULT_DEADLINE_SECONDS,
+            )
+            await self._db.update_bootstrap_state(
+                op_id, "teardown_swap_done", teardown_swap_tx_hash=tx,
+            )
 
     async def cashout_residual(self) -> dict:
         """Swap any residual token0 in the wallet to token1.
