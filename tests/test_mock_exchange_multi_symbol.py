@@ -71,3 +71,17 @@ async def test_single_symbol_backwards_compat():
     await ex.advance_to_price(4000.0, ts=0)
     pos = await ex.get_position("ETH-USD")
     assert pos is not None and pos.size == 0.05
+
+
+@pytest.mark.asyncio
+async def test_apply_funding_requires_symbol_in_multi_symbol_mode():
+    """Silent fallback in dual-leg would lose the second leg's funding."""
+    ex = MockExchangeAdapter(symbols=["ARB-USD", "ETH-USD"])
+    await ex.connect()
+    with pytest.raises(ValueError, match="explicit `symbol`"):
+        ex.apply_funding(0.0001, ts=0.0)  # no symbol arg
+
+    # Single-symbol still works without symbol arg
+    ex_single = MockExchangeAdapter(symbol="ETH-USD")
+    await ex_single.connect()
+    ex_single.apply_funding(0.0001, ts=0.0)  # OK

@@ -10,6 +10,31 @@ from typing import Awaitable, Callable
 from exchanges.base import ExchangeAdapter, Order, Fill, Position
 
 
+# Threshold below which a position is considered closed. Floating-point
+# residuals from sequential fills can leave dust like 1e-15 in `_position_size`.
+_POSITION_DUST = 1e-12
+
+# Conservative cross-margin leverage cap for the simulator. Real dYdX uses
+# asset-specific initial/maintenance margin; this is a single number that
+# protects against the engine's _aggressive_correct re-fire pattern stacking
+# takers to absurd notionals (root cause of the historical -$502M PnL bug).
+_LEVERAGE_CAP = 5.0
+
+
+def _is_marketable(side: str, order_price: float, ref_price: float) -> bool:
+    """True if an order at `order_price` would fill against a reference price.
+
+    Used both for fill-on-place (ref = last_price) and for step-crossed fills
+    (ref = step price; the prev-state predicate is checked separately by callers
+    that need transition semantics).
+    """
+    if ref_price <= 0:
+        return False
+    if side == "buy":
+        return ref_price <= order_price
+    return ref_price >= order_price
+
+
 @dataclass
 class _OpenOrder:
     cloid_int: int
@@ -103,11 +128,14 @@ class MockExchangeAdapter(ExchangeAdapter):
         # Compute hypothetical total notional across all legs
         total_notional = 0.0
         for s in self._symbols:
+            # Untraded legs (last_price still 0) contribute 0 to total notional — we
+            # have no oracle yet. This under-reports notional only on the very first
+            # placements before advance_to_prices has been called for all symbols.
             ref = self._last_price[s] if self._last_price[s] > 0 else (price if s == symbol else 0)
             sz = new_size if s == symbol else self._position_size[s]
             total_notional += abs(sz) * ref
 
-        max_notional = max(0.0, self._collateral * 5.0)
+        max_notional = max(0.0, self._collateral * _LEVERAGE_CAP)
         delta_grew = abs(new_size) > abs(self._position_size[symbol])
         if total_notional > max_notional and delta_grew:
             raise ValueError(
@@ -124,11 +152,7 @@ class MockExchangeAdapter(ExchangeAdapter):
         # because the per-step cross predicate requires strict prev/price
         # transition.
         last = self._last_price.get(symbol, 0.0)
-        already_crossed = (
-            (side == "buy" and last > 0 and last <= price)
-            or (side == "sell" and last > 0 and last >= price)
-        )
-        if already_crossed:
+        if _is_marketable(side, price, last):
             await self._apply_fill(symbol, order_obj, ts=0.0)
         else:
             self._open_orders[symbol][cloid_int] = order_obj
@@ -162,7 +186,7 @@ class MockExchangeAdapter(ExchangeAdapter):
 
     async def get_position(self, symbol: str) -> Position | None:
         ps = self._position_size.get(symbol, 0.0)
-        if abs(ps) < 1e-12:
+        if abs(ps) < _POSITION_DUST:
             return None
         side = "short" if ps < 0 else "long"
         unreal = (self._position_entry[symbol] - self._last_price[symbol]) * ps
@@ -239,7 +263,7 @@ class MockExchangeAdapter(ExchangeAdapter):
         # Update position (per-symbol)
         signed_delta = order.size if order.side == "buy" else -order.size
         new_size = self._position_size[symbol] + signed_delta
-        if abs(self._position_size[symbol]) > 1e-12 and (
+        if abs(self._position_size[symbol]) > _POSITION_DUST and (
             (self._position_size[symbol] > 0) == (signed_delta > 0)
         ):
             # Same direction — weighted average entry
@@ -247,10 +271,10 @@ class MockExchangeAdapter(ExchangeAdapter):
             self._position_entry[symbol] = (
                 (self._position_entry[symbol] * self._position_size[symbol]
                  + order.price * signed_delta) / denom
-                if abs(denom) > 1e-12
+                if abs(denom) > _POSITION_DUST
                 else order.price
             )
-        elif abs(self._position_size[symbol]) < 1e-12:
+        elif abs(self._position_size[symbol]) < _POSITION_DUST:
             self._position_entry[symbol] = order.price
         # else closing or flipping — keep entry of remaining (simplification)
         self._position_size[symbol] = new_size
@@ -283,10 +307,19 @@ class MockExchangeAdapter(ExchangeAdapter):
 
         Convention: positive rate = longs pay shorts, so short receives.
         Defaults to the first symbol when `symbol` is None (single-leg compat).
+        In multi-symbol mode, `symbol` is required to avoid silently applying
+        funding to only the first leg.
         """
-        sym = symbol or self._symbols[0]
+        if symbol is None:
+            if len(self._symbols) > 1:
+                raise ValueError(
+                    "apply_funding requires explicit `symbol` in multi-symbol mode "
+                    "(would silently apply to first leg only)"
+                )
+            symbol = self._symbols[0]
+        sym = symbol
         ps = self._position_size.get(sym, 0.0)
-        if abs(ps) < 1e-12:
+        if abs(ps) < _POSITION_DUST:
             return
         notional = abs(ps) * self._last_price[sym]
         # Bot is short -> if rate > 0, bot receives; if rate < 0, bot pays.
