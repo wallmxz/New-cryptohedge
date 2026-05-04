@@ -20,7 +20,6 @@ def mock_settings():
         threshold_aggressive=0.01,
         active_exchange="dydx",
         pool_token0_symbol="WETH", pool_token1_symbol="USDC",
-        pool_token1_is_stable=True, pool_token1_usd_price=1.0,
         uniswap_v3_router_address="0xROUTER",
         token0_address="0xWETH", token1_address="0xUSDC",
         token0_decimals=18, token1_decimals=6,

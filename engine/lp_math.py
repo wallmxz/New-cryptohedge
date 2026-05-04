@@ -1,6 +1,7 @@
 """Pure V3 math for computing optimal token split given a CLM range."""
 from __future__ import annotations
-from math import sqrt
+
+from engine.curve import compute_l_from_value, compute_x, compute_y
 
 
 def compute_optimal_split(
@@ -22,26 +23,10 @@ def compute_optimal_split(
     if total_value_usdc <= 0:
         return 0.0, 0.0
 
-    # Out-of-range cases
     if p >= p_b:
         return 0.0, total_value_usdc
     if p <= p_a:
         return total_value_usdc / p, 0.0
 
-    # In-range: use V3 amount formulas.
-    # amount_weth_per_L = (1/sqrt(p) - 1/sqrt(p_b))
-    # amount_usdc_per_L = (sqrt(p) - sqrt(p_a))
-    # Value of position = amount_weth*p + amount_usdc = L * (sqrt(p) - p/sqrt(p_b) + sqrt(p) - sqrt(p_a))
-    #                  = L * (2*sqrt(p) - sqrt(p_a) - p/sqrt(p_b))
-    # Solve for L given total value V: L = V / (2*sqrt(p) - sqrt(p_a) - p/sqrt(p_b))
-    sqrt_p = sqrt(p)
-    sqrt_pa = sqrt(p_a)
-    sqrt_pb = sqrt(p_b)
-
-    denom = 2 * sqrt_p - sqrt_pa - p / sqrt_pb
-    L = total_value_usdc / denom
-
-    amount_weth = L * (1.0 / sqrt_p - 1.0 / sqrt_pb)
-    amount_usdc = L * (sqrt_p - sqrt_pa)
-
-    return amount_weth, amount_usdc
+    L = compute_l_from_value(total_value_usdc, p_a, p_b, p)
+    return compute_x(L, p, p_b), compute_y(L, p, p_a)

@@ -8,9 +8,6 @@ class StateHub:
     # Pool
     pool_value_usd: float = 0.0
     pool_tokens: dict = field(default_factory=dict)
-    cow_balance: float = 0.0
-    cow_total_supply: float = 0.0
-    vault_balances: tuple = (0.0, 0.0)
 
     # Hedge
     hedge_position: dict | None = None
@@ -18,11 +15,12 @@ class StateHub:
     hedge_realized_pnl: float = 0.0
     funding_total: float = 0.0
 
-    # Orderbook
+    # Orderbook (legacy fields kept for dashboard partials that haven't been
+    # rewritten for the grid model; engine never writes them — they always
+    # render as defaults).
     best_bid: float = 0.0
     best_ask: float = 0.0
     my_order: dict | None = None
-    my_order_depth: int = 0
 
     # Config
     hedge_ratio: float = 0.95
@@ -33,7 +31,7 @@ class StateHub:
     total_maker_volume: float = 0.0
     total_taker_volume: float = 0.0
     total_fees_paid: float = 0.0
-    total_fees_earned: float = 0.0
+    total_fees_earned: float = 0.0  # rendered in pnl.html; engine does not write
 
     # Grid state
     range_lower: float = 0.0

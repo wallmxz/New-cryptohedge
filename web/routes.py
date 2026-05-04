@@ -180,9 +180,8 @@ async def stop_operation(request: Request):
 
 
 async def cashout(request: Request):
-    """Manual swap WETH -> USDC. Used after teardown when user wants USDC out.
-
-    Only operates when there's NO active operation (otherwise teardown handles it).
+    """Swap any residual token0 in the wallet to token1. Only allowed when
+    no operation is active (otherwise teardown handles it via swap_to_usdc).
     """
     if not hasattr(request.app.state, "engine"):
         return JSONResponse({"error": "Engine not running"}, status_code=503)
@@ -199,23 +198,7 @@ async def cashout(request: Request):
         return JSONResponse({"error": "Lifecycle not configured"}, status_code=503)
 
     try:
-        bal = await engine._lifecycle._read_wallet_balance()
-        if bal["token0"] <= 0:
-            return JSONResponse({"weth_swapped": 0.0, "message": "No WETH in wallet"}, status_code=200)
-        import time
-        p_now = await engine._lifecycle._pool_reader.read_price()
-        slippage = engine._lifecycle._settings.slippage_bps / 10000.0
-        amount_in_raw = int(bal["token0"] * 10**engine._lifecycle._decimals0)
-        min_out = int(bal["token0"] * p_now * (1 - slippage) * 10**engine._lifecycle._decimals1)
-        tx_hash = await engine._lifecycle._uniswap.swap_exact_input(
-            token_in=engine._lifecycle._settings.token0_address,
-            token_out=engine._lifecycle._settings.token1_address,
-            fee=500,
-            amount_in=amount_in_raw, amount_out_minimum=min_out,
-            recipient=engine._lifecycle._uniswap.address,
-            deadline=int(time.time()) + 300,
-        )
-        return JSONResponse({"tx_hash": tx_hash, "weth_swapped": bal["token0"]}, status_code=200)
+        return JSONResponse(await engine._lifecycle.cashout_residual(), status_code=200)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
