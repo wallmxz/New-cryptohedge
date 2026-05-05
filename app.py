@@ -18,7 +18,7 @@ from web.logging_config import setup_logging
 from web.routes import (
     dashboard, sse_state, sse_logs, update_settings, get_config,
     list_operations, get_current_operation, start_operation, stop_operation,
-    metrics, cashout, wallet_balance,
+    preview_operation, metrics, cashout, wallet_balance,
     list_pairs, select_pair, refresh_pairs,
 )
 
@@ -82,12 +82,24 @@ def create_app(start_engine: bool = True) -> Starlette:
                 w3, settings.clm_vault_address, settings.wallet_address, 18, 6,
             )
 
-            exchange = DydxAdapter(
-                mnemonic=settings.dydx_mnemonic,
-                wallet_address=settings.dydx_address,
-                network=settings.dydx_network,
-                subaccount=settings.dydx_subaccount,
-            )
+            # Choose perp exchange based on settings.active_exchange.
+            # "lighter" = Lighter v1 (zero-fee ZK rollup). Anything else
+            # (default "dydx") = dYdX v4. The engine treats both the same.
+            if settings.active_exchange == "lighter":
+                from exchanges.lighter import LighterAdapter
+                exchange = LighterAdapter(
+                    url=settings.lighter_url,
+                    account_index=settings.lighter_account_index,
+                    api_private_key=settings.lighter_api_private_key,
+                    api_key_index=settings.lighter_api_key_index,
+                )
+            else:
+                exchange = DydxAdapter(
+                    mnemonic=settings.dydx_mnemonic,
+                    wallet_address=settings.dydx_address,
+                    network=settings.dydx_network,
+                    subaccount=settings.dydx_subaccount,
+                )
             await exchange.connect()
 
             lifecycle = None
@@ -136,6 +148,7 @@ def create_app(start_engine: bool = True) -> Starlette:
         Route("/settings", update_settings, methods=["POST"]),
         Route("/operations", list_operations),
         Route("/operations/current", get_current_operation),
+        Route("/operations/preview", preview_operation, methods=["POST"]),
         Route("/operations/start", start_operation, methods=["POST"]),
         Route("/operations/stop", stop_operation, methods=["POST"]),
         Route("/operations/cashout", cashout, methods=["POST"]),

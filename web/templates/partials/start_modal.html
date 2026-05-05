@@ -1,28 +1,140 @@
 <div x-show="showStartModal" x-cloak
      class="fixed inset-0 bg-black/50 flex items-center justify-center z-50"
-     @click.self="showStartModal = false">
-    <div class="bg-white p-6 rounded-lg shadow-xl max-w-md w-full">
-        <h2 class="text-lg font-bold mb-4">Iniciar nova operação</h2>
-        <label class="block mb-2 text-sm font-medium">Capital (USDC)</label>
-        <div class="flex gap-2">
-            <input type="number" x-model.number="startBudget"
-                   class="flex-1 px-3 py-2 border rounded"
-                   step="0.01" min="0">
-            <button @click="startBudget = Math.floor(startBudgetMax)"
-                    class="px-3 py-2 bg-slate-200 rounded text-sm"
-                    x-show="startBudgetMax > 0">
-                Max (<span x-text="startBudgetMax.toFixed(2)"></span>)
-            </button>
-        </div>
-        <p class="text-xs text-slate-500 mt-2">
-            O bot vai fazer swap, depositar no Beefy e abrir short na dYdX automaticamente.
-        </p>
-        <div class="mt-4 flex justify-end gap-2">
-            <button @click="showStartModal = false"
-                    class="px-4 py-2 bg-slate-200 rounded">Cancelar</button>
-            <button @click="confirmStart()"
-                    :disabled="startBudget <= 0"
-                    class="px-4 py-2 bg-indigo-600 text-white rounded disabled:opacity-50">Iniciar</button>
-        </div>
+     @click.self="closeStartModal()">
+    <div class="bg-white p-6 rounded-lg shadow-xl max-w-2xl w-full max-h-[90vh] overflow-y-auto">
+
+        <!-- Stage 1: budget input -->
+        <template x-if="startStage === 'budget'">
+            <div>
+                <h2 class="text-lg font-bold mb-4">Iniciar nova operação</h2>
+                <label class="block mb-2 text-sm font-medium">Capital (USDC)</label>
+                <div class="flex gap-2">
+                    <input type="number" x-model.number="startBudget"
+                           class="flex-1 px-3 py-2 border rounded"
+                           step="0.01" min="0">
+                    <button @click="startBudget = Math.floor(startBudgetMax)"
+                            class="px-3 py-2 bg-slate-200 rounded text-sm"
+                            x-show="startBudgetMax > 0">
+                        Max (<span x-text="startBudgetMax.toFixed(2)"></span>)
+                    </button>
+                </div>
+                <p class="text-xs text-slate-500 mt-2">
+                    Próximo: o bot vai calcular o plano (swap + deposit + short) e te
+                    mostrar pra confirmar antes de qualquer transação on-chain.
+                </p>
+                <div class="mt-4 flex justify-end gap-2">
+                    <button @click="closeStartModal()" class="px-4 py-2 bg-slate-200 rounded">Cancelar</button>
+                    <button @click="loadStartPreview()"
+                            :disabled="startBudget <= 0 || startLoading"
+                            class="px-4 py-2 bg-indigo-600 text-white rounded disabled:opacity-50">
+                        <span x-show="!startLoading">Próximo</span>
+                        <span x-show="startLoading">Calculando…</span>
+                    </button>
+                </div>
+            </div>
+        </template>
+
+        <!-- Stage 2: preview the plan -->
+        <template x-if="startStage === 'preview' && startPreview">
+            <div>
+                <h2 class="text-lg font-bold mb-2">Confirmar plano de operação</h2>
+                <p class="text-xs text-slate-500 mb-4">
+                    Revise os swaps abaixo. O bot só vai executar tudo após você clicar Confirmar.
+                </p>
+
+                <!-- Pool/range -->
+                <div class="rounded border border-slate-200 p-3 mb-3 text-sm">
+                    <div class="font-semibold text-slate-700 mb-1">
+                        Pool <span x-text="startPreview.pool.token0_symbol + '/' + startPreview.pool.token1_symbol"></span>
+                        — fee <span x-text="(startPreview.pool.fee_pct * 100).toFixed(2) + '%'"></span>
+                    </div>
+                    <div class="text-xs text-slate-500 break-all">
+                        <span x-text="startPreview.pool.address"></span>
+                    </div>
+                    <div class="text-xs mt-1"
+                         :class="startPreview.pool.in_range ? 'text-emerald-600' : 'text-amber-600'">
+                        Faixa Beefy:
+                        <span x-text="startPreview.pool.p_a.toFixed(6)"></span> –
+                        <span x-text="startPreview.pool.p_b.toFixed(6)"></span>
+                        (preço atual <span x-text="startPreview.pool.p_now.toFixed(6)"></span>;
+                        <span x-text="startPreview.pool.in_range ? 'in-range' : 'OUT OF RANGE'"></span>)
+                    </div>
+                </div>
+
+                <!-- Swaps -->
+                <div class="font-semibold text-sm mt-3 mb-1">Swap(s) Uniswap V3</div>
+                <template x-for="(s, i) in startPreview.swaps" :key="i">
+                    <div class="rounded border border-slate-200 p-3 mb-2 text-sm">
+                        <div class="flex items-center justify-between font-medium text-slate-700">
+                            <span>
+                                <span class="text-slate-400">#</span><span x-text="i+1"></span>:
+                                <span x-text="s.amount_in_max_usdc.toFixed(2)"></span>
+                                <span x-text="s.token_in_symbol"></span> →
+                                <span x-text="s.amount_out.toFixed(6)"></span>
+                                <span x-text="s.token_out_symbol"></span>
+                            </span>
+                            <span class="text-xs text-slate-500">
+                                fee <span x-text="(s.fee_param/10000).toFixed(2) + '%'"></span>
+                            </span>
+                        </div>
+                        <div class="text-xs text-slate-500 mt-1">
+                            Router: <span class="break-all" x-text="s.router"></span>
+                        </div>
+                        <div class="text-xs text-slate-500">
+                            <span x-text="s.token_in_symbol"></span>: <span class="break-all" x-text="s.token_in_address"></span>
+                        </div>
+                        <div class="text-xs text-slate-500">
+                            <span x-text="s.token_out_symbol"></span>: <span class="break-all" x-text="s.token_out_address"></span>
+                        </div>
+                    </div>
+                </template>
+                <p class="text-xs text-slate-500">
+                    Slippage máximo <span x-text="startPreview.slippage_bps"></span> bps (definido em SLIPPAGE_BPS no .env).
+                </p>
+
+                <!-- Deposit -->
+                <div class="font-semibold text-sm mt-4 mb-1">Depósito Beefy</div>
+                <div class="rounded border border-slate-200 p-3 text-sm">
+                    <div>
+                        <span x-text="startPreview.deposit.amount0_target.toFixed(6)"></span>
+                        <span x-text="startPreview.pool.token0_symbol"></span>
+                        +
+                        <span x-text="startPreview.deposit.amount1_target.toFixed(6)"></span>
+                        <span x-text="startPreview.pool.token1_symbol"></span>
+                    </div>
+                    <div class="text-xs text-slate-500 mt-1">
+                        Vault: <span class="break-all" x-text="startPreview.deposit.vault"></span>
+                    </div>
+                </div>
+
+                <!-- Hedge -->
+                <div class="font-semibold text-sm mt-4 mb-1">Short(s) na dYdX</div>
+                <template x-for="(h, i) in startPreview.hedge" :key="i">
+                    <div class="rounded border border-slate-200 p-3 mb-2 text-sm">
+                        <div>
+                            Sell <span x-text="h.size.toFixed(6)"></span>
+                            <span x-text="h.symbol"></span>
+                            (~$<span x-text="h.notional_usd.toFixed(2)"></span>
+                            @ $<span x-text="h.ref_price_usd.toFixed(2)"></span>)
+                        </div>
+                    </div>
+                </template>
+
+                <div class="mt-4 flex justify-between gap-2">
+                    <button @click="startStage = 'budget'"
+                            class="px-4 py-2 bg-slate-200 rounded">← Voltar</button>
+                    <div class="flex gap-2">
+                        <button @click="closeStartModal()" class="px-4 py-2 bg-slate-200 rounded">Cancelar</button>
+                        <button @click="confirmStart()"
+                                :disabled="startLoading"
+                                class="px-4 py-2 bg-emerald-600 text-white rounded disabled:opacity-50">
+                            <span x-show="!startLoading">Confirmar e executar</span>
+                            <span x-show="startLoading">Executando…</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </template>
+
     </div>
 </div>

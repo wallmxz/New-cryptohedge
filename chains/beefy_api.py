@@ -100,6 +100,11 @@ class BeefyApiFetcher:
         for clm in cows:
             if clm.get("chain") != TARGET_CHAIN:
                 continue
+            # Skip retired/paused vaults — Beefy's own UI hides these by default.
+            # Statuses observed in /cow-vaults: "active" (~78 on Arbitrum) and
+            # "eol" (~65 retired). We only consider active.
+            if clm.get("status") != "active":
+                continue
             try:
                 pair = await self._extract_pair(clm, tvl, apy, active_dydx_tickers, now)
             except (KeyError, IndexError, ValueError) as e:
@@ -205,13 +210,30 @@ class BeefyApiFetcher:
             if candidate is not None and candidate in active_dydx_tickers:
                 token1_perp = candidate
 
-        # Resolve TVL — Beefy keys per chain ID, not chain name
+        # Resolve TVL. Each Beefy CLM has TWO entries in /tvl:
+        #   <id>        = strategy contract holdings (always tiny — just dust)
+        #   <id>-rp     = the Reward Pool / CLM Pool, where users actually deposit
+        # Beefy's own UI shows the -rp value (this is the real user-facing TVL).
+        # We prefer -rp; fall back to base if -rp doesn't exist (rare).
         chain_tvls = tvl_data.get(CHAIN_ID_ARB) or {}
-        tvl_usd = chain_tvls.get(clm.get("id"))
+        clm_id = clm.get("id") or ""
+        tvl_usd = chain_tvls.get(f"{clm_id}-rp")
+        if tvl_usd is None:
+            tvl_usd = chain_tvls.get(clm_id)
 
-        # Resolve APY
-        apy_block = apy_data.get(clm.get("id")) or {}
-        apy_30d = apy_block.get("vaultAprDaily30d") or apy_block.get("vaultApr")
+        # Resolve APY. Beefy renamed fields: legacy vaultApr/vaultAprDaily30d
+        # were replaced by totalApy (compounded annual yield) and clmApr (raw
+        # underlying APR). Beefy's own UI displays totalApy under the "Current
+        # APY" column, so we match that. clmApr is the un-compounded fallback
+        # for vaults that only have it; legacy fields kept for back-compat.
+        # Check both base and -rp entries (the -rp variant has its own block).
+        apy_block = apy_data.get(f"{clm_id}-rp") or apy_data.get(clm_id) or {}
+        apy_30d = (
+            apy_block.get("totalApy")
+            or apy_block.get("clmApr")
+            or apy_block.get("vaultAprDaily30d")
+            or apy_block.get("vaultApr")
+        )
 
         return {
             "vault_id": vault_id,

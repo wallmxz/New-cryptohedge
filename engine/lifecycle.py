@@ -115,6 +115,134 @@ class OperationLifecycle:
                 f"Wallet gas too low: {bal['eth']:.4f} ETH < {GAS_RESERVE_ETH:.4f} ETH reserve"
             )
 
+    async def bootstrap_preview(self, *, usdc_budget: float) -> dict:
+        """Compute the swap+deposit+hedge plan for `usdc_budget` WITHOUT touching
+        the chain. The UI calls this first, shows the plan to the user, and only
+        triggers `bootstrap()` after explicit confirmation.
+
+        Reads pool price, Beefy range, and dYdX oracle prices to size each leg;
+        no transactions are sent.
+        """
+        if (await self._db.get_active_operation()) is not None:
+            raise RuntimeError("Operation already active")
+        await self._check_gas_balance()
+
+        is_dual_leg = bool(self._settings.dydx_symbol_token1)
+        p_now = await self._pool_reader.read_price()
+        beefy_pos = await self._beefy_reader.read_position()
+        p_a = tick_to_price(beefy_pos.tick_lower, self._decimals0, self._decimals1)
+        p_b = tick_to_price(beefy_pos.tick_upper, self._decimals0, self._decimals1)
+        amount_t0_target, amount_t1_target = compute_optimal_split(
+            p=p_now, p_a=p_a, p_b=p_b, total_value_usdc=usdc_budget,
+        )
+
+        slippage_bps = self._settings.slippage_bps
+        slippage = slippage_bps / 10000.0
+        router = self._settings.uniswap_v3_router_address
+        pool_fee = self._settings.uniswap_v3_pool_fee
+        token0_addr = self._settings.token0_address
+        token1_addr = self._settings.token1_address
+        token0_sym_label = self._settings.pool_token0_symbol
+        token1_sym_label = self._settings.pool_token1_symbol
+
+        plan: dict = {
+            "usdc_budget": usdc_budget,
+            "is_dual_leg": is_dual_leg,
+            "pool": {
+                "p_now": p_now,
+                "p_a": p_a,
+                "p_b": p_b,
+                "in_range": p_a < p_now < p_b,
+                "address": self._settings.clm_pool_address,
+                "fee_param": pool_fee,
+                "fee_pct": pool_fee / 1_000_000.0,
+                "token0_symbol": token0_sym_label,
+                "token1_symbol": token1_sym_label,
+            },
+            "router": router,
+            "slippage_bps": slippage_bps,
+            "swaps": [],
+            "deposit": {
+                "vault": self._settings.clm_vault_address,
+                "amount0_target": amount_t0_target,
+                "amount1_target": amount_t1_target,
+            },
+            "hedge": [],
+        }
+
+        if is_dual_leg:
+            token0_sym = self._settings.dydx_symbol_token0
+            token1_sym = self._settings.dydx_symbol_token1
+            oracle = await self._exchange.get_oracle_prices([token0_sym, token1_sym])
+            p0_usd = float(oracle.get(token0_sym, 0.0) or 0.0)
+            p1_usd = float(oracle.get(token1_sym, 0.0) or 0.0)
+
+            usdc_for_t0 = amount_t0_target * p0_usd
+            usdc_for_t1 = amount_t1_target * p1_usd
+            plan["swaps"] = [
+                {
+                    "leg": "token0",
+                    "router": router,
+                    "token_in_symbol": "USDC",
+                    "token_in_address": _USDC_ADDRESS_ARBITRUM,
+                    "token_out_symbol": token0_sym_label,
+                    "token_out_address": token0_addr,
+                    "amount_in_max_usdc": usdc_for_t0 * (1 + slippage),
+                    "amount_out": amount_t0_target,
+                    "fee_param": pool_fee,
+                },
+                {
+                    "leg": "token1",
+                    "router": router,
+                    "token_in_symbol": "USDC",
+                    "token_in_address": _USDC_ADDRESS_ARBITRUM,
+                    "token_out_symbol": token1_sym_label,
+                    "token_out_address": token1_addr,
+                    "amount_in_max_usdc": usdc_for_t1 * (1 + slippage),
+                    "amount_out": amount_t1_target,
+                    "fee_param": pool_fee,
+                },
+            ]
+            plan["hedge"] = [
+                {
+                    "symbol": token0_sym, "side": "sell",
+                    "size": amount_t0_target * self._hub.hedge_ratio,
+                    "ref_price_usd": p0_usd,
+                    "notional_usd": amount_t0_target * self._hub.hedge_ratio * p0_usd,
+                },
+                {
+                    "symbol": token1_sym, "side": "sell",
+                    "size": amount_t1_target * self._hub.hedge_ratio,
+                    "ref_price_usd": p1_usd,
+                    "notional_usd": amount_t1_target * self._hub.hedge_ratio * p1_usd,
+                },
+            ]
+        else:
+            # Single-leg: token1 IS USDC. Only one swap (USDC->token0).
+            usdc_to_swap = max(0.0, usdc_budget - amount_t1_target)
+            plan["swaps"] = [
+                {
+                    "leg": "token0",
+                    "router": router,
+                    "token_in_symbol": token1_sym_label,
+                    "token_in_address": token1_addr,
+                    "token_out_symbol": token0_sym_label,
+                    "token_out_address": token0_addr,
+                    "amount_in_max_usdc": usdc_to_swap * (1 + slippage),
+                    "amount_out": amount_t0_target,
+                    "fee_param": pool_fee,
+                },
+            ]
+            plan["hedge"] = [
+                {
+                    "symbol": self._settings.dydx_symbol_token0, "side": "sell",
+                    "size": amount_t0_target * self._hub.hedge_ratio,
+                    "ref_price_usd": p_now,
+                    "notional_usd": amount_t0_target * self._hub.hedge_ratio * p_now,
+                },
+            ]
+        return plan
+
     async def bootstrap(self, *, usdc_budget: float) -> int:
         """Execute swap -> deposit -> snapshot -> hedge. Returns operation_id.
 

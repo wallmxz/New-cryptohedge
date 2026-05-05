@@ -39,6 +39,16 @@ class Settings:
     slippage_bps: int  # default 30 = 0.3%
     uniswap_v3_pool_fee: int  # 500 = 0.05%, 3000 = 0.30%
 
+    # Lighter exchange config (used when active_exchange == "lighter").
+    # api_private_key is generated via scripts/lighter_setup.py — separate from
+    # WALLET_PRIVATE_KEY (eth) and signs trading orders. Account index is
+    # assigned by Lighter when the eth wallet first deposits. Defaults make
+    # these optional for tests/fixtures that only exercise dYdX paths.
+    lighter_url: str = "https://mainnet.zklighter.elliot.ai"
+    lighter_account_index: int = 0
+    lighter_api_private_key: str = ""
+    lighter_api_key_index: int = 0
+
     @property
     def dydx_symbol(self) -> str:
         """Legacy alias for dydx_symbol_token0. Use the typed field directly
@@ -94,4 +104,10 @@ class Settings:
             token1_decimals=int(os.environ.get("TOKEN1_DECIMALS", "6")),
             slippage_bps=int(os.environ.get("SLIPPAGE_BPS", "30")),
             uniswap_v3_pool_fee=int(os.environ.get("UNISWAP_V3_POOL_FEE", "500")),
+            lighter_url=os.environ.get(
+                "LIGHTER_URL", "https://mainnet.zklighter.elliot.ai",
+            ),
+            lighter_account_index=int(os.environ.get("LIGHTER_ACCOUNT_INDEX", "0")),
+            lighter_api_private_key=os.environ.get("LIGHTER_API_PRIVATE_KEY", ""),
+            lighter_api_key_index=int(os.environ.get("LIGHTER_API_KEY_INDEX", "0")),
         )

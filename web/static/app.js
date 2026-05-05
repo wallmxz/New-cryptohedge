@@ -52,6 +52,10 @@ function dashboard() {
         showStartModal: false,
         startBudget: 300.0,
         startBudgetMax: 0.0,
+        // Two-stage start flow: 'budget' (input) -> 'preview' (review plan)
+        startStage: 'budget',
+        startPreview: null,
+        startLoading: false,
 
         showPairPicker: false,
         pairsData: { usd_pairs: [], cross_pairs: [], selected_vault_id: null, last_refresh_ts: 0 },
@@ -170,6 +174,10 @@ function dashboard() {
         },
 
         async openStartModal() {
+            // Reset two-stage state every open
+            this.startStage = 'budget';
+            this.startPreview = null;
+            this.startLoading = false;
             try {
                 const resp = await fetch("/wallet");
                 if (resp.ok) {
@@ -183,7 +191,39 @@ function dashboard() {
             this.showStartModal = true;
         },
 
+        closeStartModal() {
+            this.showStartModal = false;
+            this.startStage = 'budget';
+            this.startPreview = null;
+            this.startLoading = false;
+        },
+
+        // Stage 1 → Stage 2: fetch the plan, no on-chain action.
+        async loadStartPreview() {
+            this.startLoading = true;
+            try {
+                const resp = await fetch("/operations/preview", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({usdc_budget: this.startBudget}),
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    alert("Erro ao calcular plano: " + (data.error || resp.status));
+                    return;
+                }
+                this.startPreview = data;
+                this.startStage = 'preview';
+            } catch (e) {
+                alert("Erro: " + e);
+            } finally {
+                this.startLoading = false;
+            }
+        },
+
+        // Stage 2 → execute: send transactions on-chain.
         async confirmStart() {
+            this.startLoading = true;
             try {
                 const resp = await fetch("/operations/start", {
                     method: "POST",
@@ -195,9 +235,11 @@ function dashboard() {
                     alert("Erro ao iniciar: " + (err.error || resp.status));
                     return;
                 }
-                this.showStartModal = false;
+                this.closeStartModal();
             } catch (e) {
                 alert("Erro: " + e);
+            } finally {
+                this.startLoading = false;
             }
         },
 

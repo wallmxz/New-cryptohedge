@@ -66,8 +66,29 @@ def format_pair_for_ui(raw: dict) -> dict:
             selectable = True
             reason = None
 
-    # Convert pool_fee from bps to pct (e.g., 500 -> 0.05)
-    pool_fee_pct = (raw.get("pool_fee") or 0) / 10000.0
+    # Convert Uniswap V3 pool_fee parameter (pip-millionths, e.g. 500) to a
+    # fraction (e.g. 0.0005 = 0.05%). The router takes the integer; for display
+    # we want the percent. NOTE: Uniswap's fee tiers are in millionths, NOT
+    # basis points — 500 = 0.05% (5 bps), not 5%. A previous version of this
+    # code divided by 10000 and produced "5.00%" displays for the 0.05% pool.
+    pool_fee_frac = (raw.get("pool_fee") or 0) / 1_000_000.0
+
+    # Beefy CLMs sit on top of multiple V3 DEXes (Uniswap, Sushi, Camelot,
+    # PancakeSwap). The underlying DEX comes from `manager` (= tokenProviderId
+    # in Beefy /cow-vaults), which we capitalize for display. "Beefy" is shown
+    # as the strategy platform — the LP itself is on the underlying DEX.
+    dex_raw = (raw.get("manager") or "").strip()
+    dex_label_map = {
+        "uniswap": "Uniswap V3",
+        "sushi": "SushiSwap V3",
+        "camelot": "Camelot V3",
+        "pancakeswap": "PancakeSwap V3",
+    }
+    dex = dex_label_map.get(dex_raw.lower(), dex_raw.title() if dex_raw else "—")
+
+    # When pool_fee parses to 0 (e.g., feeTier="Dynamic" for Camelot), surface
+    # that distinction so the UI shows "Dynamic" instead of "0.00%".
+    pool_fee_label = "Dynamic" if pool_fee_frac == 0 else f"{pool_fee_frac * 100:.2f}%"
 
     return {
         "vault_id": raw.get("vault_id"),
@@ -78,9 +99,10 @@ def format_pair_for_ui(raw: dict) -> dict:
         "token1_address": raw.get("token1_address"),
         "token0_decimals": raw.get("token0_decimals"),
         "token1_decimals": raw.get("token1_decimals"),
-        "manager": raw.get("manager") or "—",
-        "dex": "Uniswap V3",  # only DEX supported today
-        "pool_fee_pct": pool_fee_pct,
+        "manager": "Beefy",
+        "dex": dex,
+        "pool_fee_pct": pool_fee_frac,
+        "pool_fee_label": pool_fee_label,
         "pool_address": raw.get("pool_address"),
         "tvl_usd": raw.get("tvl_usd"),
         "apy_30d": raw.get("apy_30d"),

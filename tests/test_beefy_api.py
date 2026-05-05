@@ -30,6 +30,7 @@ def _arb_clm_payload():
         {
             "id": "cow-uniswap-arb-eth-usdc",
             "chain": "arbitrum",
+            "status": "active",
             "earnContractAddress": "0xVAULT1",
             "tokenAddress": "0xPOOL1",
             "depositTokenAddresses": [
@@ -42,6 +43,7 @@ def _arb_clm_payload():
         {
             "id": "cow-uniswap-arb-arb-eth",
             "chain": "arbitrum",
+            "status": "active",
             "earnContractAddress": "0xVAULT2",
             "depositTokenAddresses": [
                 "0x912CE59144191C1204E64559FE8253a0e49E6548",  # ARB
@@ -142,6 +144,7 @@ async def test_refresh_skips_vaults_with_unresolvable_token(mock_db):
         {
             "id": "cow-uniswap-arb-rare-usdc",
             "chain": "arbitrum",
+            "status": "active",
             "earnContractAddress": "0xRARE",
             "depositTokenAddresses": [
                 "0x9999999999999999999999999999999999999999",  # not in mock cache
@@ -168,6 +171,7 @@ async def test_refresh_skips_vaults_without_dydx_perp(mock_db):
         {
             "id": "cow-uniswap-arb-weth-arb",
             "chain": "arbitrum",
+            "status": "active",
             "earnContractAddress": "0xV_NO_PERP_TOKEN0",
             "depositTokenAddresses": [
                 "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",  # WETH (resolvable)
@@ -197,6 +201,7 @@ async def test_extract_pair_populates_dydx_perp_token1_for_cross_pair(mock_db):
         "earnContractAddress": "0xV1",
         "id": "test-arb-weth",
         "chain": "arbitrum",
+            "status": "active",
         "tokenAddress": "0xPOOL",
         "depositTokenAddresses": [
             "0x912CE59144191C1204E64559FE8253a0e49E6548",  # ARB
@@ -226,6 +231,7 @@ async def test_extract_pair_dydx_perp_token1_null_for_usd_pair(mock_db):
         "earnContractAddress": "0xV2",
         "id": "test-weth-usdc",
         "chain": "arbitrum",
+            "status": "active",
         "tokenAddress": "0xPOOL2",
         "depositTokenAddresses": [
             "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",  # WETH

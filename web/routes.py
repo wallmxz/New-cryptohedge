@@ -131,6 +131,37 @@ async def get_current_operation(request: Request):
     })
 
 
+async def preview_operation(request: Request):
+    """POST /operations/preview {usdc_budget} → returns the swap+deposit+hedge
+    plan without sending any transactions. The UI shows this to the user for
+    explicit confirmation before /operations/start is called."""
+    if not hasattr(request.app.state, "engine"):
+        return JSONResponse(
+            {"error": "Engine not running (set START_ENGINE=true)"}, status_code=503,
+        )
+    engine = request.app.state.engine
+    if engine._lifecycle is None:
+        return JSONResponse({"error": "Lifecycle not configured"}, status_code=503)
+
+    try:
+        body = await request.json()
+        usdc_budget = float(body.get("usdc_budget", 0))
+    except Exception:
+        return JSONResponse({"error": "Body must be {usdc_budget: number}"}, status_code=400)
+    if usdc_budget <= 0:
+        return JSONResponse({"error": "usdc_budget must be positive"}, status_code=400)
+
+    try:
+        plan = await engine._lifecycle.bootstrap_preview(usdc_budget=usdc_budget)
+        return JSONResponse(plan, status_code=200)
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).exception(f"preview_operation failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 async def start_operation(request: Request):
     if not hasattr(request.app.state, "engine"):
         return JSONResponse(

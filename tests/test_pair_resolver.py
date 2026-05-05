@@ -73,7 +73,9 @@ def test_format_pair_for_ui_usd_pair():
     formatted = format_pair_for_ui(raw)
     assert formatted["pair"] == "WETH-USDC"
     assert formatted["selectable"] is True
-    assert formatted["pool_fee_pct"] == 0.05  # 500 bps
+    # Uniswap V3 fee param 500 = 0.05% = 0.0005 fraction (NOT 5%)
+    assert formatted["pool_fee_pct"] == 0.0005
+    assert formatted["pool_fee_label"] == "0.05%"
     assert formatted["dydx_perp"] == "ETH-USD"
 
 

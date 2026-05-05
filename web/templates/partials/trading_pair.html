@@ -12,12 +12,13 @@
             </div>
             <div class="min-w-0">
                 <p class="text-xs text-slate-400 uppercase tracking-wider">Trading Pair</p>
-                <template x-if="pairsData.selected_vault_id">
-                    <p class="text-base font-semibold text-slate-800 truncate" x-text="selectedPairLabel || '…'"></p>
-                </template>
-                <template x-if="!pairsData.selected_vault_id">
-                    <p class="text-sm text-slate-400 italic">Nenhum par selecionado — escolha pra começar</p>
-                </template>
+                <p class="text-base font-semibold text-slate-800 truncate"
+                   x-show="pairsData.selected_vault_id"
+                   x-text="selectedPairLabel || '...'"></p>
+                <p class="text-sm text-slate-400 italic"
+                   x-show="!pairsData.selected_vault_id">
+                    Nenhum par selecionado &mdash; escolha pra come&ccedil;ar
+                </p>
             </div>
         </div>
         <div class="flex items-center gap-2">
