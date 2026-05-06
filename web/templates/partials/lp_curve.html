@@ -1,5 +1,8 @@
-<!-- LP Curve: V3 range + grid de ordens. Renderizado via Chart.js
-     contra GET /curve. Atualiza a cada 5s. -->
+<!-- LP Curve V3: continuous exposure curve + grid orders anchored on it.
+     X axis: price. Y axis: token0 exposure of the LP at that price (=
+     `x(p) = L * (1/sqrt(p) - 1/sqrt(p_b))`). The line is the V3 curve;
+     each point is a grid order placed at the price level where the bot
+     reposts its short. -->
 <div class="bg-white rounded-lg shadow p-4 mb-5"
      x-data="{
         curve: null,
@@ -28,56 +31,98 @@
         render() {
             if (!this.curve || !window.Chart) return;
             const c = this.curve;
-            const buys = c.grid.filter(g => g.side === 'buy');
-            const sells = c.grid.filter(g => g.side === 'sell');
+            // Continuous V3 exposure curve (line)
+            const curveLine = c.curve_samples.map(s => ({x: s.price, y: s.x_token0}));
+            // Grid orders anchored on the curve
+            const buys  = c.grid.filter(g => g.side === 'buy')
+                             .map(g => ({x: g.price, y: g.x_token0}));
+            const sells = c.grid.filter(g => g.side === 'sell')
+                             .map(g => ({x: g.price, y: g.x_token0}));
+            // Current position dot
+            const nowPoint = (c.position.x_token0_now > 0)
+                ? [{x: c.pool.p_now, y: c.position.x_token0_now}]
+                : [];
+
             const datasets = [
                 {
-                    label: 'Buys (close short)',
-                    data: buys.map(g => ({x: g.price, y: g.size})),
-                    backgroundColor: 'rgba(16, 185, 129, 0.7)',
-                    borderColor: 'rgb(16, 185, 129)',
-                    pointRadius: 4,
-                    pointHoverRadius: 6,
-                    showLine: false,
+                    label: 'Curva LP V3 (exposição em ' + c.pool.token0_symbol + ')',
+                    data: curveLine,
+                    borderColor: 'rgb(99, 102, 241)',
+                    backgroundColor: 'rgba(99, 102, 241, 0.08)',
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    fill: true,
+                    tension: 0.3,
+                    type: 'line',
+                    order: 3,
                 },
                 {
-                    label: 'Sells (open short)',
-                    data: sells.map(g => ({x: g.price, y: g.size})),
-                    backgroundColor: 'rgba(239, 68, 68, 0.7)',
-                    borderColor: 'rgb(239, 68, 68)',
+                    label: 'Buys (fecham short conforme preço sobe)',
+                    data: buys,
+                    backgroundColor: 'rgba(16, 185, 129, 0.9)',
+                    borderColor: 'rgb(5, 122, 85)',
                     pointRadius: 4,
-                    pointHoverRadius: 6,
+                    pointHoverRadius: 7,
                     showLine: false,
+                    type: 'scatter',
+                    order: 2,
+                },
+                {
+                    label: 'Sells (abrem short conforme preço cai)',
+                    data: sells,
+                    backgroundColor: 'rgba(239, 68, 68, 0.9)',
+                    borderColor: 'rgb(185, 28, 28)',
+                    pointRadius: 4,
+                    pointHoverRadius: 7,
+                    showLine: false,
+                    type: 'scatter',
+                    order: 1,
+                },
+                {
+                    label: 'Posição atual',
+                    data: nowPoint,
+                    backgroundColor: 'rgb(99, 102, 241)',
+                    borderColor: '#fff',
+                    borderWidth: 2,
+                    pointRadius: 7,
+                    pointHoverRadius: 10,
+                    showLine: false,
+                    type: 'scatter',
+                    order: 0,
                 },
             ];
+
             const cfg = {
                 type: 'scatter',
                 data: { datasets },
                 options: {
                     responsive: true,
                     maintainAspectRatio: false,
+                    interaction: { mode: 'nearest', intersect: false },
                     scales: {
                         x: {
                             type: 'linear',
                             title: { display: true, text:
                                 'Preço ' + c.pool.token0_symbol + '/' + c.pool.token1_symbol },
-                            min: c.pool.p_a * 0.995,
-                            max: c.pool.p_b * 1.005,
+                            min: c.pool.p_a * 0.998,
+                            max: c.pool.p_b * 1.002,
                         },
                         y: {
                             title: { display: true, text:
-                                'Tamanho da ordem (' + c.pool.token0_symbol + ')' },
+                                'Exposição da LP em ' + c.pool.token0_symbol +
+                                ' (= short ideal pra hedge)' },
                             beginAtZero: true,
                         },
                     },
                     plugins: {
-                        legend: { position: 'top' },
+                        legend: { position: 'top', labels: { boxWidth: 12 } },
                         tooltip: {
                             callbacks: {
                                 label: function(ctx) {
-                                    return ctx.dataset.label + ': ' +
-                                        ctx.parsed.y.toFixed(6) + ' @ ' +
-                                        ctx.parsed.x.toFixed(6);
+                                    const lbl = ctx.dataset.label || '';
+                                    return lbl + ': ' + ctx.parsed.y.toFixed(6) +
+                                        ' ' + c.pool.token0_symbol +
+                                        ' @ ' + ctx.parsed.x.toFixed(6);
                                 },
                             },
                         },
@@ -86,26 +131,48 @@
                                 pNow: {
                                     type: 'line',
                                     xMin: c.pool.p_now, xMax: c.pool.p_now,
-                                    borderColor: 'rgb(99, 102, 241)',
+                                    borderColor: 'rgba(99, 102, 241, 0.7)',
                                     borderWidth: 2,
                                     borderDash: [5,5],
                                     label: {
-                                        content: 'preço atual ' + c.pool.p_now.toFixed(6),
-                                        enabled: true,
+                                        content: 'preço atual',
+                                        display: true,
                                         position: 'start',
+                                        backgroundColor: 'rgba(99, 102, 241, 0.85)',
+                                        color: '#fff',
+                                        font: {size: 10},
+                                        padding: 3,
                                     },
                                 },
                                 pA: {
                                     type: 'line',
                                     xMin: c.pool.p_a, xMax: c.pool.p_a,
-                                    borderColor: 'rgba(100,116,139,0.5)',
+                                    borderColor: 'rgba(100,116,139,0.6)',
                                     borderWidth: 1,
+                                    label: {
+                                        content: 'p_a',
+                                        display: true,
+                                        position: 'end',
+                                        backgroundColor: 'rgba(100,116,139,0.85)',
+                                        color: '#fff',
+                                        font: {size: 10},
+                                        padding: 2,
+                                    },
                                 },
                                 pB: {
                                     type: 'line',
                                     xMin: c.pool.p_b, xMax: c.pool.p_b,
-                                    borderColor: 'rgba(100,116,139,0.5)',
+                                    borderColor: 'rgba(100,116,139,0.6)',
                                     borderWidth: 1,
+                                    label: {
+                                        content: 'p_b',
+                                        display: true,
+                                        position: 'end',
+                                        backgroundColor: 'rgba(100,116,139,0.85)',
+                                        color: '#fff',
+                                        font: {size: 10},
+                                        padding: 2,
+                                    },
                                 },
                             },
                         },
@@ -120,7 +187,7 @@
      x-init="load(); setInterval(() => load(), 5000)">
 
     <div class="flex items-center justify-between mb-2">
-        <h2 class="text-lg font-bold">Curva LP & Grid de ordens</h2>
+        <h2 class="text-lg font-bold">Curva LP V3 & Grid de ordens</h2>
         <button @click="load()" :disabled="loading"
                 class="text-xs px-3 py-1 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50">
             <span x-show="!loading">🔄 Atualizar</span>
@@ -160,7 +227,7 @@
             </div>
 
             <!-- Chart -->
-            <div class="relative" style="height: 280px;">
+            <div class="relative" style="height: 320px;">
                 <canvas id="lp-curve-chart"></canvas>
             </div>
 
@@ -194,9 +261,13 @@
             </div>
 
             <p class="text-[11px] text-slate-500 italic mt-2">
-                Cada ponto = 1 ordem maker. Acima do preço atual: buys (fecham short conforme preço sobe).
-                Abaixo: sells (abrem short conforme preço cai). Tamanho de cada ordem ≈
-                $<span x-text="curve.min_notional_usd.toFixed(2)"></span> de notional.
+                A linha é a <strong>exposição da LP em <span x-text="curve.pool.token0_symbol"></span></strong>
+                conforme o preço varia: em <span class="font-mono" x-text="curve.pool.p_a.toFixed(2)"></span> a
+                LP é 100% <span x-text="curve.pool.token0_symbol"></span>; em
+                <span class="font-mono" x-text="curve.pool.p_b.toFixed(2)"></span> a LP é 100%
+                <span x-text="curve.pool.token1_symbol"></span>. Cada ponto = 1 ordem maker
+                replicando essa curva no perp pra manter o delta neutro.
+                Notional alvo por ordem ≈ $<span x-text="curve.min_notional_usd.toFixed(2)"></span>.
             </p>
         </div>
     </template>

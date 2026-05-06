@@ -168,12 +168,33 @@ class GridMakerEngine:
         # No grid possible if out of range or no value.
         in_range = p_a < p_now < p_b
         grid_payload = []
+        curve_samples: list[dict] = []
+        L_value = 0.0
+        x_now = 0.0
         if in_range and my_value_t1 > 0:
             try:
                 L = compute_l_from_value(my_value_t1, p_a, p_b, p_now)
-                # Min notional defaults to $3 — the dYdX minimum used in
-                # production. Lighter is similar. The exact value comes
-                # from the exchange but for visualization $3 is fine.
+                L_value = L
+                x_now = compute_x(L, p_now, p_b)
+                # Sample the V3 curve uniformly across [p_a, p_b]. The y-axis
+                # is exposure in token0 (`x(p) = L*(1/√p − 1/√p_b)`),
+                # which is what the bot has to hedge with shorts. Curve
+                # decreases monotonically: at p_a the LP is 100% token0
+                # (max hedge needed), at p_b it's 100% token1 (zero hedge).
+                n_samples = 80
+                for i in range(n_samples + 1):
+                    p = p_a + (p_b - p_a) * (i / n_samples)
+                    # Avoid singularity at the edges
+                    if p <= p_a:
+                        p = p_a + (p_b - p_a) * 1e-6
+                    if p >= p_b:
+                        p = p_b - (p_b - p_a) * 1e-6
+                    curve_samples.append({
+                        "price": p,
+                        "x_token0": compute_x(L, p, p_b),
+                        "y_token1": compute_y(L, p, p_a),
+                    })
+
                 min_notional = 3.0
                 max_orders = self._settings.max_open_orders or 200
                 levels = compute_target_grid(
@@ -181,10 +202,16 @@ class GridMakerEngine:
                     hedge_ratio=self._hub.hedge_ratio or 1.0,
                     min_notional_usd=min_notional, max_orders=max_orders,
                 )
+                # Anchor each grid order on the curve (price, x_token0).
+                # `target_short` is the cumulative short the bot SHOULD
+                # hold once price reaches that level — matches `x(p)`.
                 grid_payload = [
                     {
-                        "price": lv.price, "side": lv.side, "size": lv.size,
-                        "target_short": lv.target_short,
+                        "price": lv.price,
+                        "side": lv.side,
+                        "size": lv.size,                # base units per order
+                        "target_short": lv.target_short, # cumulative short
+                        "x_token0": compute_x(L, lv.price, p_b),  # for plotting
                     }
                     for lv in levels
                 ]
@@ -204,7 +231,10 @@ class GridMakerEngine:
                 "my_amount0": my_amount0, "my_amount1": my_amount1,
                 "pool_value_usd": pool_value_usd,
                 "share": beefy_pos.share,
+                "L": L_value,
+                "x_token0_now": x_now,  # current LP token0 exposure
             },
+            "curve_samples": curve_samples,
             "grid": grid_payload,
             "is_dual_leg": is_dual_leg,
             "hedge_ratio": self._hub.hedge_ratio or 1.0,
