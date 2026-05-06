@@ -23,6 +23,8 @@ def _install_lighter_stub() -> None:
         ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL = 0
         ORDER_TIME_IN_FORCE_GOOD_TILL_TIME = 1
         ORDER_TIME_IN_FORCE_POST_ONLY = 2
+        DEFAULT_IOC_EXPIRY = 0
+        DEFAULT_28_DAY_ORDER_EXPIRY = -1
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs

@@ -7,7 +7,66 @@
         <template x-if="startStage === 'budget'">
             <div>
                 <h2 class="text-lg font-bold mb-4">Iniciar nova operação</h2>
-                <label class="block mb-2 text-sm font-medium">Capital (USDC)</label>
+
+                <!-- Wallet breakdown: total USD value across all assets the
+                     bot can use (native USDC + token0 in USD + token1 in
+                     USD). The Max button uses this total as the ceiling. -->
+                <template x-if="startWallet">
+                    <div class="rounded border border-slate-200 p-3 mb-4 text-sm bg-slate-50">
+                        <div class="flex items-baseline justify-between mb-2">
+                            <span class="font-semibold text-slate-700">Valor total na wallet</span>
+                            <span class="text-lg font-mono font-semibold text-emerald-700">
+                                $<span x-text="(startWallet.total_usd || 0).toFixed(2)"></span>
+                            </span>
+                        </div>
+                        <div class="text-xs text-slate-600 space-y-0.5">
+                            <div class="flex justify-between">
+                                <span>USDC</span>
+                                <span class="font-mono"
+                                      x-text="'$' + (startWallet.usdc_balance || 0).toFixed(2)"></span>
+                            </div>
+                            <template x-if="startWallet.is_dual_leg && (startWallet.token0_balance || 0) > 0">
+                                <div class="flex justify-between">
+                                    <span>
+                                        <span x-text="(startWallet.token0_balance || 0).toFixed(6)"></span>
+                                        <span x-text="startWallet.token0_symbol"></span>
+                                        @ $<span x-text="(startWallet.token0_usd_price || 0).toFixed(2)"></span>
+                                    </span>
+                                    <span class="font-mono"
+                                          x-text="'$' + ((startWallet.token0_balance || 0) * (startWallet.token0_usd_price || 0)).toFixed(2)"></span>
+                                </div>
+                            </template>
+                            <template x-if="startWallet.is_dual_leg && (startWallet.token1_balance || 0) > 0">
+                                <div class="flex justify-between">
+                                    <span>
+                                        <span x-text="(startWallet.token1_balance || 0).toFixed(6)"></span>
+                                        <span x-text="startWallet.token1_symbol"></span>
+                                        @ $<span x-text="(startWallet.token1_usd_price || 0).toFixed(2)"></span>
+                                    </span>
+                                    <span class="font-mono"
+                                          x-text="'$' + ((startWallet.token1_balance || 0) * (startWallet.token1_usd_price || 0)).toFixed(2)"></span>
+                                </div>
+                            </template>
+                            <template x-if="!startWallet.is_dual_leg && (startWallet.token0_balance || 0) > 0">
+                                <div class="flex justify-between">
+                                    <span>
+                                        <span x-text="(startWallet.token0_balance || 0).toFixed(6)"></span>
+                                        <span x-text="startWallet.token0_symbol"></span>
+                                        @ $<span x-text="(startWallet.token0_usd_price || 0).toFixed(2)"></span>
+                                    </span>
+                                    <span class="font-mono"
+                                          x-text="'$' + ((startWallet.token0_balance || 0) * (startWallet.token0_usd_price || 0)).toFixed(2)"></span>
+                                </div>
+                            </template>
+                        </div>
+                        <p class="text-[11px] text-slate-500 mt-2 italic">
+                            Bot vai usar tokens existentes primeiro e só
+                            faz swap pelo que faltar.
+                        </p>
+                    </div>
+                </template>
+
+                <label class="block mb-2 text-sm font-medium">Notional (USD)</label>
                 <div class="flex gap-2">
                     <input type="number" x-model.number="startBudget"
                            class="flex-1 px-3 py-2 border rounded"
@@ -15,7 +74,7 @@
                     <button @click="startBudget = Math.floor(startBudgetMax)"
                             class="px-3 py-2 bg-slate-200 rounded text-sm"
                             x-show="startBudgetMax > 0">
-                        Max (<span x-text="startBudgetMax.toFixed(2)"></span>)
+                        Max ($<span x-text="startBudgetMax.toFixed(2)"></span>)
                     </button>
                 </div>
                 <p class="text-xs text-slate-500 mt-2">
@@ -38,8 +97,11 @@
         <template x-if="startStage === 'preview' && startPreview">
             <div>
                 <h2 class="text-lg font-bold mb-2">Confirmar plano de operação</h2>
-                <p class="text-xs text-slate-500 mb-4">
+                <p class="text-xs text-slate-500 mb-1">
                     Revise os swaps abaixo. O bot só vai executar tudo após você clicar Confirmar.
+                </p>
+                <p class="text-xs text-slate-400 mb-4" x-show="startPreviewAt">
+                    Cotação calculada em <span x-text="startPreviewAt"></span>. Clique 🔄 Recalcular pra atualizar.
                 </p>
 
                 <!-- Pool/range -->
@@ -61,10 +123,76 @@
                     </div>
                 </div>
 
+                <!-- Per-leg sourcing (dual-leg only). Show strategy options
+                     only when the wallet already holds some of that token —
+                     otherwise the only sensible action is a full swap, so we
+                     just say so without making the user click anything. -->
+                <template x-if="startPreview.is_dual_leg">
+                    <div class="rounded border border-slate-200 p-3 mb-3 text-sm">
+                        <div class="font-semibold text-slate-700 mb-2">De onde vêm os tokens?</div>
+
+                        <!-- Token0 leg -->
+                        <div class="mb-3 last:mb-0">
+                            <div class="flex items-baseline justify-between mb-2">
+                                <span class="font-medium text-slate-700"
+                                      x-text="startPreview.pool.token0_symbol"></span>
+                                <span class="text-xs text-slate-500">
+                                    alvo <span class="font-mono" x-text="(startPreview.deposit.amount0_target || 0).toFixed(6)"></span>
+                                    · saldo <span class="font-mono" x-text="((startPreview.wallet && startPreview.wallet.token0_balance) || 0).toFixed(6)"></span>
+                                </span>
+                            </div>
+                            <template x-if="((startPreview.wallet && startPreview.wallet.token0_balance) || 0) <= 1e-9">
+                                <div class="text-xs text-slate-500 italic">
+                                    Sem saldo — bot vai fazer o swap completo (USDC → <span x-text="startPreview.pool.token0_symbol"></span>).
+                                </div>
+                            </template>
+                            <template x-if="((startPreview.wallet && startPreview.wallet.token0_balance) || 0) > 1e-9">
+                                <div class="grid grid-cols-3 gap-1 bg-slate-100 rounded p-1">
+                                    <button type="button"
+                                            @click="startSwapStrategy.token0 = 'use_existing'"
+                                            :class="startSwapStrategy.token0 === 'use_existing' ? 'bg-white shadow-sm font-semibold text-indigo-700' : 'text-slate-600 hover:bg-white/60'"
+                                            class="px-2 py-2 rounded text-xs transition text-center">
+                                        Usar o que tenho
+                                        <div class="font-mono text-[10px] text-slate-500 mt-0.5"
+                                             x-text="((startPreview.wallet && startPreview.wallet.token0_balance) || 0).toFixed(6)"></div>
+                                    </button>
+                                    <button type="button"
+                                            @click="startSwapStrategy.token0 = 'swap_diff'"
+                                            :class="startSwapStrategy.token0 === 'swap_diff' ? 'bg-white shadow-sm font-semibold text-indigo-700' : 'text-slate-600 hover:bg-white/60'"
+                                            class="px-2 py-2 rounded text-xs transition text-center">
+                                        Comprar a diferença
+                                        <div class="font-mono text-[10px] text-slate-500 mt-0.5"
+                                             x-text="Math.max(0, (startPreview.deposit.amount0_target || 0) - ((startPreview.wallet && startPreview.wallet.token0_balance) || 0)).toFixed(6)"></div>
+                                    </button>
+                                    <button type="button"
+                                            @click="startSwapStrategy.token0 = 'full_swap'"
+                                            :class="startSwapStrategy.token0 === 'full_swap' ? 'bg-white shadow-sm font-semibold text-indigo-700' : 'text-slate-600 hover:bg-white/60'"
+                                            class="px-2 py-2 rounded text-xs transition text-center">
+                                        Comprar tudo
+                                        <div class="font-mono text-[10px] text-slate-500 mt-0.5"
+                                             x-text="(startPreview.deposit.amount0_target || 0).toFixed(6)"></div>
+                                    </button>
+                                </div>
+                            </template>
+                        </div>
+
+                        <!-- Token1 leg: in dual-leg mode the Beefy CLM v2
+                             vault zaps internally, so we don't pre-acquire
+                             token1 anymore. Show the user a note instead. -->
+                        <div class="text-xs text-slate-500 italic">
+                            <span x-text="startPreview.pool.token1_symbol"></span>:
+                            o vault da Beefy faz o swap interno do alvo
+                            (<span class="font-mono" x-text="(startPreview.deposit.amount1_target || 0).toFixed(6)"></span>)
+                            a partir do <span x-text="startPreview.pool.token0_symbol"></span> depositado.
+                        </div>
+                    </div>
+                </template>
+
                 <!-- Swaps -->
                 <div class="font-semibold text-sm mt-3 mb-1">Swap(s) Uniswap V3</div>
                 <template x-for="(s, i) in startPreview.swaps" :key="i">
-                    <div class="rounded border border-slate-200 p-3 mb-2 text-sm">
+                    <div class="rounded border border-slate-200 p-3 mb-2 text-sm"
+                         :class="(startPreview.is_dual_leg && startSwapStrategy[s.leg] === 'use_existing') ? 'opacity-60 bg-slate-50' : ''">
                         <div class="flex items-center justify-between font-medium text-slate-700">
                             <span>
                                 <span class="text-slate-400">#</span><span x-text="i+1"></span>:
@@ -77,6 +205,26 @@
                                 fee <span x-text="(s.fee_param/10000).toFixed(2) + '%'"></span>
                             </span>
                         </div>
+                        <!-- Strategy badge per leg in dual-leg mode -->
+                        <template x-if="startPreview.is_dual_leg && s.leg">
+                            <div class="text-xs mt-1">
+                                <template x-if="startSwapStrategy[s.leg] === 'use_existing'">
+                                    <span class="inline-block px-2 py-0.5 rounded bg-slate-200 text-slate-600">
+                                        skip — usar saldo existente
+                                    </span>
+                                </template>
+                                <template x-if="startSwapStrategy[s.leg] === 'full_swap'">
+                                    <span class="inline-block px-2 py-0.5 rounded bg-indigo-100 text-indigo-700">
+                                        swap 100% (alvo total)
+                                    </span>
+                                </template>
+                                <template x-if="startSwapStrategy[s.leg] === 'swap_diff'">
+                                    <span class="inline-block px-2 py-0.5 rounded bg-emerald-100 text-emerald-700">
+                                        swap diff (alvo − saldo)
+                                    </span>
+                                </template>
+                            </div>
+                        </template>
                         <div class="text-xs text-slate-500 mt-1">
                             Router: <span class="break-all" x-text="s.router"></span>
                         </div>
@@ -108,7 +256,9 @@
                 </div>
 
                 <!-- Hedge -->
-                <div class="font-semibold text-sm mt-4 mb-1">Short(s) na dYdX</div>
+                <div class="font-semibold text-sm mt-4 mb-1">
+                    Short(s) na <span x-text="(config.active_exchange || 'dydx') === 'lighter' ? 'Lighter' : 'dYdX'"></span>
+                </div>
                 <template x-for="(h, i) in startPreview.hedge" :key="i">
                     <div class="rounded border border-slate-200 p-3 mb-2 text-sm">
                         <div>
@@ -124,6 +274,13 @@
                     <button @click="startStage = 'budget'"
                             class="px-4 py-2 bg-slate-200 rounded">← Voltar</button>
                     <div class="flex gap-2">
+                        <button @click="loadStartPreview()"
+                                :disabled="startLoading"
+                                class="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-sm disabled:opacity-50"
+                                title="Recalcula preço/saldos com cotação ao vivo">
+                            <span x-show="!startLoading">🔄 Recalcular</span>
+                            <span x-show="startLoading">Atualizando…</span>
+                        </button>
                         <button @click="closeStartModal()" class="px-4 py-2 bg-slate-200 rounded">Cancelar</button>
                         <button @click="confirmStart()"
                                 :disabled="startLoading"

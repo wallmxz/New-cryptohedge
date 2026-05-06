@@ -51,7 +51,10 @@ async def test_bootstrap_dual_leg_does_two_swaps_sequentially(cross_pair_setting
     uniswap._w3 = MagicMock()
     uniswap._w3.eth.get_balance = AsyncMock(return_value=10**16)  # 0.01 ETH gas
     uniswap._erc20 = MagicMock(return_value=MagicMock())
-    uniswap._erc20.return_value.functions.balanceOf.return_value.call = AsyncMock(return_value=300 * 10**6)
+    # Wallet has 0 of token0 and token1 — both bootstrap legs need to swap.
+    # With pre-existing balance, the strategy-driven 'swap_diff' default
+    # would skip a leg when wallet covers ≥99% of target.
+    uniswap._erc20.return_value.functions.balanceOf.return_value.call = AsyncMock(return_value=0)
     uniswap.address = "0xWALLET"
     async def _swap(**kwargs):
         swap_calls.append(kwargs)
@@ -66,8 +69,12 @@ async def test_bootstrap_dual_leg_does_two_swaps_sequentially(cross_pair_setting
     pool = MagicMock()
     pool.read_price = AsyncMock(return_value=0.000375)
     beefy_reader = MagicMock()
+    # Range chosen so p_now (0.000375) lies inside [tick_to_price(-80000),
+    # tick_to_price(-78000)] = [~3.35e-4, ~4.10e-4]. This makes
+    # compute_optimal_split allocate value to BOTH tokens, so both swap legs
+    # have non-zero targets and the bootstrap fires both.
     beefy_reader.read_position = AsyncMock(return_value=MagicMock(
-        tick_lower=-201386, tick_upper=-198363,
+        tick_lower=-80000, tick_upper=-78000,
         amount0=100.0, amount1=0.0375, share=1.0, raw_balance=10**18,
     ))
 
@@ -78,16 +85,24 @@ async def test_bootstrap_dual_leg_does_two_swaps_sequentially(cross_pair_setting
         decimals0=18, decimals1=18,
     )
 
-    op_id = await lifecycle.bootstrap(usdc_budget=300.0)
+    # The new QuoterV2 + Factory calls (added to size amount_in_max accurately
+    # and pick the deepest fee tier) must be patched: in the real path they
+    # hit Arbitrum mainnet RPC. Quoter returns the integer amountIn the pool
+    # would charge — here we just echo a reasonable USDC amount per swap.
+    with patch("engine.lifecycle._best_swap_fee_tier", AsyncMock(return_value=3000)), \
+         patch("engine.lifecycle._quote_exact_output", AsyncMock(return_value=150 * 10**6)):
+        op_id = await lifecycle.bootstrap(usdc_budget=300.0)
     assert op_id == 42
 
-    # Two swaps were called (USDC->ARB, USDC->WETH), in order
-    assert len(swap_calls) == 2
-    # First call: token_out is ARB; second is WETH
+    # New (post-2026-05-05 refactor): only ONE swap fires — USDC → token0 —
+    # because Beefy CLM v2 deposit() consumes only `amount0` and zaps
+    # internally to the V3 ratio. Pre-acquiring token1 was wasted gas.
+    assert len(swap_calls) == 1
+    # The single swap targets token0 (ARB in this fixture).
     assert swap_calls[0]["token_out"] in {"0xARB", cross_pair_settings.token0_address}
-    assert swap_calls[1]["token_out"] in {"0xWETH", cross_pair_settings.token1_address}
 
-    # Two short orders on the perps (paralelos via gather)
+    # BOTH perp shorts still fire in parallel — sized from read_position
+    # AFTER the deposit (vault decided the actual t0/t1 split).
     assert exchange.place_long_term_order.await_count == 2
     symbols = [c.kwargs["symbol"] for c in exchange.place_long_term_order.await_args_list]
     assert "ARB-USD" in symbols

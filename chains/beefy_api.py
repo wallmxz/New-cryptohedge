@@ -235,6 +235,16 @@ class BeefyApiFetcher:
             or apy_block.get("vaultApr")
         )
 
+        # Beefy CLM v2 splits state between two contracts:
+        #   - earnContractAddress (= vault_id) is the user-facing ERC20 vault
+        #     that holds totalSupply/balanceOf for share accounting.
+        #   - "strategy" is the contract holding the V3 NFT, position ranges
+        #     (positionMain/Alt), and current token balances.
+        # Both addresses are needed by BeefyClmReader to read full CLM state.
+        # Older cache rows may have NULL strategy_address; lifecycle factory
+        # falls back to vault_id in that case.
+        strategy_address = clm.get("strategy") or ""
+
         return {
             "vault_id": vault_id,
             "chain": TARGET_CHAIN,
@@ -257,4 +267,5 @@ class BeefyApiFetcher:
             "token0_logo_url": f"{BEEFY_API_BASE}/token/{TARGET_CHAIN}/{token0_symbol}",
             "token1_logo_url": f"{BEEFY_API_BASE}/token/{TARGET_CHAIN}/{token1_symbol}",
             "fetched_at": now,
+            "strategy_address": strategy_address,
         }

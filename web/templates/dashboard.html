@@ -89,7 +89,9 @@
                        x-text="state.margin_ratio > 0 && state.margin_ratio < 999 ? state.margin_ratio.toFixed(2) + 'x' : '—'"></p>
                 </div>
                 <div>
-                    <p class="text-xs text-slate-400 mb-1">Collateral dYdX</p>
+                    <p class="text-xs text-slate-400 mb-1">
+                        Collateral <span x-text="(config.active_exchange || 'dydx') === 'lighter' ? 'Lighter' : 'dYdX'"></span>
+                    </p>
                     <p class="text-sm font-semibold text-slate-700"
                        x-text="'$' + state.dydx_collateral.toFixed(2)"></p>
                 </div>
@@ -98,6 +100,9 @@
 
         <!-- Saúde do loop -->
         {% include "partials/health.html" %}
+
+        <!-- LP Curve + grid de ordens -->
+        {% include "partials/lp_curve.html" %}
 
         <!-- Chart -->
         {% include "partials/chart.html" %}

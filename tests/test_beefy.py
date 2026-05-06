@@ -3,28 +3,42 @@ from unittest.mock import AsyncMock, MagicMock
 from chains.beefy import BeefyClmReader, BeefyPosition
 
 
-@pytest.mark.asyncio
-async def test_read_position_returns_struct():
-    """Mocked strategy: returns expected position struct."""
+def _build_mocks(*, ticks, balances, total_supply, balance):
+    """Build separate strategy + earn contract mocks.
+
+    Strategy exposes `positionMain()` and `balances()`.
+    Earn exposes `totalSupply()` and `balanceOf(addr)`.
+    """
     strategy = MagicMock()
-    strategy.functions.range.return_value.call = AsyncMock(return_value=(80000, 90000))
-    strategy.functions.balances.return_value.call = AsyncMock(
-        return_value=(int(0.5 * 10**18), int(1500 * 10**6))
-    )
-    strategy.functions.totalSupply.return_value.call = AsyncMock(
-        return_value=int(100 * 10**18)
-    )
-    strategy.functions.balanceOf.return_value.call = AsyncMock(
-        return_value=int(1 * 10**18)
-    )
+    strategy.functions.positionMain.return_value.call = AsyncMock(return_value=ticks)
+    strategy.functions.balances.return_value.call = AsyncMock(return_value=balances)
+
+    earn = MagicMock()
+    earn.functions.totalSupply.return_value.call = AsyncMock(return_value=total_supply)
+    earn.functions.balanceOf.return_value.call = AsyncMock(return_value=balance)
 
     w3 = MagicMock()
-    w3.eth.contract.return_value = strategy
+    # Two contract instances are constructed (strategy first, earn second);
+    # have w3.eth.contract return them in that order.
+    w3.eth.contract = MagicMock(side_effect=[strategy, earn])
     w3.to_checksum_address = lambda a: a
+    return w3, strategy, earn
+
+
+@pytest.mark.asyncio
+async def test_read_position_returns_struct():
+    """Mocked strategy + earn: returns expected position struct."""
+    w3, _strategy, _earn = _build_mocks(
+        ticks=(80000, 90000),
+        balances=(int(0.5 * 10**18), int(1500 * 10**6)),
+        total_supply=int(100 * 10**18),
+        balance=int(1 * 10**18),
+    )
 
     reader = BeefyClmReader(
         w3=w3,
         strategy_address="0xstrategy",
+        earn_address="0xearn",
         wallet_address="0xwallet",
         decimals0=18,
         decimals1=6,
@@ -41,18 +55,16 @@ async def test_read_position_returns_struct():
 @pytest.mark.asyncio
 async def test_read_position_zero_total_supply():
     """When totalSupply is 0, share should be 0.0 (no division-by-zero)."""
-    strategy = MagicMock()
-    strategy.functions.range.return_value.call = AsyncMock(return_value=(80000, 90000))
-    strategy.functions.balances.return_value.call = AsyncMock(return_value=(0, 0))
-    strategy.functions.totalSupply.return_value.call = AsyncMock(return_value=0)
-    strategy.functions.balanceOf.return_value.call = AsyncMock(return_value=0)
-
-    w3 = MagicMock()
-    w3.eth.contract.return_value = strategy
-    w3.to_checksum_address = lambda a: a
+    w3, _, _ = _build_mocks(
+        ticks=(80000, 90000),
+        balances=(0, 0),
+        total_supply=0,
+        balance=0,
+    )
 
     reader = BeefyClmReader(
-        w3=w3, strategy_address="0x0", wallet_address="0x0",
+        w3=w3, strategy_address="0xstrategy", earn_address="0xearn",
+        wallet_address="0x0",
         decimals0=18, decimals1=6,
     )
     pos = await reader.read_position()
@@ -64,20 +76,16 @@ async def test_read_position_zero_total_supply():
 @pytest.mark.asyncio
 async def test_read_position_negative_ticks():
     """Beefy ranges may have negative tick bounds (e.g., for low-USD-priced pools)."""
-    strategy = MagicMock()
-    strategy.functions.range.return_value.call = AsyncMock(return_value=(-887220, -880000))
-    strategy.functions.balances.return_value.call = AsyncMock(
-        return_value=(int(0.1 * 10**18), int(100 * 10**6))
+    w3, _, _ = _build_mocks(
+        ticks=(-887220, -880000),
+        balances=(int(0.1 * 10**18), int(100 * 10**6)),
+        total_supply=int(50 * 10**18),
+        balance=int(5 * 10**18),
     )
-    strategy.functions.totalSupply.return_value.call = AsyncMock(return_value=int(50 * 10**18))
-    strategy.functions.balanceOf.return_value.call = AsyncMock(return_value=int(5 * 10**18))
-
-    w3 = MagicMock()
-    w3.eth.contract.return_value = strategy
-    w3.to_checksum_address = lambda a: a
 
     reader = BeefyClmReader(
-        w3=w3, strategy_address="0x0", wallet_address="0x0",
+        w3=w3, strategy_address="0xstrategy", earn_address="0xearn",
+        wallet_address="0x0",
         decimals0=18, decimals1=6,
     )
     pos = await reader.read_position()

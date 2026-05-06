@@ -55,7 +55,17 @@ function dashboard() {
         // Two-stage start flow: 'budget' (input) -> 'preview' (review plan)
         startStage: 'budget',
         startPreview: null,
+        startPreviewAt: null,  // human-readable timestamp of last preview fetch
         startLoading: false,
+        // Wallet snapshot fetched on modal open (USDC + token0/1 balances +
+        // oracle prices + total USD). Used to render the budget ceiling
+        // breakdown on stage 'budget'.
+        startWallet: null,
+        // Per-leg swap strategy chosen by the user in stage 'preview'.
+        // Values: 'use_existing' | 'full_swap' | 'swap_diff'.
+        // Server-recommended defaults seeded from startPreview.strategies once
+        // the preview returns (see loadStartPreview).
+        startSwapStrategy: { token0: 'swap_diff', token1: 'swap_diff' },
 
         showPairPicker: false,
         pairsData: { usd_pairs: [], cross_pairs: [], selected_vault_id: null, last_refresh_ts: 0 },
@@ -178,11 +188,17 @@ function dashboard() {
             this.startStage = 'budget';
             this.startPreview = null;
             this.startLoading = false;
+            this.startWallet = null;
             try {
                 const resp = await fetch("/wallet");
                 if (resp.ok) {
                     const data = await resp.json();
-                    this.startBudgetMax = data.usdc_balance || 0;
+                    this.startWallet = data;
+                    // Use total wallet value priced in USD (USDC + token0 in
+                    // USD + token1 in USD) as the budget ceiling — not just
+                    // native USDC. The bot will use existing token0/token1
+                    // and only swap USDC for the gap.
+                    this.startBudgetMax = data.total_usd || data.usdc_balance || 0;
                     if (this.startBudgetMax > 0) {
                         this.startBudget = Math.floor(this.startBudgetMax);
                     }
@@ -212,7 +228,32 @@ function dashboard() {
                     alert("Erro ao calcular plano: " + (data.error || resp.status));
                     return;
                 }
+                // Default wallet snapshot to zeros so the template renders
+                // numeric values even if a stale backend skips the field.
+                if (!data.wallet) {
+                    data.wallet = {
+                        token0_balance: 0, token1_balance: 0, eth_balance: 0,
+                    };
+                }
                 this.startPreview = data;
+                this.startPreviewAt = new Date().toLocaleTimeString();
+                // Seed strategy per leg. If wallet has no balance of that
+                // token, only "full_swap" makes sense — pin it. If wallet
+                // has some balance, take the server's recommendation as a
+                // starting point (user can override before confirming).
+                const t0Bal = data.wallet.token0_balance || 0;
+                const t1Bal = data.wallet.token1_balance || 0;
+                const t0Target = (data.deposit && data.deposit.amount0_target) || 0;
+                const t1Target = (data.deposit && data.deposit.amount1_target) || 0;
+                const eps = 1e-9;  // dust threshold
+                this.startSwapStrategy = {
+                    token0: t0Bal <= eps
+                        ? 'full_swap'
+                        : ((data.strategies && data.strategies.token0) || 'swap_diff'),
+                    token1: t1Bal <= eps
+                        ? 'full_swap'
+                        : ((data.strategies && data.strategies.token1) || 'swap_diff'),
+                };
                 this.startStage = 'preview';
             } catch (e) {
                 alert("Erro: " + e);
@@ -225,10 +266,21 @@ function dashboard() {
         async confirmStart() {
             this.startLoading = true;
             try {
+                const payload = { usdc_budget: this.startBudget };
+                // Only forward strategies in dual-leg (cross-pair). Single-leg
+                // path ignores the field server-side, but no point sending it.
+                if (this.startPreview && this.startPreview.is_dual_leg) {
+                    // Dual-leg now uses a single swap (USDC → token0); only
+                    // the token0 strategy is meaningful. token1 is omitted —
+                    // backend ignores it anyway.
+                    payload.swap_strategies = {
+                        token0: this.startSwapStrategy.token0,
+                    };
+                }
                 const resp = await fetch("/operations/start", {
                     method: "POST",
                     headers: {"Content-Type": "application/json"},
-                    body: JSON.stringify({usdc_budget: this.startBudget}),
+                    body: JSON.stringify(payload),
                 });
                 if (!resp.ok) {
                     const err = await resp.json();

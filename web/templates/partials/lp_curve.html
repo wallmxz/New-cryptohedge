@@ -1,0 +1,203 @@
+<!-- LP Curve: V3 range + grid de ordens. Renderizado via Chart.js
+     contra GET /curve. Atualiza a cada 5s. -->
+<div class="bg-white rounded-lg shadow p-4 mb-5"
+     x-data="{
+        curve: null,
+        loading: false,
+        lastError: null,
+        chart: null,
+        async load() {
+            this.loading = true;
+            try {
+                const r = await fetch('/curve');
+                const data = await r.json();
+                if (data.error) {
+                    this.lastError = data.error === 'no_pair_selected'
+                        ? 'Selecione um par primeiro pra ver a curva.'
+                        : data.error;
+                    this.curve = null;
+                } else {
+                    this.curve = data;
+                    this.lastError = null;
+                    this.$nextTick(() => this.render());
+                }
+            } catch (e) {
+                this.lastError = String(e);
+            } finally { this.loading = false; }
+        },
+        render() {
+            if (!this.curve || !window.Chart) return;
+            const c = this.curve;
+            const buys = c.grid.filter(g => g.side === 'buy');
+            const sells = c.grid.filter(g => g.side === 'sell');
+            const datasets = [
+                {
+                    label: 'Buys (close short)',
+                    data: buys.map(g => ({x: g.price, y: g.size})),
+                    backgroundColor: 'rgba(16, 185, 129, 0.7)',
+                    borderColor: 'rgb(16, 185, 129)',
+                    pointRadius: 4,
+                    pointHoverRadius: 6,
+                    showLine: false,
+                },
+                {
+                    label: 'Sells (open short)',
+                    data: sells.map(g => ({x: g.price, y: g.size})),
+                    backgroundColor: 'rgba(239, 68, 68, 0.7)',
+                    borderColor: 'rgb(239, 68, 68)',
+                    pointRadius: 4,
+                    pointHoverRadius: 6,
+                    showLine: false,
+                },
+            ];
+            const cfg = {
+                type: 'scatter',
+                data: { datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: {
+                            type: 'linear',
+                            title: { display: true, text:
+                                'Preço ' + c.pool.token0_symbol + '/' + c.pool.token1_symbol },
+                            min: c.pool.p_a * 0.995,
+                            max: c.pool.p_b * 1.005,
+                        },
+                        y: {
+                            title: { display: true, text:
+                                'Tamanho da ordem (' + c.pool.token0_symbol + ')' },
+                            beginAtZero: true,
+                        },
+                    },
+                    plugins: {
+                        legend: { position: 'top' },
+                        tooltip: {
+                            callbacks: {
+                                label: function(ctx) {
+                                    return ctx.dataset.label + ': ' +
+                                        ctx.parsed.y.toFixed(6) + ' @ ' +
+                                        ctx.parsed.x.toFixed(6);
+                                },
+                            },
+                        },
+                        annotation: {
+                            annotations: {
+                                pNow: {
+                                    type: 'line',
+                                    xMin: c.pool.p_now, xMax: c.pool.p_now,
+                                    borderColor: 'rgb(99, 102, 241)',
+                                    borderWidth: 2,
+                                    borderDash: [5,5],
+                                    label: {
+                                        content: 'preço atual ' + c.pool.p_now.toFixed(6),
+                                        enabled: true,
+                                        position: 'start',
+                                    },
+                                },
+                                pA: {
+                                    type: 'line',
+                                    xMin: c.pool.p_a, xMax: c.pool.p_a,
+                                    borderColor: 'rgba(100,116,139,0.5)',
+                                    borderWidth: 1,
+                                },
+                                pB: {
+                                    type: 'line',
+                                    xMin: c.pool.p_b, xMax: c.pool.p_b,
+                                    borderColor: 'rgba(100,116,139,0.5)',
+                                    borderWidth: 1,
+                                },
+                            },
+                        },
+                    },
+                },
+            };
+            const canvas = document.getElementById('lp-curve-chart');
+            if (this.chart) this.chart.destroy();
+            this.chart = new Chart(canvas, cfg);
+        },
+     }"
+     x-init="load(); setInterval(() => load(), 5000)">
+
+    <div class="flex items-center justify-between mb-2">
+        <h2 class="text-lg font-bold">Curva LP & Grid de ordens</h2>
+        <button @click="load()" :disabled="loading"
+                class="text-xs px-3 py-1 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50">
+            <span x-show="!loading">🔄 Atualizar</span>
+            <span x-show="loading">Carregando...</span>
+        </button>
+    </div>
+
+    <template x-if="lastError">
+        <div class="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded p-3"
+             x-text="lastError"></div>
+    </template>
+
+    <template x-if="curve && !lastError">
+        <div>
+            <!-- Summary line -->
+            <div class="text-xs text-slate-600 mb-2 flex flex-wrap gap-3">
+                <span>
+                    Pool <span class="font-semibold"
+                                x-text="curve.pool.token0_symbol + '/' + curve.pool.token1_symbol"></span>
+                    fee <span class="font-mono" x-text="(curve.pool.fee_pct * 100).toFixed(2) + '%'"></span>
+                </span>
+                <span>
+                    Faixa
+                    <span class="font-mono" x-text="curve.pool.p_a.toFixed(6)"></span>
+                    –
+                    <span class="font-mono" x-text="curve.pool.p_b.toFixed(6)"></span>
+                </span>
+                <span :class="curve.pool.in_range ? 'text-emerald-700' : 'text-red-600 font-semibold'">
+                    <span x-text="curve.pool.in_range ? '✓ in-range' : '✗ OUT OF RANGE'"></span>
+                </span>
+                <span>
+                    Preço atual:
+                    <span class="font-mono" x-text="curve.pool.p_now.toFixed(6)"></span>
+                </span>
+                <span class="ml-auto text-slate-500"
+                      x-text="curve.source === 'active' ? 'usando posição real' : 'simulação com saldo da wallet'"></span>
+            </div>
+
+            <!-- Chart -->
+            <div class="relative" style="height: 280px;">
+                <canvas id="lp-curve-chart"></canvas>
+            </div>
+
+            <!-- Stats -->
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3 text-xs">
+                <div class="bg-slate-50 rounded p-2">
+                    <div class="text-slate-500">Posição (token0)</div>
+                    <div class="font-mono font-semibold"
+                         x-text="curve.position.my_amount0.toFixed(6) + ' ' + curve.pool.token0_symbol"></div>
+                </div>
+                <div class="bg-slate-50 rounded p-2">
+                    <div class="text-slate-500">Posição (token1)</div>
+                    <div class="font-mono font-semibold"
+                         x-text="curve.position.my_amount1.toFixed(6) + ' ' + curve.pool.token1_symbol"></div>
+                </div>
+                <div class="bg-slate-50 rounded p-2">
+                    <div class="text-slate-500">Valor total</div>
+                    <div class="font-mono font-semibold"
+                         x-text="'$' + curve.position.pool_value_usd.toFixed(2)"></div>
+                </div>
+                <div class="bg-slate-50 rounded p-2">
+                    <div class="text-slate-500">Ordens no grid</div>
+                    <div class="font-mono font-semibold">
+                        <span class="text-emerald-700"
+                              x-text="curve.grid.filter(g => g.side === 'buy').length + ' buy'"></span>
+                        ·
+                        <span class="text-red-600"
+                              x-text="curve.grid.filter(g => g.side === 'sell').length + ' sell'"></span>
+                    </div>
+                </div>
+            </div>
+
+            <p class="text-[11px] text-slate-500 italic mt-2">
+                Cada ponto = 1 ordem maker. Acima do preço atual: buys (fecham short conforme preço sobe).
+                Abaixo: sells (abrem short conforme preço cai). Tamanho de cada ordem ≈
+                $<span x-text="curve.min_notional_usd.toFixed(2)"></span> de notional.
+            </p>
+        </div>
+    </template>
+</div>

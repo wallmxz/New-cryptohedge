@@ -68,7 +68,7 @@
                 <div x-show="settingsTab === 'exchange'" x-cloak class="space-y-4">
                     <div class="cfg-group">
                         <label class="cfg-label">Exchange</label>
-                        <input type="text" value="dYdX v4" class="cfg-input" disabled>
+                        <input type="text" :value="(config.active_exchange || 'dydx') === 'lighter' ? 'Lighter v1' : 'dYdX v4'" class="cfg-input" disabled>
                         <p class="cfg-hint">Fixo desde Phase 1.1 (decisão arquitetural)</p>
                     </div>
                     <div class="cfg-group">

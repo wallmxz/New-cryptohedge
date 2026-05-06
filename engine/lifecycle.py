@@ -31,6 +31,118 @@ DEFAULT_DEADLINE_SECONDS = 300  # 5 min
 # bootstrap, where neither token0 nor token1 is the user's holding currency.
 _USDC_ADDRESS_ARBITRUM = "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
 
+# Uniswap V3 Factory + Quoter on Arbitrum.
+# Factory: looks up which fee tier has the most liquid pool for a pair.
+# Quoter: simulates the swap and returns the EXACT amountIn the pool would
+#   charge for a desired amountOut (accounts for fee + price impact + tick
+#   geometry). We use this instead of `mid × (1 + slippage)` so the user's
+#   slippage tolerance is the budget for chain-time price drift, not for the
+#   pool's fee or trade impact.
+_UNISWAP_V3_FACTORY_ARB = "0x1F98431c8aD98523631AE4a59f267346ea31F984"
+_UNISWAP_V3_QUOTER_ARB = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"  # QuoterV2
+_QUOTER_V2_ABI = [{
+    "inputs": [{
+        "components": [
+            {"name": "tokenIn", "type": "address"},
+            {"name": "tokenOut", "type": "address"},
+            {"name": "amount", "type": "uint256"},
+            {"name": "fee", "type": "uint24"},
+            {"name": "sqrtPriceLimitX96", "type": "uint160"},
+        ],
+        "name": "params", "type": "tuple",
+    }],
+    "name": "quoteExactOutputSingle",
+    "outputs": [
+        {"name": "amountIn", "type": "uint256"},
+        {"name": "sqrtPriceX96After", "type": "uint160"},
+        {"name": "initializedTicksCrossed", "type": "uint32"},
+        {"name": "gasEstimate", "type": "uint256"},
+    ],
+    "stateMutability": "nonpayable",
+    "type": "function",
+}]
+
+
+async def _quote_exact_output(
+    w3, token_in: str, token_out: str, fee: int, amount_out: int,
+) -> int | None:
+    """Ask Uniswap V3 QuoterV2 how much `token_in` is needed to receive
+    `amount_out` of `token_out` through the pool at `fee` tier. Returns the
+    integer amountIn, or None if the quote fails (pool empty/illiquid).
+    Uses eth_call (no state change) since QuoterV2 is read-via-call."""
+    quoter = w3.eth.contract(
+        address=w3.to_checksum_address(_UNISWAP_V3_QUOTER_ARB),
+        abi=_QUOTER_V2_ABI,
+    )
+    try:
+        result = await quoter.functions.quoteExactOutputSingle({
+            "tokenIn": w3.to_checksum_address(token_in),
+            "tokenOut": w3.to_checksum_address(token_out),
+            "amount": amount_out,
+            "fee": fee,
+            "sqrtPriceLimitX96": 0,
+        }).call()
+        # QuoterV2 returns (amountIn, sqrtPriceX96After, initializedTicksCrossed, gasEstimate)
+        return int(result[0])
+    except Exception as e:
+        logger.warning(f"Quoter failed: {e}")
+        return None
+_FEE_TIERS = [100, 500, 3000, 10000]  # 0.01%, 0.05%, 0.30%, 1.00%
+_FACTORY_ABI = [{
+    "inputs": [
+        {"name": "tokenA", "type": "address"},
+        {"name": "tokenB", "type": "address"},
+        {"name": "fee", "type": "uint24"},
+    ],
+    "name": "getPool",
+    "outputs": [{"type": "address"}],
+    "stateMutability": "view",
+    "type": "function",
+}]
+_POOL_LIQ_ABI = [{
+    "inputs": [], "name": "liquidity",
+    "outputs": [{"type": "uint128"}],
+    "stateMutability": "view", "type": "function",
+}]
+_ZERO_ADDR = "0x0000000000000000000000000000000000000000"
+
+
+async def _best_swap_fee_tier(w3, token_a: str, token_b: str) -> int | None:
+    """Return the Uniswap V3 fee tier (100/500/3000/10000) of the most-liquid
+    pool for a token pair, or None if no pool exists.
+
+    Why: Uniswap V3 has up to 4 fee tiers per pair. Liquidity is often
+    concentrated in ONE tier (varies per pair: USDC-WETH → 0.05%, USDC-ARB
+    → 0.30%, etc.). The CLM's LP pool fee is fixed by the strategy, but our
+    bootstrap swaps are free to use whichever tier is deepest.
+    """
+    factory = w3.eth.contract(
+        address=w3.to_checksum_address(_UNISWAP_V3_FACTORY_ARB),
+        abi=_FACTORY_ABI,
+    )
+    best_fee = None
+    best_liq = 0
+    for fee in _FEE_TIERS:
+        try:
+            addr = await factory.functions.getPool(
+                w3.to_checksum_address(token_a),
+                w3.to_checksum_address(token_b),
+                fee,
+            ).call()
+        except Exception:
+            continue
+        if not addr or addr.lower() == _ZERO_ADDR:
+            continue
+        try:
+            pool = w3.eth.contract(address=addr, abi=_POOL_LIQ_ABI)
+            liq = await pool.functions.liquidity().call()
+        except Exception:
+            continue
+        if liq > best_liq:
+            best_liq = liq
+            best_fee = fee
+    return best_fee
+
 # State -> next-step continuation map.
 # - 'with_hash' means: if tx_hash exists, wait for receipt, then continue.
 # - 'without_hash' means: re-execute the step (safe because on-chain state hasn't changed).
@@ -106,14 +218,187 @@ class OperationLifecycle:
             "eth": eth_raw / 1e18,
         }
 
+    async def wallet_summary(self) -> dict:
+        """Return wallet snapshot priced in USD using exchange oracle prices.
+
+        Used by the start-modal so the user's "max budget" reflects the TOTAL
+        spendable value (native USDC + token0 in USD + token1 in USD), not
+        just the native USDC. Cross-pair vaults have a 4th balance (the
+        Arbitrum-native USDC) on top of token0 / token1.
+
+        Returns:
+          {
+            "usdc_balance": float,         # native USDC (1:1 USD)
+            "token0_balance": float,       # display units
+            "token1_balance": float,       # display units
+            "token0_symbol": str,
+            "token1_symbol": str,
+            "token0_usd_price": float,
+            "token1_usd_price": float,
+            "eth_balance": float,          # native gas
+            "total_usd": float,            # sum of all USD-priced legs
+          }
+        """
+        is_dual_leg = bool(self._settings.dydx_symbol_token1)
+        # Read native ETH + token0 + token1 balances. In single-leg, token1
+        # IS USDC, so we don't need a separate USDC read.
+        token0 = self._uniswap._erc20(self._settings.token0_address)
+        token1 = self._uniswap._erc20(self._settings.token1_address)
+        wallet = self._uniswap.address
+
+        if is_dual_leg:
+            usdc = self._uniswap._erc20(_USDC_ADDRESS_ARBITRUM)
+            eth_raw, token0_raw, token1_raw, usdc_raw = await asyncio.gather(
+                self._uniswap._w3.eth.get_balance(wallet),
+                token0.functions.balanceOf(wallet).call(),
+                token1.functions.balanceOf(wallet).call(),
+                usdc.functions.balanceOf(wallet).call(),
+            )
+            usdc_balance = usdc_raw / 1e6  # USDC = 6 decimals on Arbitrum
+        else:
+            eth_raw, token0_raw, token1_raw = await asyncio.gather(
+                self._uniswap._w3.eth.get_balance(wallet),
+                token0.functions.balanceOf(wallet).call(),
+                token1.functions.balanceOf(wallet).call(),
+            )
+            # Single-leg: token1 is USDC. Reuse the token1 balance as
+            # native USDC; don't double-count.
+            usdc_balance = token1_raw / (10 ** self._decimals1)
+
+        token0_balance = token0_raw / (10 ** self._decimals0)
+        token1_balance = token1_raw / (10 ** self._decimals1)
+        eth_balance = eth_raw / 1e18
+
+        # Oracle prices: dual-leg has both perp symbols; single-leg only
+        # token0's symbol (token1 is USDC = $1).
+        if is_dual_leg:
+            symbols = [self._settings.dydx_symbol_token0, self._settings.dydx_symbol_token1]
+        else:
+            symbols = [self._settings.dydx_symbol]
+        try:
+            oracle = await self._exchange.get_oracle_prices(symbols)
+        except Exception as e:
+            logger.warning(f"wallet_summary: oracle price fetch failed ({e})")
+            oracle = {}
+
+        if is_dual_leg:
+            t0_usd = float(oracle.get(self._settings.dydx_symbol_token0, 0.0) or 0.0)
+            t1_usd = float(oracle.get(self._settings.dydx_symbol_token1, 0.0) or 0.0)
+            total_usd = (
+                usdc_balance
+                + token0_balance * t0_usd
+                + token1_balance * t1_usd
+            )
+        else:
+            t0_usd = float(oracle.get(self._settings.dydx_symbol, 0.0) or 0.0)
+            t1_usd = 1.0  # USDC
+            # In single-leg, token1 IS USDC — `usdc_balance` already counts it.
+            # Don't add token1_balance * 1.0 again.
+            total_usd = usdc_balance + token0_balance * t0_usd
+
+        return {
+            "usdc_balance": usdc_balance,
+            "token0_balance": token0_balance,
+            "token1_balance": token1_balance,
+            "token0_symbol": self._settings.pool_token0_symbol,
+            "token1_symbol": self._settings.pool_token1_symbol,
+            "token0_usd_price": t0_usd,
+            "token1_usd_price": t1_usd,
+            "eth_balance": eth_balance,
+            "total_usd": total_usd,
+            "is_dual_leg": is_dual_leg,
+        }
+
     async def _check_gas_balance(self) -> None:
-        """Raise if wallet ETH balance is below GAS_RESERVE_ETH."""
+        """Soft check — log a warning if gas is below the recommended reserve,
+        but proceed regardless. The user owns the wallet and accepts the risk
+        of a tx running out of gas mid-flow (which would surface as a clear
+        revert and operation_state=failed)."""
         bal = await self._read_wallet_balance()
         self._hub.wallet_eth_balance = bal["eth"]
         if bal["eth"] < GAS_RESERVE_ETH:
-            raise RuntimeError(
-                f"Wallet gas too low: {bal['eth']:.4f} ETH < {GAS_RESERVE_ETH:.4f} ETH reserve"
+            logger.warning(
+                f"Wallet gas low: {bal['eth']:.4f} ETH < recommended "
+                f"{GAS_RESERVE_ETH:.4f} ETH reserve. Proceeding — operation may "
+                f"fail mid-flow if gas runs out."
             )
+
+    async def _maybe_swap_to_token(
+        self, *, strategy: str, target_amount: float, wallet_balance: float,
+        token_out: str, token_out_symbol: str, token_out_decimals: int,
+        slippage: float,
+    ) -> str | None:
+        """Execute a USDC -> token_out swap according to `strategy`. Returns
+        the tx_hash, or None if no swap was performed.
+
+        Strategies:
+          - "use_existing": skip the swap. Caller asserted wallet already has
+            the target. We validate ≥99% of target is present and raise
+            otherwise (so we don't silently under-deposit).
+          - "full_swap": swap exactly `target_amount` of token_out, ignoring
+            the wallet balance entirely. Any pre-existing balance stays put
+            and gets folded into the deposit later.
+          - "swap_diff": swap only `max(0, target - wallet)`. If the wallet
+            already covers ≥99% of target, skip. Default behavior.
+        """
+        if strategy == "use_existing":
+            if wallet_balance < target_amount * 0.99:
+                raise RuntimeError(
+                    f"Strategy 'use_existing' for {token_out_symbol} requires "
+                    f"wallet balance >= {target_amount:.6f}, but only "
+                    f"{wallet_balance:.6f} available."
+                )
+            logger.info(
+                f"use_existing {token_out_symbol}: wallet has "
+                f"{wallet_balance:.6f} >= target {target_amount:.6f}, skipping swap"
+            )
+            return None
+
+        if strategy == "full_swap":
+            amount_to_swap = target_amount
+        elif strategy == "swap_diff":
+            amount_to_swap = max(0.0, target_amount - wallet_balance)
+            if amount_to_swap <= 0 or wallet_balance >= target_amount * 0.99:
+                logger.info(
+                    f"swap_diff {token_out_symbol}: wallet has {wallet_balance:.6f}, "
+                    f"covers target {target_amount:.6f}, skipping swap"
+                )
+                return None
+        else:
+            raise RuntimeError(
+                f"Unknown swap strategy '{strategy}' for {token_out_symbol}"
+            )
+
+        # Live quote to size amount_in_max accurately. Pick deepest fee tier
+        # for the USDC <-> token_out pair (independent from CLM LP pool fee).
+        swap_fee = await _best_swap_fee_tier(
+            self._uniswap._w3, _USDC_ADDRESS_ARBITRUM, token_out,
+        ) or self._settings.uniswap_v3_pool_fee
+        amount_out_raw = int(amount_to_swap * 10**token_out_decimals)
+        quoted_in = await _quote_exact_output(
+            self._uniswap._w3, _USDC_ADDRESS_ARBITRUM,
+            token_out, swap_fee, amount_out_raw,
+        )
+        if quoted_in is None:
+            raise RuntimeError(
+                f"Quoter could not price USDC→{token_out_symbol} at fee {swap_fee}"
+            )
+        amount_in_max = int(quoted_in * (1 + slippage))
+        logger.info(
+            f"USDC→{token_out_symbol} fee {swap_fee} ({swap_fee/10000:.2f}%) "
+            f"strategy={strategy} target={amount_to_swap:.6f} "
+            f"quoted=${quoted_in/1e6:.4f} max=${amount_in_max/1e6:.4f} "
+            f"(+{slippage*100:.2f}%)"
+        )
+        return await self._uniswap.swap_exact_output(
+            token_in=_USDC_ADDRESS_ARBITRUM,
+            token_out=token_out,
+            fee=swap_fee,
+            amount_out=amount_out_raw,
+            amount_in_maximum=amount_in_max,
+            recipient=self._uniswap.address,
+            deadline=int(time.time()) + DEFAULT_DEADLINE_SECONDS,
+        )
 
     async def bootstrap_preview(self, *, usdc_budget: float) -> dict:
         """Compute the swap+deposit+hedge plan for `usdc_budget` WITHOUT touching
@@ -132,8 +417,34 @@ class OperationLifecycle:
         beefy_pos = await self._beefy_reader.read_position()
         p_a = tick_to_price(beefy_pos.tick_lower, self._decimals0, self._decimals1)
         p_b = tick_to_price(beefy_pos.tick_upper, self._decimals0, self._decimals1)
+
+        # Convert USDC budget to "value in token1 units" for compute_optimal_split.
+        # Single-leg: token1 IS USDC, so 1 USDC == 1 token1 unit.
+        # Dual-leg: token1 is volatile (e.g. ARB at $0.12), so we must divide
+        # the USDC budget by token1's USD oracle price to get token1 units.
+        # Without this, $700 USDC was being treated as 700 ARB (= $83 USD)
+        # and the resulting swap amounts under-allocated the pool by ~88%.
+        if is_dual_leg:
+            token0_sym_oracle = self._settings.dydx_symbol_token0
+            token1_sym_oracle = self._settings.dydx_symbol_token1
+            oracle = await self._exchange.get_oracle_prices(
+                [token0_sym_oracle, token1_sym_oracle],
+            )
+            p0_usd = float(oracle.get(token0_sym_oracle, 0.0) or 0.0)
+            p1_usd = float(oracle.get(token1_sym_oracle, 0.0) or 0.0)
+            if p1_usd <= 0:
+                raise RuntimeError(
+                    f"Could not resolve USD oracle price for token1 "
+                    f"({token1_sym_oracle}); cannot size cross-pair LP."
+                )
+            total_value_token1_units = usdc_budget / p1_usd
+        else:
+            p0_usd = p_now  # token1 == USDC, p_now is already USD/token0
+            p1_usd = 1.0
+            total_value_token1_units = usdc_budget
+
         amount_t0_target, amount_t1_target = compute_optimal_split(
-            p=p_now, p_a=p_a, p_b=p_b, total_value_usdc=usdc_budget,
+            p=p_now, p_a=p_a, p_b=p_b, total_value_usdc=total_value_token1_units,
         )
 
         slippage_bps = self._settings.slippage_bps
@@ -144,6 +455,24 @@ class OperationLifecycle:
         token1_addr = self._settings.token1_address
         token0_sym_label = self._settings.pool_token0_symbol
         token1_sym_label = self._settings.pool_token1_symbol
+
+        # Read current wallet balances per token so the UI can recommend a
+        # swap strategy ('use_existing' / 'full_swap' / 'swap_diff') per leg.
+        # Defensive: if RPC fails, treat as empty wallet — the user just sees
+        # 'full_swap' across the board (the safe default) instead of the
+        # whole preview blowing up.
+        try:
+            wallet_bal = await self._read_wallet_balance()
+        except Exception as e:
+            logger.warning(f"bootstrap_preview: wallet read failed ({e}); defaulting to zero balances")
+            wallet_bal = {"token0": 0.0, "token1": 0.0, "eth": 0.0}
+
+        def recommend_strategy(have: float, target: float) -> str:
+            if have >= target * 0.99 and target > 0:
+                return "use_existing"
+            if have <= target * 0.01 or have <= 1e-12:
+                return "full_swap"
+            return "swap_diff"
 
         plan: dict = {
             "usdc_budget": usdc_budget,
@@ -162,6 +491,11 @@ class OperationLifecycle:
             "router": router,
             "slippage_bps": slippage_bps,
             "swaps": [],
+            "wallet": {
+                "token0_balance": wallet_bal["token0"],
+                "token1_balance": wallet_bal["token1"],
+                "eth_balance": wallet_bal["eth"],
+            },
             "deposit": {
                 "vault": self._settings.clm_vault_address,
                 "amount0_target": amount_t0_target,
@@ -171,14 +505,21 @@ class OperationLifecycle:
         }
 
         if is_dual_leg:
+            # CROSS-PAIR (cowcentrated CLM v2):
+            # The Beefy CLM v2 vault zaps internally: it accepts only token0
+            # and rebalances to the V3 ratio inside the strategy. So we only
+            # need a SINGLE swap (USDC → token0) sized for the FULL budget,
+            # not two swaps split by V3 ratio. The vault swaps token0 → token1
+            # internally as needed.
+            #
+            # The hedge sizes are sized against `amount_t0_target` /
+            # `amount_t1_target` (the post-zap V3 split estimate). Real
+            # numbers come from `read_position()` after the deposit lands.
             token0_sym = self._settings.dydx_symbol_token0
             token1_sym = self._settings.dydx_symbol_token1
-            oracle = await self._exchange.get_oracle_prices([token0_sym, token1_sym])
-            p0_usd = float(oracle.get(token0_sym, 0.0) or 0.0)
-            p1_usd = float(oracle.get(token1_sym, 0.0) or 0.0)
-
-            usdc_for_t0 = amount_t0_target * p0_usd
-            usdc_for_t1 = amount_t1_target * p1_usd
+            # Total budget expressed in token0 units.
+            total_in_token0 = usdc_budget / p0_usd if p0_usd > 0 else 0.0
+            usdc_for_t0 = total_in_token0 * p0_usd
             plan["swaps"] = [
                 {
                     "leg": "token0",
@@ -188,21 +529,15 @@ class OperationLifecycle:
                     "token_out_symbol": token0_sym_label,
                     "token_out_address": token0_addr,
                     "amount_in_max_usdc": usdc_for_t0 * (1 + slippage),
-                    "amount_out": amount_t0_target,
-                    "fee_param": pool_fee,
-                },
-                {
-                    "leg": "token1",
-                    "router": router,
-                    "token_in_symbol": "USDC",
-                    "token_in_address": _USDC_ADDRESS_ARBITRUM,
-                    "token_out_symbol": token1_sym_label,
-                    "token_out_address": token1_addr,
-                    "amount_in_max_usdc": usdc_for_t1 * (1 + slippage),
-                    "amount_out": amount_t1_target,
+                    "amount_out": total_in_token0,
                     "fee_param": pool_fee,
                 },
             ]
+            plan["strategies"] = {
+                # Only the token0 leg has a strategy choice in the new model.
+                # token1 is auto-handled by the vault zap.
+                "token0": recommend_strategy(wallet_bal["token0"], total_in_token0),
+            }
             plan["hedge"] = [
                 {
                     "symbol": token0_sym, "side": "sell",
@@ -241,9 +576,14 @@ class OperationLifecycle:
                     "notional_usd": amount_t0_target * self._hub.hedge_ratio * p_now,
                 },
             ]
+            plan["strategies"] = {
+                "token0": recommend_strategy(wallet_bal["token0"], amount_t0_target),
+            }
         return plan
 
-    async def bootstrap(self, *, usdc_budget: float) -> int:
+    async def bootstrap(
+        self, *, usdc_budget: float, swap_strategies: dict | None = None,
+    ) -> int:
         """Execute swap -> deposit -> snapshot -> hedge. Returns operation_id.
 
         Dispatches on `settings.dydx_symbol_token1`:
@@ -252,9 +592,18 @@ class OperationLifecycle:
           - non-empty (dual-leg / cross-pair): user holds USDC; performs two
             sequential swaps (USDC->token0, USDC->token1) and opens two perp
             shorts in parallel via asyncio.gather.
+
+        `swap_strategies`: optional per-leg user choice from the preview UI.
+        Dict shape `{"token0": "use_existing"|"full_swap"|"swap_diff",
+                     "token1": "use_existing"|"full_swap"|"swap_diff"}`. When
+        omitted, dual-leg falls back to legacy "swap_diff" behavior (skip if
+        wallet already has ≥99% of the target). Single-leg path ignores the
+        argument — its swap sizing is already deterministic from the budget.
         """
         if bool(self._settings.dydx_symbol_token1):
-            return await self._bootstrap_dual_leg(usdc_budget=usdc_budget)
+            return await self._bootstrap_dual_leg(
+                usdc_budget=usdc_budget, swap_strategies=swap_strategies,
+            )
 
         existing = await self._db.get_active_operation()
         if existing is not None:
@@ -385,18 +734,39 @@ class OperationLifecycle:
             self._hub.bootstrap_progress = f"FAILED: {e}"
             raise
 
-    async def _bootstrap_dual_leg(self, *, usdc_budget: float) -> int:
-        """Cross-pair bootstrap: USDC -> token0 swap, then USDC -> token1 swap,
-        deposit into Beefy, snapshot baseline, open BOTH perp shorts in parallel.
+    async def _bootstrap_dual_leg(
+        self, *, usdc_budget: float, swap_strategies: dict | None = None,
+    ) -> int:
+        """Cross-pair bootstrap: USDC -> token0 swap (single, full budget),
+        deposit into Beefy (vault zaps internally to V3 ratio), snapshot
+        baseline, open BOTH perp shorts in parallel.
 
         Differs from single-leg in three ways:
-        1. Two sequential Uniswap swaps from USDC into token0 and token1 (USDC
-           is neither token0 nor token1 in this path).
+        1. ONE Uniswap swap (USDC -> token0). The Beefy CLM v2 vault is a
+           single-sided depositor: it accepts only `amount0` and rebalances
+           to the V3 range internally (swapping token0 for token1 inside
+           the strategy as needed). Sending `amount1 > 0` is ignored — and
+           burning gas + slippage to acquire ARB pre-deposit just to have
+           it sit in our wallet is wasteful.
         2. Baseline pool value computed using both tokens' USD oracle prices
            (token1 is no longer assumed to be 1.0 USD/unit).
         3. Two `place_long_term_order` calls dispatched in parallel via
-           asyncio.gather, one per perp symbol.
+           asyncio.gather, one per perp symbol — sized from `read_position`
+           AFTER deposit (since the vault decides the actual t0/t1 split).
+
+        `swap_strategies`: per-leg explicit choice from the user. In the
+        new single-swap model only the `token0` key matters:
+            - "use_existing": skip the swap; use whatever token0 is in the
+              wallet (validates wallet balance >= 99% of full budget in t0).
+            - "full_swap": always swap the full budget, regardless of
+              wallet balance (pre-existing token0 stays and gets folded
+              into the deposit too).
+            - "swap_diff": swap only the gap (target - wallet_balance);
+              if wallet already covers ≥99%, skip.
+        Defaults to "swap_diff" when `swap_strategies` is None.
         """
+        strategies = swap_strategies or {}
+        strat_t0 = strategies.get("token0", "swap_diff")
         existing = await self._db.get_active_operation()
         if existing is not None:
             raise RuntimeError(f"Operation {existing['id']} already active")
@@ -407,15 +777,26 @@ class OperationLifecycle:
         p_a = tick_to_price(beefy_pos.tick_lower, self._decimals0, self._decimals1)
         p_b = tick_to_price(beefy_pos.tick_upper, self._decimals0, self._decimals1)
 
-        amount_t0_target, amount_t1_target = compute_optimal_split(
-            p=p_now, p_a=p_a, p_b=p_b, total_value_usdc=usdc_budget,
-        )
-
+        # Need oracle prices BEFORE the split: in cross-pair, token1 is volatile
+        # so the USDC budget must be converted to token1 units before passing
+        # to compute_optimal_split (whose `total_value_usdc` arg is actually
+        # "total value in token1 units" — fine for USD pairs where token1=USDC,
+        # but not here).
         token0_sym = self._settings.dydx_symbol_token0
         token1_sym = self._settings.dydx_symbol_token1
         oracle_prices = await self._exchange.get_oracle_prices([token0_sym, token1_sym])
         baseline_t0_usd = float(oracle_prices.get(token0_sym, 0.0) or 0.0)
         baseline_t1_usd = float(oracle_prices.get(token1_sym, 0.0) or 0.0)
+        if baseline_t1_usd <= 0:
+            raise RuntimeError(
+                f"Could not resolve USD oracle price for token1 "
+                f"({token1_sym}); cannot size cross-pair LP."
+            )
+
+        total_value_token1_units = usdc_budget / baseline_t1_usd
+        amount_t0_target, amount_t1_target = compute_optimal_split(
+            p=p_now, p_a=p_a, p_b=p_b, total_value_usdc=total_value_token1_units,
+        )
         logger.info(
             f"Dual-leg bootstrap budget=${usdc_budget:.2f} "
             f"oracle[{token0_sym}]={baseline_t0_usd} oracle[{token1_sym}]={baseline_t1_usd} "
@@ -446,71 +827,59 @@ class OperationLifecycle:
         try:
             await self._db.update_bootstrap_state(op_id, "approving")
             self._hub.bootstrap_progress = "Approving tokens (dual-leg)..."
-            # USDC must be approved for the router (we spend USDC twice).
+            # USDC must be approved for the router (we spend USDC for the
+            # single token0 swap).
             await self._uniswap.ensure_approval(
                 token_address=_USDC_ADDRESS_ARBITRUM,
                 amount=2**256 - 1,
                 spender=self._settings.uniswap_v3_router_address,
             )
-            # Both pool tokens must be approved for the Beefy strategy.
+            # token0 must be approved for the Beefy earn vault — that's
+            # what gets transferred in by deposit(). token1 doesn't need
+            # approval here because the vault zaps token0→token1 itself.
             await self._beefy.ensure_approval(
                 token_address=self._settings.token0_address, amount=2**256 - 1,
-            )
-            await self._beefy.ensure_approval(
-                token_address=self._settings.token1_address, amount=2**256 - 1,
             )
 
             slippage = self._settings.slippage_bps / 10000.0
 
-            # ---- Swap 1: USDC -> token0 ----
-            # In dual-leg, both legs must execute their swap call (cross-pair
-            # holds USDC, neither token is USDC). When `compute_optimal_split`
-            # returns 0 for a leg (price outside range), the call is still
-            # issued but with amount_out=0 — the router will treat it as a
-            # no-op or revert; we surface either via the standard failure path.
+            # ---- Single swap: USDC -> token0 for the FULL budget ----
+            # Beefy CLM v2 deposit() only consumes amount0 and zaps it
+            # into the pool's V3 ratio internally. Acquiring token1
+            # pre-deposit was wasted gas + slippage in the old code path.
             await self._db.update_bootstrap_state(op_id, "swap_token0_pending")
-            self._hub.bootstrap_progress = f"Swapping USDC -> {self._settings.pool_token0_symbol}..."
-            usdc_for_t0 = amount_t0_target * baseline_t0_usd
-            amount_in_max_t0 = int(usdc_for_t0 * (1 + slippage) * 10**6)  # USDC = 6 decimals
-            amount_out_t0 = int(amount_t0_target * 10**self._decimals0)
-            tx0 = await self._uniswap.swap_exact_output(
-                token_in=_USDC_ADDRESS_ARBITRUM,
+            self._hub.bootstrap_progress = (
+                f"Swapping USDC -> {self._settings.pool_token0_symbol}..."
+            )
+            total_in_token0 = usdc_budget / baseline_t0_usd if baseline_t0_usd > 0 else 0.0
+            current_bal = await self._read_wallet_balance()
+            tx0 = await self._maybe_swap_to_token(
+                strategy=strat_t0,
+                target_amount=total_in_token0,
+                wallet_balance=current_bal["token0"],
                 token_out=self._settings.token0_address,
-                fee=self._settings.uniswap_v3_pool_fee,
-                amount_out=amount_out_t0,
-                amount_in_maximum=amount_in_max_t0,
-                recipient=self._uniswap.address,
-                deadline=int(time.time()) + DEFAULT_DEADLINE_SECONDS,
+                token_out_symbol=self._settings.pool_token0_symbol,
+                token_out_decimals=self._decimals0,
+                slippage=slippage,
             )
+            # Keep the legacy `swaps_done` state name for resume_in_flight
+            # compatibility — the state machine doesn't differentiate
+            # whether one or two swaps ran.
             await self._db.update_bootstrap_state(
-                op_id, "swap_token0_done", swap_tx_hash=tx0,
+                op_id, "swaps_done", swap_tx_hash=tx0,
             )
 
-            # ---- Swap 2: USDC -> token1 ----
-            await self._db.update_bootstrap_state(op_id, "swap_token1_pending")
-            self._hub.bootstrap_progress = f"Swapping USDC -> {self._settings.pool_token1_symbol}..."
-            usdc_for_t1 = amount_t1_target * baseline_t1_usd
-            amount_in_max_t1 = int(usdc_for_t1 * (1 + slippage) * 10**6)
-            amount_out_t1 = int(amount_t1_target * 10**self._decimals1)
-            tx1 = await self._uniswap.swap_exact_output(
-                token_in=_USDC_ADDRESS_ARBITRUM,
-                token_out=self._settings.token1_address,
-                fee=self._settings.uniswap_v3_pool_fee,
-                amount_out=amount_out_t1,
-                amount_in_maximum=amount_in_max_t1,
-                recipient=self._uniswap.address,
-                deadline=int(time.time()) + DEFAULT_DEADLINE_SECONDS,
-            )
-            await self._db.update_bootstrap_state(op_id, "swaps_done", swap_tx_hash=tx1)
-
-            # ---- Deposit on Beefy with actual post-swap balances ----
+            # ---- Deposit on Beefy: amount0 = wallet token0 (raw int from
+            # balanceOf — never `float × 10**decimals`, which rounds up
+            # and triggers transferFrom STF). amount1 = 0 by design.
             await self._db.update_bootstrap_state(op_id, "deposit_pending")
             self._hub.bootstrap_progress = "Depositing in Beefy..."
-            bal = await self._read_wallet_balance()
-            amount0_raw = int(bal["token0"] * 10**self._decimals0)
-            amount1_raw = int(bal["token1"] * 10**self._decimals1)
+            token0_erc = self._uniswap._erc20(self._settings.token0_address)
+            amount0_raw = await token0_erc.functions.balanceOf(
+                self._uniswap.address,
+            ).call()
             tx_dep = await self._beefy.deposit(
-                amount0=amount0_raw, amount1=amount1_raw, min_shares=0,
+                amount0=amount0_raw, amount1=0, min_shares=0,
             )
             await self._db.update_bootstrap_state(
                 op_id, "deposit_done", deposit_tx_hash=tx_dep,
@@ -877,6 +1246,129 @@ class OperationLifecycle:
             await self._db.update_bootstrap_state(
                 op_id, "teardown_swap_done", teardown_swap_tx_hash=tx,
             )
+
+    async def recover_partial_position(self) -> dict:
+        """Emergency recovery: withdraw any Beefy shares + swap residuals to USDC.
+
+        Use case: an operation failed mid-bootstrap (e.g. hedge open
+        failed after deposit succeeded). The user is left with shares in
+        the vault and/or residual tokens in the wallet, with no active
+        operation tracking it. This method:
+          1. Reads current wallet shares of the earn vault.
+          2. If shares > 0, withdraws them all (returns token0 + token1 to wallet).
+          3. Swaps residual token0 → USDC (if dual-leg) or → token1 (single-leg).
+          4. Swaps residual token1 → USDC if dual-leg.
+
+        Returns a summary dict with tx hashes and amounts recovered.
+        Idempotent: safe to call multiple times.
+        """
+        is_dual_leg = bool(self._settings.dydx_symbol_token1)
+        result: dict = {
+            "withdraw_tx": None,
+            "swap_token0_tx": None,
+            "swap_token1_tx": None,
+            "before": {}, "after": {},
+        }
+        # Snapshot before
+        bal_before = await self._read_wallet_balance()
+        beefy_before = await self._beefy_reader.read_position()
+        result["before"] = {
+            "shares": beefy_before.raw_balance,
+            "token0_balance": bal_before["token0"],
+            "token1_balance": bal_before["token1"],
+        }
+
+        # Step 1: withdraw any shares
+        if beefy_before.raw_balance > 0:
+            logger.info(
+                f"Recovery: withdrawing {beefy_before.raw_balance} shares from earn vault"
+            )
+            self._hub.bootstrap_progress = "Recuperando: withdraw Beefy..."
+            tx = await self._beefy.withdraw(
+                shares=beefy_before.raw_balance, min_amount0=0, min_amount1=0,
+            )
+            result["withdraw_tx"] = tx
+        else:
+            logger.info("Recovery: no Beefy shares to withdraw")
+
+        # Step 2 & 3: swap residuals to USDC.
+        # IMPORTANT: in bootstrap we only approve USDC→router (the input
+        # to bootstrap swaps), so token0/token1 are NOT yet approved for
+        # the router. Recovery flips direction (token0/1 → USDC) and so
+        # needs fresh approvals. Without these, the swap reverts with
+        # `STF` (SafeTransferFrom failed) inside the SwapRouter.
+        #
+        # Use RAW balances (uint256 from balanceOf) — never `float ×
+        # 10**decimals`, which rounds up and tries to spend more than the
+        # wallet has, causing STF.
+        deadline = int(time.time()) + DEFAULT_DEADLINE_SECONDS
+        router = self._settings.uniswap_v3_router_address
+        token0_erc = self._uniswap._erc20(self._settings.token0_address)
+        token1_erc = self._uniswap._erc20(self._settings.token1_address)
+        token0_raw = await token0_erc.functions.balanceOf(self._uniswap.address).call()
+        token1_raw = await token1_erc.functions.balanceOf(self._uniswap.address).call()
+
+        if token0_raw > 0:
+            logger.info(
+                f"Recovery: swapping {token0_raw} raw "
+                f"({token0_raw/10**self._decimals0:.6f}) "
+                f"{self._settings.pool_token0_symbol} → USDC"
+            )
+            self._hub.bootstrap_progress = "Recuperando: token0 → USDC..."
+            await self._uniswap.ensure_approval(
+                token_address=self._settings.token0_address,
+                amount=2**256 - 1, spender=router,
+            )
+            token_out = _USDC_ADDRESS_ARBITRUM if is_dual_leg else self._settings.token1_address
+            fee_tier = await _best_swap_fee_tier(
+                self._uniswap._w3, self._settings.token0_address, token_out,
+            ) or self._settings.uniswap_v3_pool_fee
+            tx0 = await self._uniswap.swap_exact_input(
+                token_in=self._settings.token0_address,
+                token_out=token_out,
+                fee=fee_tier,
+                amount_in=token0_raw,
+                amount_out_minimum=0,  # accept any — recovery, not entry
+                recipient=self._uniswap.address,
+                deadline=deadline,
+            )
+            result["swap_token0_tx"] = tx0
+
+        if is_dual_leg and token1_raw > 0:
+            logger.info(
+                f"Recovery: swapping {token1_raw} raw "
+                f"({token1_raw/10**self._decimals1:.6f}) "
+                f"{self._settings.pool_token1_symbol} → USDC"
+            )
+            self._hub.bootstrap_progress = "Recuperando: token1 → USDC..."
+            await self._uniswap.ensure_approval(
+                token_address=self._settings.token1_address,
+                amount=2**256 - 1, spender=router,
+            )
+            fee_tier = await _best_swap_fee_tier(
+                self._uniswap._w3, self._settings.token1_address, _USDC_ADDRESS_ARBITRUM,
+            ) or self._settings.uniswap_v3_pool_fee
+            tx1 = await self._uniswap.swap_exact_input(
+                token_in=self._settings.token1_address,
+                token_out=_USDC_ADDRESS_ARBITRUM,
+                fee=fee_tier,
+                amount_in=token1_raw,
+                amount_out_minimum=0,
+                recipient=self._uniswap.address,
+                deadline=int(time.time()) + DEFAULT_DEADLINE_SECONDS,
+            )
+            result["swap_token1_tx"] = tx1
+
+        # Snapshot after
+        bal_after = await self._read_wallet_balance()
+        beefy_after = await self._beefy_reader.read_position()
+        result["after"] = {
+            "shares": beefy_after.raw_balance,
+            "token0_balance": bal_after["token0"],
+            "token1_balance": bal_after["token1"],
+        }
+        self._hub.bootstrap_progress = ""
+        return result
 
     async def cashout_residual(self) -> dict:
         """Swap any residual token0 in the wallet to token1.

@@ -156,6 +156,11 @@ class LighterAdapter(ExchangeAdapter):
         for detail in details_list:
             sym_lighter = detail.symbol  # e.g. "ETH"
             sym_user = f"{sym_lighter}-USD"  # engine convention
+            # step_size is the smallest representable quantity given size_decimals,
+            # NOT the API's min_base_amount field. Empirically Lighter's matching
+            # engine accepts orders smaller than min_base_amount as long as they
+            # round to a valid integer at supported_size_decimals (e.g., ARB
+            # accepts 0.4 even though min_base_amount=20.0).
             self._markets[sym_user] = _MarketMeta(
                 symbol_user=sym_user,
                 symbol_lighter=sym_lighter,
@@ -163,7 +168,7 @@ class LighterAdapter(ExchangeAdapter):
                 price_decimals=detail.supported_price_decimals,
                 size_decimals=detail.supported_size_decimals,
                 tick_size=10 ** -detail.supported_price_decimals,
-                step_size=float(detail.min_base_amount),
+                step_size=10 ** -detail.supported_size_decimals,
                 min_base_amount=float(detail.min_base_amount),
                 min_quote_amount=float(detail.min_quote_amount),
             )
@@ -232,6 +237,11 @@ class LighterAdapter(ExchangeAdapter):
                 continue
 
             # IOC LIMIT at exactly the bid/ask we observed.
+            # `order_expiry=DEFAULT_IOC_EXPIRY` (=0) is REQUIRED when
+            # `time_in_force=IOC`. The SDK's default order_expiry is -1
+            # (DEFAULT_28_DAY_ORDER_EXPIRY) which is only valid for resting
+            # GTC orders; passing -1 with IOC time-in-force makes the
+            # exchange reject the order with "OrderExpiry is invalid".
             from lighter import SignerClient
             tx, resp, err = await self._signer.create_order(
                 market_index=meta.market_index,
@@ -241,6 +251,7 @@ class LighterAdapter(ExchangeAdapter):
                 is_ask=is_ask,
                 order_type=SignerClient.ORDER_TYPE_LIMIT,
                 time_in_force=SignerClient.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                order_expiry=SignerClient.DEFAULT_IOC_EXPIRY,
             )
             if err is not None:
                 # Exchange-side error (insufficient margin, market halted, etc.)

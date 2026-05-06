@@ -140,8 +140,6 @@ async def preview_operation(request: Request):
             {"error": "Engine not running (set START_ENGINE=true)"}, status_code=503,
         )
     engine = request.app.state.engine
-    if engine._lifecycle is None:
-        return JSONResponse({"error": "Lifecycle not configured"}, status_code=503)
 
     try:
         body = await request.json()
@@ -152,7 +150,9 @@ async def preview_operation(request: Request):
         return JSONResponse({"error": "usdc_budget must be positive"}, status_code=400)
 
     try:
-        plan = await engine._lifecycle.bootstrap_preview(usdc_budget=usdc_budget)
+        # Engine routes through pair_factory when a vault is selected, so the
+        # preview uses the SAME addresses the real operation would use.
+        plan = await engine.preview_operation(usdc_budget=usdc_budget)
         return JSONResponse(plan, status_code=200)
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=409)
@@ -169,19 +169,37 @@ async def start_operation(request: Request):
         )
     engine = request.app.state.engine
 
-    # Parse optional JSON body for Phase 2.0 budget
+    # Parse optional JSON body for Phase 2.0 budget + per-leg swap strategies
     usdc_budget = None
+    swap_strategies = None
     try:
         body = await request.json()
         if "usdc_budget" in body:
             usdc_budget = float(body["usdc_budget"])
             if usdc_budget <= 0:
                 return JSONResponse({"error": "usdc_budget must be positive"}, status_code=400)
+        if "swap_strategies" in body and isinstance(body["swap_strategies"], dict):
+            valid_choices = {"use_existing", "full_swap", "swap_diff"}
+            raw = body["swap_strategies"]
+            cleaned: dict = {}
+            for leg in ("token0", "token1"):
+                if leg in raw:
+                    choice = str(raw[leg])
+                    if choice not in valid_choices:
+                        return JSONResponse(
+                            {"error": f"swap_strategies.{leg} must be one of {sorted(valid_choices)}"},
+                            status_code=400,
+                        )
+                    cleaned[leg] = choice
+            if cleaned:
+                swap_strategies = cleaned
     except Exception:
         pass  # No body or invalid JSON; legacy mode
 
     try:
-        op_id = await engine.start_operation(usdc_budget=usdc_budget)
+        op_id = await engine.start_operation(
+            usdc_budget=usdc_budget, swap_strategies=swap_strategies,
+        )
         return JSONResponse({"id": op_id, "status": "active"}, status_code=201)
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=409)
@@ -234,17 +252,84 @@ async def cashout(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-async def wallet_balance(request: Request):
+async def curve_preview(request: Request):
+    """GET /curve → V3 range + grid that the engine WILL post (or is
+    posting) for the currently selected vault. Used by the dashboard to
+    render the LP curve visually so the user can see where buy/sell
+    orders trigger before/after starting an operation."""
     if not hasattr(request.app.state, "engine"):
-        return JSONResponse({"usdc_balance": 0, "weth_balance": 0, "eth_balance": 0})
+        return JSONResponse({"error": "Engine not running"}, status_code=503)
     engine = request.app.state.engine
-    if engine._lifecycle is None:
-        return JSONResponse({"usdc_balance": 0, "weth_balance": 0, "eth_balance": 0})
-    bal = await engine._lifecycle._read_wallet_balance()
+    try:
+        return JSONResponse(await engine.compute_curve_preview(), status_code=200)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def recover_partial(request: Request):
+    """Emergency recovery: withdraw any Beefy shares + swap residuals to USDC.
+
+    For when an operation fails mid-bootstrap and leaves orphaned shares
+    or wallet balances. Idempotent.
+    """
+    if not hasattr(request.app.state, "engine"):
+        return JSONResponse({"error": "Engine not running"}, status_code=503)
+    engine = request.app.state.engine
+    db = request.app.state.db
+
+    active = await db.get_active_operation()
+    if active is not None:
+        return JSONResponse(
+            {"error": "Active operation in progress; use /operations/stop instead"},
+            status_code=409,
+        )
+
+    try:
+        result = await engine.recover_partial_position()
+        return JSONResponse(result, status_code=200)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def wallet_balance(request: Request):
+    """Return wallet balances + total USD value via oracle.
+
+    Routing mirrors preview_operation: pair-picker mode rebuilds the
+    lifecycle from the selected vault, so cross-pair vaults expose all
+    three balances (native USDC + token0 + token1) and the total in USD.
+
+    Backwards-compatible fields: `usdc_balance`, `weth_balance`,
+    `eth_balance` are still emitted (where `weth_balance` aliases
+    `token0_balance`, regardless of whether token0 is actually WETH).
+    New callers should use the explicit per-token fields.
+    """
+    empty = {
+        "usdc_balance": 0.0, "weth_balance": 0.0, "eth_balance": 0.0,
+        "token0_balance": 0.0, "token1_balance": 0.0,
+        "token0_symbol": "", "token1_symbol": "",
+        "token0_usd_price": 0.0, "token1_usd_price": 0.0,
+        "total_usd": 0.0, "is_dual_leg": False,
+    }
+    if not hasattr(request.app.state, "engine"):
+        return JSONResponse(empty)
+    engine = request.app.state.engine
+    summary = await engine.wallet_summary()
+    if summary is None:
+        return JSONResponse(empty)
     return JSONResponse({
-        "usdc_balance": bal["token1"],
-        "weth_balance": bal["token0"],
-        "eth_balance": bal["eth"],
+        # Backwards-compat keys
+        "usdc_balance": summary["usdc_balance"],
+        "weth_balance": summary["token0_balance"],
+        "eth_balance": summary["eth_balance"],
+        # Explicit per-token + USD breakdown
+        "token0_balance": summary["token0_balance"],
+        "token1_balance": summary["token1_balance"],
+        "token0_symbol": summary["token0_symbol"],
+        "token1_symbol": summary["token1_symbol"],
+        "token0_usd_price": summary["token0_usd_price"],
+        "token1_usd_price": summary["token1_usd_price"],
+        "total_usd": summary["total_usd"],
+        "is_dual_leg": summary["is_dual_leg"],
     })
 
 

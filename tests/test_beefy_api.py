@@ -305,3 +305,63 @@ def test_fee_tier_to_pool_fee_handles_edge_cases():
     assert _fee_tier_to_pool_fee("NaN") == 0
     assert _fee_tier_to_pool_fee("-0.05") == 0
     assert _fee_tier_to_pool_fee("inf") == 0
+
+
+@pytest.mark.asyncio
+async def test_extract_pair_includes_strategy_address(mock_db):
+    """Beefy CLM v2 returns 'strategy' field; _extract_pair must surface it
+    so the BeefyClmReader can target the strategy contract directly (where
+    positionMain/balances live, distinct from the user-facing earn vault
+    that holds totalSupply/balanceOf)."""
+    fetcher = BeefyApiFetcher(db=mock_db)
+    clm = {
+        "earnContractAddress": "0xEARN",
+        "strategy": "0xSTRATEGY_C443",
+        "id": "test-arb-weth",
+        "chain": "arbitrum",
+        "status": "active",
+        "tokenAddress": "0xPOOL",
+        "depositTokenAddresses": [
+            "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",  # WETH
+            "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",  # USDC
+        ],
+        "feeTier": "0.05",
+    }
+    pair = await fetcher._extract_pair(
+        clm,
+        tvl_data={"42161": {"test-arb-weth": 1_000_000}},
+        apy_data={"test-arb-weth": {"vaultApr": 0.15}},
+        active_dydx_tickers={"ETH-USD"},
+        now=0,
+    )
+    assert pair is not None
+    assert pair["vault_id"] == "0xEARN"
+    assert pair["strategy_address"] == "0xSTRATEGY_C443"
+
+
+@pytest.mark.asyncio
+async def test_extract_pair_strategy_address_empty_when_missing(mock_db):
+    """If Beefy API omits 'strategy' (legacy / mid-migration), surface ''
+    so downstream code can fall back to vault_id."""
+    fetcher = BeefyApiFetcher(db=mock_db)
+    clm = {
+        "earnContractAddress": "0xEARN_ONLY",
+        # no "strategy" field
+        "id": "legacy-vault",
+        "chain": "arbitrum",
+        "status": "active",
+        "tokenAddress": "0xPOOL",
+        "depositTokenAddresses": [
+            "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+            "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
+        ],
+        "feeTier": "0.05",
+    }
+    pair = await fetcher._extract_pair(
+        clm,
+        tvl_data={}, apy_data={},
+        active_dydx_tickers={"ETH-USD"},
+        now=0,
+    )
+    assert pair is not None
+    assert pair["strategy_address"] == ""

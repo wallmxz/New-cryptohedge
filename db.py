@@ -196,6 +196,19 @@ class Database:
         except aiosqlite.OperationalError:
             pass
 
+        # Beefy CLM v2 splits read state across two contracts: the EARN
+        # contract (vault_id, holds totalSupply/balanceOf) and the STRATEGY
+        # contract (holds positionMain/balances). Older cache entries only
+        # had vault_id; the strategy_address column was added so the reader
+        # can target the strategy directly.
+        try:
+            await self._conn.execute(
+                "ALTER TABLE beefy_pairs_cache ADD COLUMN strategy_address TEXT"
+            )
+            await self._conn.commit()
+        except aiosqlite.OperationalError:
+            pass
+
         # ERC20 (symbol, decimals) metadata cache. Filled on-demand from on-chain
         # reads when the Beefy fetcher encounters new token addresses; rows are
         # immutable per address (ERC20 metadata never changes for a given
@@ -550,8 +563,8 @@ class Database:
                 pool_fee, manager, tick_lower, tick_upper,
                 tvl_usd, apy_30d, is_usd_pair, dydx_perp,
                 token0_logo_url, token1_logo_url, fetched_at,
-                dydx_perp_token1
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                dydx_perp_token1, strategy_address
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 pair["vault_id"], pair["chain"], pair["pool_address"],
                 pair["token0_address"], pair["token0_symbol"], pair["token0_decimals"],
@@ -563,6 +576,7 @@ class Database:
                 pair.get("token0_logo_url"), pair.get("token1_logo_url"),
                 pair["fetched_at"],
                 pair.get("dydx_perp_token1"),
+                pair.get("strategy_address"),
             ),
         )
         await self._conn.commit()

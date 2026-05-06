@@ -70,6 +70,18 @@ async def build_lifecycle(
             f"{sorted(SUPPORTED_DECIMALS_PAIR)} only."
         )
 
+    # Beefy CLM v2 splits state between two contracts:
+    # - "vault_id" (= earnContractAddress from Beefy API) is the user-facing
+    #   ERC20 vault that holds totalSupply/balanceOf for share accounting.
+    # - "strategy_address" (= strategy field from Beefy API) holds the V3
+    #   NFT, ranges (positionMain), and current balances.
+    # Older entries in the cache may not have strategy_address yet (refresh
+    # not yet run); fall back to vault_id in that case so the system at
+    # least makes a single-contract attempt instead of crashing in the
+    # factory. The fallback will fail at first read and surface a clear
+    # error to the operator, who can then run a refresh.
+    strategy_address = pair.get("strategy_address") or pair["vault_id"]
+
     pair_settings = dataclasses.replace(
         settings,
         dydx_symbol_token0=perp0,
@@ -90,7 +102,8 @@ async def build_lifecycle(
         decimals0=decimals0, decimals1=decimals1,
     )
     beefy_reader = BeefyClmReader(
-        w3=w3, strategy_address=pair["vault_id"],
+        w3=w3, strategy_address=strategy_address,
+        earn_address=pair["vault_id"],
         wallet_address=settings.wallet_address,
         decimals0=decimals0, decimals1=decimals1,
     )
@@ -99,7 +112,9 @@ async def build_lifecycle(
         router_address=settings.uniswap_v3_router_address,
     )
     beefy_exec = BeefyExecutor(
-        w3=w3, account=account, strategy_address=pair["vault_id"],
+        w3=w3, account=account,
+        strategy_address=strategy_address,
+        earn_address=pair["vault_id"],
     )
 
     lifecycle = OperationLifecycle(
@@ -114,3 +129,55 @@ async def build_lifecycle(
         f"{'USD-pair' if is_usd else 'cross-pair (dual-leg)'})"
     )
     return lifecycle
+
+
+async def build_readers_for_vault(*, settings, db, w3, selected_vault_id: str):
+    """Lightweight version of build_lifecycle that returns just the chain
+    readers (UniswapV3PoolReader + BeefyClmReader) plus the per-pair
+    settings overrides (decimals, perp symbols, etc).
+
+    Used by the engine main loop so it can read the SAME pool/vault that
+    `start_operation` would target — without rebuilding the whole
+    lifecycle every iteration. Returns None if vault is missing from the
+    cache (so the caller can keep idling).
+
+    Returns: (pair_settings, pool_reader, beefy_reader, decimals0, decimals1)
+    """
+    pair = await db.get_pair_from_cache(selected_vault_id)
+    if pair is None:
+        return None
+
+    decimals0 = int(pair["token0_decimals"])
+    decimals1 = int(pair["token1_decimals"])
+    if (decimals0, decimals1) not in SUPPORTED_DECIMALS_PAIR:
+        return None
+
+    strategy_address = pair.get("strategy_address") or pair["vault_id"]
+    perp0 = pair["dydx_perp"]
+    perp1 = pair.get("dydx_perp_token1") or ""
+
+    pair_settings = dataclasses.replace(
+        settings,
+        dydx_symbol_token0=perp0,
+        dydx_symbol_token1=perp1,
+        token0_address=pair["token0_address"],
+        token1_address=pair["token1_address"],
+        token0_decimals=decimals0,
+        token1_decimals=decimals1,
+        pool_token0_symbol=pair["token0_symbol"],
+        pool_token1_symbol=pair["token1_symbol"],
+        clm_vault_address=pair["vault_id"],
+        clm_pool_address=pair["pool_address"],
+        uniswap_v3_pool_fee=int(pair["pool_fee"]),
+    )
+    pool_reader = UniswapV3PoolReader(
+        w3=w3, pool_address=pair["pool_address"],
+        decimals0=decimals0, decimals1=decimals1,
+    )
+    beefy_reader = BeefyClmReader(
+        w3=w3, strategy_address=strategy_address,
+        earn_address=pair["vault_id"],
+        wallet_address=settings.wallet_address,
+        decimals0=decimals0, decimals1=decimals1,
+    )
+    return (pair_settings, pool_reader, beefy_reader, decimals0, decimals1)

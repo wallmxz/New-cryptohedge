@@ -72,6 +72,13 @@ class GridMakerEngine:
         # corrections stack up and explode the position when price crosses.
         self._last_aggressive_correction_at: float = 0.0
         self.AGGRESSIVE_CORRECTION_COOLDOWN_SECONDS = 30.0
+        # Cache of (vault_id, readers, pair_settings). Rebuilt when DB's
+        # selected_vault_id changes. Lets the main loop read the SAME
+        # pool/vault that start_operation would target, instead of the
+        # placeholder addresses from .env.
+        self._vault_readers_cache: tuple[
+            str, UniswapV3PoolReader, BeefyClmReader, "Settings", int, int,
+        ] | None = None
 
     def _ensure_reconciler(self):
         if self._reconciler is None and self._exchange is not None:
@@ -80,7 +87,224 @@ class GridMakerEngine:
             )
         return self._reconciler
 
-    async def start_operation(self, *, usdc_budget: float | None = None) -> int:
+    async def compute_curve_preview(self) -> dict:
+        """Read the current vault's V3 range + grid that the engine would
+        post against it. Used by the dashboard to render the LP curve
+        visually so the user can see where buy/sell orders would trigger
+        BEFORE starting an operation.
+
+        Returns a dict with:
+          - pool: { p_now, p_a, p_b, in_range, token0_symbol, token1_symbol }
+          - position: { my_amount0, my_amount1, pool_value_usd, share }
+          - grid: [{ price, side, size, target_short }, ...]
+          - source: "active" if reading our actual LP position, "preview"
+            if simulating against the wallet's total USD value.
+          - min_notional_usd: minimum size of each grid order.
+
+        Routes via the same vault as preview/start so what we render is
+        what we'd actually post.
+        """
+        await self._refresh_vault_readers()  # ensure correct readers
+        # Refuse early if pre-pair-pick (placeholder vault from .env).
+        vault_addr = str(self._settings.clm_vault_address or "")
+        if len(vault_addr) < 30:
+            return {"error": "no_pair_selected"}
+
+        beefy_pos = await self._beefy_reader.read_position()
+        p_now = await self._pool_reader.read_price()
+        p_a = tick_to_price(beefy_pos.tick_lower, self._decimals0, self._decimals1)
+        p_b = tick_to_price(beefy_pos.tick_upper, self._decimals0, self._decimals1)
+
+        my_amount0 = beefy_pos.amount0 * beefy_pos.share
+        my_amount1 = beefy_pos.amount1 * beefy_pos.share
+        my_value_t1 = my_amount0 * p_now + my_amount1
+        is_dual_leg = bool(self._settings.dydx_symbol_token1)
+
+        symbols = [self._settings.dydx_symbol_token0]
+        if is_dual_leg:
+            symbols.append(self._settings.dydx_symbol_token1)
+        oracle = {}
+        try:
+            oracle = await self._exchange.get_oracle_prices(symbols)
+        except Exception:
+            pass
+        p0_usd = float(oracle.get(symbols[0], p_now) or p_now)
+        p1_usd = (
+            float(oracle.get(symbols[1], 1.0) or 1.0)
+            if is_dual_leg else 1.0
+        )
+        if is_dual_leg:
+            pool_value_usd = my_amount0 * p0_usd + my_amount1 * p1_usd
+        else:
+            pool_value_usd = my_value_t1
+
+        # If no LP position yet, simulate the curve against the wallet's
+        # total USD value — gives the user a feel of where orders would go.
+        source = "active" if my_value_t1 > 0 else "preview"
+        if my_value_t1 <= 0:
+            try:
+                ws = await self._lifecycle.wallet_summary() if self._lifecycle else None
+                if ws is None and self._pair_factory_w3 is not None:
+                    sel = await self._db.get_selected_vault_id()
+                    if sel:
+                        from engine.pair_factory import build_lifecycle
+                        lc = await build_lifecycle(
+                            settings=self._settings, hub=self._hub, db=self._db,
+                            exchange=self._exchange, selected_vault_id=sel,
+                            w3=self._pair_factory_w3,
+                            account=self._pair_factory_account,
+                        )
+                        ws = await lc.wallet_summary()
+                if ws and ws.get("total_usd", 0) > 0:
+                    # Convert wallet total USD into "value in token1 units"
+                    # — that's what compute_l_from_value expects.
+                    if is_dual_leg and p1_usd > 0:
+                        my_value_t1 = ws["total_usd"] / p1_usd
+                    else:
+                        my_value_t1 = ws["total_usd"]
+            except Exception as e:
+                logger.warning(f"compute_curve_preview wallet sim failed: {e}")
+
+        # No grid possible if out of range or no value.
+        in_range = p_a < p_now < p_b
+        grid_payload = []
+        if in_range and my_value_t1 > 0:
+            try:
+                L = compute_l_from_value(my_value_t1, p_a, p_b, p_now)
+                # Min notional defaults to $3 — the dYdX minimum used in
+                # production. Lighter is similar. The exact value comes
+                # from the exchange but for visualization $3 is fine.
+                min_notional = 3.0
+                max_orders = self._settings.max_open_orders or 200
+                levels = compute_target_grid(
+                    L=L, p_a=p_a, p_b=p_b, p_now=p_now,
+                    hedge_ratio=self._hub.hedge_ratio or 1.0,
+                    min_notional_usd=min_notional, max_orders=max_orders,
+                )
+                grid_payload = [
+                    {
+                        "price": lv.price, "side": lv.side, "size": lv.size,
+                        "target_short": lv.target_short,
+                    }
+                    for lv in levels
+                ]
+            except Exception as e:
+                logger.warning(f"compute_curve_preview grid build failed: {e}")
+
+        return {
+            "source": source,
+            "pool": {
+                "p_now": p_now, "p_a": p_a, "p_b": p_b, "in_range": in_range,
+                "token0_symbol": self._settings.pool_token0_symbol,
+                "token1_symbol": self._settings.pool_token1_symbol,
+                "address": self._settings.clm_pool_address,
+                "fee_pct": (self._settings.uniswap_v3_pool_fee or 0) / 1_000_000.0,
+            },
+            "position": {
+                "my_amount0": my_amount0, "my_amount1": my_amount1,
+                "pool_value_usd": pool_value_usd,
+                "share": beefy_pos.share,
+            },
+            "grid": grid_payload,
+            "is_dual_leg": is_dual_leg,
+            "hedge_ratio": self._hub.hedge_ratio or 1.0,
+            "min_notional_usd": 3.0,
+        }
+
+    async def recover_partial_position(self) -> dict:
+        """Emergency recovery: undo any partial state from a failed bootstrap.
+
+        Mirrors the same lifecycle-routing as preview/start so we work
+        against the SAME vault the user is configured for.
+        """
+        selected_vault_id = await self._db.get_selected_vault_id()
+        if (
+            selected_vault_id
+            and self._pair_factory_w3 is not None
+            and self._pair_factory_account is not None
+        ):
+            from engine.pair_factory import build_lifecycle
+            lifecycle = await build_lifecycle(
+                settings=self._settings, hub=self._hub, db=self._db,
+                exchange=self._exchange,
+                selected_vault_id=selected_vault_id,
+                w3=self._pair_factory_w3,
+                account=self._pair_factory_account,
+            )
+            return await lifecycle.recover_partial_position()
+
+        if self._lifecycle is not None:
+            return await self._lifecycle.recover_partial_position()
+
+        raise RuntimeError("No lifecycle configured.")
+
+    async def wallet_summary(self) -> dict | None:
+        """Return total wallet value priced in USD via oracle.
+
+        Mirrors `preview_operation`'s lifecycle-routing so the summary uses
+        the same vault/pool addresses that the actual operation would use.
+        Returns None if no lifecycle is reachable (no pair selected and no
+        singleton lifecycle).
+        """
+        selected_vault_id = await self._db.get_selected_vault_id()
+        if (
+            selected_vault_id
+            and self._pair_factory_w3 is not None
+            and self._pair_factory_account is not None
+        ):
+            from engine.pair_factory import build_lifecycle
+            lifecycle = await build_lifecycle(
+                settings=self._settings, hub=self._hub, db=self._db,
+                exchange=self._exchange,
+                selected_vault_id=selected_vault_id,
+                w3=self._pair_factory_w3,
+                account=self._pair_factory_account,
+            )
+            return await lifecycle.wallet_summary()
+
+        if self._lifecycle is not None:
+            return await self._lifecycle.wallet_summary()
+
+        return None
+
+    async def preview_operation(self, *, usdc_budget: float) -> dict:
+        """Compute the swap+deposit+hedge plan WITHOUT touching the chain.
+
+        Mirrors `start_operation`'s lifecycle-selection logic so the preview
+        uses the SAME addresses the actual operation would use:
+          - Pair-picker path: rebuild lifecycle via pair_factory for the
+            currently-selected vault, then preview against that.
+          - Singleton lifecycle path: preview against `self._lifecycle`.
+          - Legacy: no preview available (returns error).
+        """
+        selected_vault_id = await self._db.get_selected_vault_id()
+        if (
+            selected_vault_id
+            and self._pair_factory_w3 is not None
+            and self._pair_factory_account is not None
+        ):
+            from engine.pair_factory import build_lifecycle
+            lifecycle = await build_lifecycle(
+                settings=self._settings, hub=self._hub, db=self._db,
+                exchange=self._exchange,
+                selected_vault_id=selected_vault_id,
+                w3=self._pair_factory_w3,
+                account=self._pair_factory_account,
+            )
+            return await lifecycle.bootstrap_preview(usdc_budget=usdc_budget)
+
+        if self._lifecycle is not None:
+            return await self._lifecycle.bootstrap_preview(usdc_budget=usdc_budget)
+
+        raise RuntimeError(
+            "No lifecycle configured and no pair selected. "
+            "Select a pair via UI before previewing."
+        )
+
+    async def start_operation(
+        self, *, usdc_budget: float | None = None,
+        swap_strategies: dict | None = None,
+    ) -> int:
         """Begin a new operation. Routes via pair_factory > singleton lifecycle > legacy.
 
         When pair_factory is configured AND a vault is selected in DB, build a
@@ -90,6 +314,10 @@ class GridMakerEngine:
 
         usdc_budget is REQUIRED when either lifecycle path is used. Missing
         budget raises RuntimeError to prevent silent fallback.
+
+        swap_strategies (optional, cross-pair only): per-leg user choice from
+        the preview UI. Shape `{"token0": "use_existing"|"full_swap"|"swap_diff",
+        "token1": "..."}`. Forwarded to `lifecycle.bootstrap()`.
         """
         # NEW: Pair-picker path (if user has selected a pair via UI)
         selected_vault_id = await self._db.get_selected_vault_id()
@@ -111,7 +339,9 @@ class GridMakerEngine:
                 w3=self._pair_factory_w3,
                 account=self._pair_factory_account,
             )
-            return await lifecycle.bootstrap(usdc_budget=usdc_budget)
+            return await lifecycle.bootstrap(
+                usdc_budget=usdc_budget, swap_strategies=swap_strategies,
+            )
 
         # Phase 2.0 path: singleton lifecycle if configured
         if self._lifecycle is not None:
@@ -120,7 +350,9 @@ class GridMakerEngine:
                     "usdc_budget required when lifecycle is configured. "
                     "Pass {usdc_budget: <float>} in request body."
                 )
-            return await self._lifecycle.bootstrap(usdc_budget=usdc_budget)
+            return await self._lifecycle.bootstrap(
+                usdc_budget=usdc_budget, swap_strategies=swap_strategies,
+            )
 
         # Legacy path: existing Phase 1.2 behavior (no on-chain bootstrap)
         existing = await self._db.get_active_operation()
@@ -339,8 +571,17 @@ class GridMakerEngine:
             self._pool_reader = UniswapV3PoolReader(
                 w3, self._settings.clm_pool_address, self._decimals0, self._decimals1,
             )
+            # Legacy fallback path (no pair selected via picker yet). The
+            # CLM v2 reader needs both strategy + earn addresses; without
+            # pair-picker metadata we only have the legacy single address.
+            # This path is only exercised pre-pair-pick (typically with
+            # placeholder addresses), so we pass the configured address as
+            # both — first real read will fail with a clear error if the
+            # address actually points at a deployed contract.
             self._beefy_reader = BeefyClmReader(
-                w3, self._settings.clm_vault_address, self._settings.wallet_address,
+                w3, self._settings.clm_vault_address,
+                self._settings.clm_vault_address,
+                self._settings.wallet_address,
                 self._decimals0, self._decimals1,
             )
             self._hub.connected_chain = True
@@ -380,14 +621,31 @@ class GridMakerEngine:
         # Hold a stable 1Hz cadence: subtract the iteration's elapsed time so
         # a slow iter doesn't compound into a 2Hz/0.5Hz drift.
         period = 1.0
+        # Suppress repeated exception logs while idling against a placeholder
+        # vault — common during fresh setup before any pair is selected.
+        idle_log_suppressed = False
         while self._running:
             iter_start = time.monotonic()
             try:
                 await self._iterate()
+                idle_log_suppressed = False
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.exception(f"Engine loop error: {e}")
+                # When idle (no operation active), the chain reads on the
+                # configured (placeholder) vault address are expected to fail.
+                # Log once at WARN, then suppress until either an operation
+                # starts or a successful iter resets the flag.
+                if self._hub.operation_state == OperationState.NONE.value:
+                    if not idle_log_suppressed:
+                        logger.warning(
+                            f"Idle iter failed (likely placeholder vault — "
+                            f"select a pair via UI to start). Suppressing "
+                            f"further idle errors. err={e!r}"
+                        )
+                        idle_log_suppressed = True
+                else:
+                    logger.exception(f"Engine loop error: {e}")
             elapsed = time.monotonic() - iter_start
             await asyncio.sleep(max(0.0, period - elapsed))
 
@@ -401,11 +659,73 @@ class GridMakerEngine:
             (self._cloid_seq & 0xFF)
         )
 
+    async def _refresh_vault_readers(self) -> None:
+        """If a pair was picked via the UI, swap pool/beefy readers and
+        per-pair settings to point at that vault — instead of using the
+        .env placeholder addresses. Cached against selected_vault_id so we
+        only rebuild when it actually changes (no per-iteration cost).
+
+        No-op when:
+          - pair_factory not configured (legacy single-vault deployments)
+          - no vault selected yet (`/pairs/select` not called)
+          - vault not in beefy_pairs_cache (refresh needed)
+        """
+        if self._pair_factory_w3 is None:
+            return  # legacy single-vault path; nothing to do
+        try:
+            selected = await self._db.get_selected_vault_id()
+        except Exception:
+            return
+        if not selected:
+            return
+        cache = self._vault_readers_cache
+        if cache is not None and cache[0] == selected:
+            return  # already cached for this vault
+        from engine.pair_factory import build_readers_for_vault
+        try:
+            built = await build_readers_for_vault(
+                settings=self._settings, db=self._db,
+                w3=self._pair_factory_w3,
+                selected_vault_id=selected,
+            )
+        except Exception as e:
+            logger.warning(f"build_readers_for_vault failed: {e}")
+            return
+        if built is None:
+            return
+        pair_settings, pool_reader, beefy_reader, dec0, dec1 = built
+        self._settings = pair_settings
+        self._pool_reader = pool_reader
+        self._beefy_reader = beefy_reader
+        self._decimals0 = dec0
+        self._decimals1 = dec1
+        self._vault_readers_cache = (
+            selected, pool_reader, beefy_reader, pair_settings, dec0, dec1,
+        )
+        logger.info(
+            f"Engine readers rebuilt for vault {selected} "
+            f"({pair_settings.pool_token0_symbol}/{pair_settings.pool_token1_symbol})"
+        )
+
     async def _iterate(self):
         iter_start = time.monotonic()
         self._iter_count += 1
         timings: dict[str, float] = {}
         try:
+            # If a pair was picked via UI, swap our readers to point at the
+            # actual vault/pool — not the .env placeholder addresses.
+            # Cached: only rebuilds when selected_vault_id changes.
+            await self._refresh_vault_readers()
+
+            # Idle guard: no real vault means we're pre-pair-selection.
+            # Skip chain reads to avoid log spam. tests pass `settings =
+            # MagicMock()` so `clm_vault_address` may be a MagicMock that
+            # raises TypeError on `len()` — coerce via `str()` first.
+            if self._hub.operation_state == OperationState.NONE.value:
+                vault_addr = str(self._settings.clm_vault_address or "")
+                if len(vault_addr) < 30:
+                    return
+
             await self._maybe_reconcile()
 
             t = time.monotonic()

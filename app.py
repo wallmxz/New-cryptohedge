@@ -18,7 +18,8 @@ from web.logging_config import setup_logging
 from web.routes import (
     dashboard, sse_state, sse_logs, update_settings, get_config,
     list_operations, get_current_operation, start_operation, stop_operation,
-    preview_operation, metrics, cashout, wallet_balance,
+    preview_operation, metrics, cashout, recover_partial, wallet_balance,
+    curve_preview,
     list_pairs, select_pair, refresh_pairs,
 )
 
@@ -78,8 +79,14 @@ def create_app(start_engine: bool = True) -> Starlette:
             pool_reader = UniswapV3PoolReader(
                 w3, settings.clm_pool_address, 18, 6,
             )
+            # Legacy startup fallback. CLM v2 reader needs both strategy +
+            # earn addresses; without pair-picker metadata we only have one.
+            # Pass the same address twice — first real read will fail with a
+            # clear error if a real (non-placeholder) address is configured
+            # without the picker.
             beefy_reader = BeefyClmReader(
-                w3, settings.clm_vault_address, settings.wallet_address, 18, 6,
+                w3, settings.clm_vault_address, settings.clm_vault_address,
+                settings.wallet_address, 18, 6,
             )
 
             # Choose perp exchange based on settings.active_exchange.
@@ -152,6 +159,8 @@ def create_app(start_engine: bool = True) -> Starlette:
         Route("/operations/start", start_operation, methods=["POST"]),
         Route("/operations/stop", stop_operation, methods=["POST"]),
         Route("/operations/cashout", cashout, methods=["POST"]),
+        Route("/operations/recover", recover_partial, methods=["POST"]),
+        Route("/curve", curve_preview, methods=["GET"]),
         Route("/pairs", list_pairs),
         Route("/pairs/select", select_pair, methods=["POST"]),
         Route("/pairs/refresh", refresh_pairs, methods=["POST"]),
