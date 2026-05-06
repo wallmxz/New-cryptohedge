@@ -63,6 +63,24 @@ _QUOTER_V2_ABI = [{
 }]
 
 
+async def _fetch_coinbase_spot_usd(symbol: str) -> float | None:
+    """Query Coinbase public spot price for `symbol-USD` (e.g. ETH, ARB).
+    Returns price as float, or None on failure. No auth, no key needed.
+    Used as a fallback when the perp venue's oracle is unreachable.
+    """
+    import httpx
+    url = f"https://api.coinbase.com/v2/prices/{symbol}-USD/spot"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            r = await client.get(url)
+            r.raise_for_status()
+            data = r.json()
+            return float(data["data"]["amount"])
+    except Exception as e:
+        logger.warning(f"Coinbase spot fetch for {symbol}-USD failed: {e}")
+        return None
+
+
 async def _quote_exact_output(
     w3, token_in: str, token_out: str, fee: int, amount_out: int,
 ) -> int | None:
@@ -150,10 +168,11 @@ _BOOTSTRAP_STATES_RESUMABLE = {
     "approving",
     "swap_pending",
     "swap_confirmed",
-    # Dual-leg states (cross-pair): two sequential swaps replace the single swap.
+    # Dual-leg cross-pair: single swap USDC→token0 (vault zaps internally
+    # to V3 ratio). `swap_token1_pending` was a legacy state from the
+    # 2-swaps model — removed.
     "swap_token0_pending",
     "swap_token0_done",
-    "swap_token1_pending",
     "swaps_done",
     "deposit_pending",
     "deposit_confirmed",
@@ -505,19 +524,12 @@ class OperationLifecycle:
         }
 
         if is_dual_leg:
-            # CROSS-PAIR (cowcentrated CLM v2):
-            # The Beefy CLM v2 vault zaps internally: it accepts only token0
-            # and rebalances to the V3 ratio inside the strategy. So we only
-            # need a SINGLE swap (USDC → token0) sized for the FULL budget,
-            # not two swaps split by V3 ratio. The vault swaps token0 → token1
-            # internally as needed.
-            #
-            # The hedge sizes are sized against `amount_t0_target` /
-            # `amount_t1_target` (the post-zap V3 split estimate). Real
-            # numbers come from `read_position()` after the deposit lands.
+            # Cross-pair single-swap model: ONE swap USDC → token0 for the
+            # full budget. Beefy CLM v2 consumes only amount0 and zaps to
+            # the V3 ratio internally. If the wallet has pre-existing
+            # token1, we offer to consolidate it → token0 first.
             token0_sym = self._settings.dydx_symbol_token0
             token1_sym = self._settings.dydx_symbol_token1
-            # Total budget expressed in token0 units.
             total_in_token0 = usdc_budget / p0_usd if p0_usd > 0 else 0.0
             usdc_for_t0 = total_in_token0 * p0_usd
             plan["swaps"] = [
@@ -534,9 +546,11 @@ class OperationLifecycle:
                 },
             ]
             plan["strategies"] = {
-                # Only the token0 leg has a strategy choice in the new model.
-                # token1 is auto-handled by the vault zap.
                 "token0": recommend_strategy(wallet_bal["token0"], total_in_token0),
+                # token1 default = "keep" (don't touch). User opts in to
+                # "consolidate" only when they explicitly want existing
+                # token1 to be swapped into token0 and consumed.
+                "token1": "keep" if wallet_bal["token1"] > 0 else None,
             }
             plan["hedge"] = [
                 {
@@ -703,7 +717,9 @@ class OperationLifecycle:
             )
 
             await self._db.update_bootstrap_state(op_id, "hedge_pending")
-            self._hub.bootstrap_progress = "Opening short on dYdX..."
+            self._hub.bootstrap_progress = (
+                f"Opening short on {self._settings.active_exchange or 'exchange'}..."
+            )
             target_short = my_amount0 * self._hub.hedge_ratio
             if target_short > 0:
                 await self._exchange.place_long_term_order(
@@ -767,6 +783,14 @@ class OperationLifecycle:
         """
         strategies = swap_strategies or {}
         strat_t0 = strategies.get("token0", "swap_diff")
+        # token1 strategy in single-swap dual-leg model:
+        #   "consolidate" → swap ALL wallet token1 → token0 before deposit.
+        #     User opts in explicitly when they want to use existing
+        #     token1 as capital (consumes it entirely).
+        #   "keep" (DEFAULT) → don't touch wallet token1. Caller's budget
+        #     determines what enters the LP via the USDC swap. Anything
+        #     already in token1 stays put.
+        strat_t1 = strategies.get("token1", "keep")
         existing = await self._db.get_active_operation()
         if existing is not None:
             raise RuntimeError(f"Operation {existing['id']} already active")
@@ -834,24 +858,71 @@ class OperationLifecycle:
                 amount=2**256 - 1,
                 spender=self._settings.uniswap_v3_router_address,
             )
-            # token0 must be approved for the Beefy earn vault — that's
-            # what gets transferred in by deposit(). token1 doesn't need
-            # approval here because the vault zaps token0→token1 itself.
+            # token0 needs approval for the Beefy earn vault — that's
+            # what gets transferred in by deposit(). The vault zaps token0
+            # → token1 internally to the V3 ratio, so we don't approve or
+            # send token1.
             await self._beefy.ensure_approval(
                 token_address=self._settings.token0_address, amount=2**256 - 1,
             )
 
             slippage = self._settings.slippage_bps / 10000.0
 
-            # ---- Single swap: USDC -> token0 for the FULL budget ----
-            # Beefy CLM v2 deposit() only consumes amount0 and zaps it
-            # into the pool's V3 ratio internally. Acquiring token1
-            # pre-deposit was wasted gas + slippage in the old code path.
+            # Cross-pair single-swap model:
+            # 1. Optionally consolidate any existing wallet token1 into
+            #    token0 first (so prior residuals join the LP capital
+            #    instead of staying stranded).
+            # 2. ONE swap USDC → token0 covering whatever's still missing
+            #    to hit the full budget expressed in token0 units.
+            # 3. Deposit amount0 only; vault zaps internally.
+
+            # ---- Step 1: consolidate token1 → token0 (optional) ----
+            current_bal = await self._read_wallet_balance()
+            if strat_t1 == "consolidate" and current_bal["token1"] > 0:
+                token1_erc = self._uniswap._erc20(self._settings.token1_address)
+                token1_raw = await token1_erc.functions.balanceOf(
+                    self._uniswap.address,
+                ).call()
+                if token1_raw > 0:
+                    self._hub.bootstrap_progress = (
+                        f"Consolidando {self._settings.pool_token1_symbol} -> "
+                        f"{self._settings.pool_token0_symbol}..."
+                    )
+                    await self._uniswap.ensure_approval(
+                        token_address=self._settings.token1_address,
+                        amount=2**256 - 1,
+                        spender=self._settings.uniswap_v3_router_address,
+                    )
+                    fee_tier = await _best_swap_fee_tier(
+                        self._uniswap._w3,
+                        self._settings.token1_address,
+                        self._settings.token0_address,
+                    ) or self._settings.uniswap_v3_pool_fee
+                    logger.info(
+                        f"Consolidating {token1_raw} raw "
+                        f"({token1_raw/10**self._decimals1:.6f}) "
+                        f"{self._settings.pool_token1_symbol} -> "
+                        f"{self._settings.pool_token0_symbol} at fee {fee_tier}"
+                    )
+                    await self._uniswap.swap_exact_input(
+                        token_in=self._settings.token1_address,
+                        token_out=self._settings.token0_address,
+                        fee=fee_tier,
+                        amount_in=token1_raw,
+                        amount_out_minimum=0,
+                        recipient=self._uniswap.address,
+                        deadline=int(time.time()) + DEFAULT_DEADLINE_SECONDS,
+                    )
+
+            # ---- Step 2: single swap USDC → token0 ----
+            # Budget expressed in token0 units = total USD / token0 USD price.
             await self._db.update_bootstrap_state(op_id, "swap_token0_pending")
             self._hub.bootstrap_progress = (
                 f"Swapping USDC -> {self._settings.pool_token0_symbol}..."
             )
-            total_in_token0 = usdc_budget / baseline_t0_usd if baseline_t0_usd > 0 else 0.0
+            total_in_token0 = (
+                usdc_budget / baseline_t0_usd if baseline_t0_usd > 0 else 0.0
+            )
             current_bal = await self._read_wallet_balance()
             tx0 = await self._maybe_swap_to_token(
                 strategy=strat_t0,
@@ -862,16 +933,15 @@ class OperationLifecycle:
                 token_out_decimals=self._decimals0,
                 slippage=slippage,
             )
-            # Keep the legacy `swaps_done` state name for resume_in_flight
-            # compatibility — the state machine doesn't differentiate
-            # whether one or two swaps ran.
             await self._db.update_bootstrap_state(
                 op_id, "swaps_done", swap_tx_hash=tx0,
             )
 
-            # ---- Deposit on Beefy: amount0 = wallet token0 (raw int from
-            # balanceOf — never `float × 10**decimals`, which rounds up
-            # and triggers transferFrom STF). amount1 = 0 by design.
+            # ---- Step 3: deposit token0 only ----
+            # Beefy CLM v2 vaults consume only amount0 and zap to V3 ratio
+            # internally. amount1=0 by design.
+            # Use RAW uint256 from balanceOf (never `float × 10**dec` which
+            # rounds up and triggers transferFrom STF).
             await self._db.update_bootstrap_state(op_id, "deposit_pending")
             self._hub.bootstrap_progress = "Depositing in Beefy..."
             token0_erc = self._uniswap._erc20(self._settings.token0_address)
@@ -900,7 +970,9 @@ class OperationLifecycle:
 
             # ---- Hedge: open BOTH perp shorts in parallel ----
             await self._db.update_bootstrap_state(op_id, "hedge_pending")
-            self._hub.bootstrap_progress = "Opening shorts on dYdX (dual-leg)..."
+            self._hub.bootstrap_progress = (
+                f"Opening shorts on {self._settings.active_exchange or 'exchange'} (dual-leg)..."
+            )
             target_short_t0 = my_amount0 * self._hub.hedge_ratio
             target_short_t1 = my_amount1 * self._hub.hedge_ratio
 
@@ -1247,17 +1319,26 @@ class OperationLifecycle:
                 op_id, "teardown_swap_done", teardown_swap_tx_hash=tx,
             )
 
-    async def recover_partial_position(self) -> dict:
-        """Emergency recovery: withdraw any Beefy shares + swap residuals to USDC.
+    async def recover_partial_position(
+        self, *, swap_to_usdc: bool = False,
+    ) -> dict:
+        """Emergency recovery: withdraw any Beefy shares; optionally swap
+        residuals to USDC.
 
         Use case: an operation failed mid-bootstrap (e.g. hedge open
         failed after deposit succeeded). The user is left with shares in
         the vault and/or residual tokens in the wallet, with no active
-        operation tracking it. This method:
-          1. Reads current wallet shares of the earn vault.
-          2. If shares > 0, withdraws them all (returns token0 + token1 to wallet).
-          3. Swaps residual token0 → USDC (if dual-leg) or → token1 (single-leg).
-          4. Swaps residual token1 → USDC if dual-leg.
+        operation tracking it.
+
+        With `swap_to_usdc=False` (DEFAULT, what you usually want):
+          1. Withdraw any shares — wallet gets back token0 + token1.
+          2. STOP. Tokens stay in the wallet so the next start_operation
+             can use them via use_existing/swap_diff without paying for
+             a USDC round-trip.
+
+        With `swap_to_usdc=True` (only when actually exiting):
+          3. Swap residual token0 → USDC (or → token1 in single-leg).
+          4. Swap residual token1 → USDC (dual-leg only).
 
         Returns a summary dict with tx hashes and amounts recovered.
         Idempotent: safe to call multiple times.
@@ -1291,7 +1372,22 @@ class OperationLifecycle:
         else:
             logger.info("Recovery: no Beefy shares to withdraw")
 
-        # Step 2 & 3: swap residuals to USDC.
+        # Steps 2/3 (swap residuals to USDC) only run when the caller
+        # explicitly opts in. Default keeps token0/token1 in the wallet so
+        # the next start_operation can reuse them via use_existing /
+        # swap_diff without paying for a USDC round-trip.
+        if not swap_to_usdc:
+            bal_after = await self._read_wallet_balance()
+            beefy_after = await self._beefy_reader.read_position()
+            result["after"] = {
+                "shares": beefy_after.raw_balance,
+                "token0_balance": bal_after["token0"],
+                "token1_balance": bal_after["token1"],
+            }
+            self._hub.bootstrap_progress = ""
+            return result
+
+        # Below: swap_to_usdc=True path.
         # IMPORTANT: in bootstrap we only approve USDC→router (the input
         # to bootstrap swaps), so token0/token1 are NOT yet approved for
         # the router. Recovery flips direction (token0/1 → USDC) and so
@@ -1369,6 +1465,281 @@ class OperationLifecycle:
         }
         self._hub.bootstrap_progress = ""
         return result
+
+    async def open_shorts_for_existing_position(self) -> dict:
+        """Open the hedge shorts against the position currently sitting in
+        the Beefy vault — without going through the full bootstrap.
+
+        Use case: a previous bootstrap failed AFTER the deposit (e.g. the
+        exchange API was unreachable so the shorts never opened). The LP
+        position is healthy but unhedged. This method:
+          1. Reads the current Beefy position (token0/token1 amounts).
+          2. Inserts a new ACTIVE operation row with baselines equal to
+             the current position so the engine main loop tracks it.
+          3. Opens the 2 perp shorts (or 1 in single-leg) sized against
+             the actual position.
+
+        Errors out if the wallet has zero shares (nothing to hedge).
+        """
+        is_dual_leg = bool(self._settings.dydx_symbol_token1)
+
+        if (await self._db.get_active_operation()) is not None:
+            raise RuntimeError(
+                "Operation already active — engine is already managing a hedge."
+            )
+
+        beefy_pos = await self._beefy_reader.read_position()
+        if beefy_pos.raw_balance <= 0:
+            raise RuntimeError(
+                "Beefy wallet has zero shares. Nothing to hedge."
+            )
+        my_amount0 = beefy_pos.amount0 * beefy_pos.share
+        my_amount1 = beefy_pos.amount1 * beefy_pos.share
+
+        p_now = await self._pool_reader.read_price()
+
+        # Resolve oracle prices (USD) for sizing the shorts and snapping
+        # the operation baseline. Fallback chain (in priority):
+        #   1. Exchange oracle (Lighter)
+        #   2. Coinbase public spot API (no rate limit, no auth) for ETH-USD
+        #      and derive ARB-USD via the pool ratio.
+        if is_dual_leg:
+            t0_sym = self._settings.dydx_symbol_token0
+            t1_sym = self._settings.dydx_symbol_token1
+            try:
+                oracle = await self._exchange.get_oracle_prices([t0_sym, t1_sym])
+            except Exception:
+                oracle = {}
+            p0_usd = float(oracle.get(t0_sym, 0.0) or 0.0)
+            p1_usd = float(oracle.get(t1_sym, 0.0) or 0.0)
+            if p0_usd <= 0 or p1_usd <= 0:
+                # Fallback: Coinbase ETH-USD, derive token1 via pool ratio
+                # (assumes token0 = ETH-like, token1 = ALT). Single-token
+                # pairs can extend by querying their own coinbase ticker.
+                fb_eth = await _fetch_coinbase_spot_usd("ETH")
+                if fb_eth and fb_eth > 0:
+                    if p0_usd <= 0:
+                        p0_usd = fb_eth
+                    if p1_usd <= 0 and p_now > 0:
+                        # p_now is token1 per token0 (e.g. ARB per WETH).
+                        # token1_usd = token0_usd / (token1 per token0)
+                        p1_usd = p0_usd / p_now
+            if p0_usd <= 0 or p1_usd <= 0:
+                raise RuntimeError(
+                    "Oracle prices unavailable from Lighter and Coinbase. "
+                    "Try again in a minute."
+                )
+            pool_value_usd = my_amount0 * p0_usd + my_amount1 * p1_usd
+        else:
+            t0_sym = self._settings.dydx_symbol
+            p0_usd = p_now
+            p1_usd = 1.0
+            pool_value_usd = my_amount0 * p_now + my_amount1
+
+        # Insert as STARTING — promote to ACTIVE only after the shorts
+        # confirm. Otherwise the engine main loop sees an ACTIVE op
+        # without a hedge in place and may double-fire correction takers.
+        op_id = await self._db.insert_operation(
+            started_at=time.time(),
+            status=OperationState.STARTING.value,
+            baseline_eth_price=p_now,
+            baseline_pool_value_usd=pool_value_usd,
+            baseline_amount0=my_amount0,
+            baseline_amount1=my_amount1,
+            baseline_collateral=self._hub.dydx_collateral,
+            usdc_budget=pool_value_usd,
+        )
+        if is_dual_leg:
+            await self._db._conn.execute(
+                "UPDATE operations SET baseline_token0_usd_price = ?, "
+                "baseline_token1_usd_price = ? WHERE id = ?",
+                (p0_usd, p1_usd, op_id),
+            )
+            await self._db._conn.commit()
+        await self._db.update_bootstrap_state(op_id, "hedge_pending")
+        self._hub.current_operation_id = op_id
+        self._hub.operation_state = OperationState.STARTING.value
+
+        # Open the shorts.
+        target_short_t0 = my_amount0 * (self._hub.hedge_ratio or 1.0)
+        target_short_t1 = my_amount1 * (self._hub.hedge_ratio or 1.0)
+        result: dict = {
+            "operation_id": op_id,
+            "shorts": [],
+            "position": {
+                "token0": my_amount0, "token1": my_amount1,
+                "pool_value_usd": pool_value_usd,
+            },
+        }
+
+        async def _open_short(symbol: str, size: float, ref_usd: float, accumulator: str):
+            if size <= 0 or ref_usd <= 0:
+                return None
+            self._hub.bootstrap_progress = (
+                f"Opening short {symbol} on "
+                f"{self._settings.active_exchange or 'exchange'}..."
+            )
+            await self._exchange.place_long_term_order(
+                symbol=symbol, side="sell", size=size,
+                price=ref_usd * 0.999,  # taker
+                cloid_int=self._next_cloid(998),
+                ttl_seconds=60,
+            )
+            slippage_usd = 0.0005 * size * ref_usd
+            await self._db.add_to_operation_accumulator(
+                op_id, accumulator, slippage_usd,
+            )
+            return {"symbol": symbol, "size": size, "ref_price_usd": ref_usd}
+
+        try:
+            if is_dual_leg:
+                short_t0_task = _open_short(
+                    t0_sym, target_short_t0, p0_usd, "perp_fees_paid_token0",
+                )
+                short_t1_task = _open_short(
+                    t1_sym, target_short_t1, p1_usd, "perp_fees_paid_token1",
+                )
+                short_t0, short_t1 = await asyncio.gather(short_t0_task, short_t1_task)
+                if short_t0:
+                    result["shorts"].append(short_t0)
+                if short_t1:
+                    result["shorts"].append(short_t1)
+            else:
+                short = await _open_short(
+                    t0_sym, target_short_t0, p_now, "bootstrap_slippage",
+                )
+                if short:
+                    result["shorts"].append(short)
+        except Exception as e:
+            # Shorts failed → mark op as FAILED so the engine main loop
+            # doesn't try to manage a half-built operation.
+            logger.exception(f"open_shorts_for_existing_position: short open failed: {e}")
+            await self._db.update_operation_status(op_id, OperationState.FAILED.value)
+            await self._db.update_bootstrap_state(op_id, "failed")
+            self._hub.operation_state = OperationState.FAILED.value
+            self._hub.bootstrap_progress = f"Short open failed: {e}"
+            self._hub.current_operation_id = None
+            raise
+
+        # Promote to ACTIVE only after shorts confirmed.
+        await self._db.update_operation_status(op_id, OperationState.ACTIVE.value)
+        await self._db.update_bootstrap_state(op_id, "active")
+        self._hub.operation_state = OperationState.ACTIVE.value
+        self._hub.bootstrap_progress = ""
+        logger.info(
+            f"open_shorts_for_existing_position: op_id={op_id}, "
+            f"shorts={len(result['shorts'])}/{2 if is_dual_leg else 1}"
+        )
+        return result
+
+    async def withdraw_partial(
+        self, *, usd_amount: float | None = None,
+        fraction: float | None = None,
+    ) -> dict:
+        """Withdraw a partial slice of the Beefy position back to the wallet.
+
+        Pass EITHER `usd_amount` (we convert via oracle) OR `fraction`
+        (0.0 to 1.0, direct share fraction). `fraction` is preferred when
+        oracle prices are unreliable (e.g. exchange API blocked) — the
+        user specifies the slice directly.
+
+        Uses min_amount0/1=0 — no slippage protection on the residuals.
+        Returns a summary with tx hash + shares burned.
+        """
+        if (usd_amount is None and fraction is None) or (
+            usd_amount is not None and fraction is not None
+        ):
+            raise ValueError("pass exactly one of `usd_amount` or `fraction`")
+        if fraction is not None and not (0 < fraction <= 1):
+            raise ValueError("fraction must be in (0, 1]")
+        if usd_amount is not None and usd_amount <= 0:
+            raise ValueError("usd_amount must be positive")
+
+        is_dual_leg = bool(self._settings.dydx_symbol_token1)
+        beefy_pos = await self._beefy_reader.read_position()
+        my_amount0 = beefy_pos.amount0 * beefy_pos.share
+        my_amount1 = beefy_pos.amount1 * beefy_pos.share
+        if beefy_pos.raw_balance <= 0:
+            raise RuntimeError("No Beefy position to withdraw from")
+
+        # Compute fraction if user passed usd_amount.
+        p0_usd = 0.0
+        p1_usd = 0.0
+        position_usd = 0.0
+        if fraction is None:
+            if is_dual_leg:
+                symbols = [
+                    self._settings.dydx_symbol_token0,
+                    self._settings.dydx_symbol_token1,
+                ]
+                try:
+                    oracle = await self._exchange.get_oracle_prices(symbols)
+                except Exception:
+                    oracle = {}
+                p0_usd = float(oracle.get(symbols[0], 0.0) or 0.0)
+                p1_usd = float(oracle.get(symbols[1], 0.0) or 0.0)
+                position_usd = my_amount0 * p0_usd + my_amount1 * p1_usd
+            else:
+                p_now = await self._pool_reader.read_price()
+                p0_usd = p_now
+                p1_usd = 1.0
+                position_usd = my_amount0 * p_now + my_amount1
+            if position_usd <= 0:
+                raise RuntimeError(
+                    "Cannot price position in USD (oracle unavailable). "
+                    "Use `fraction` parameter instead."
+                )
+            if usd_amount > position_usd:
+                raise ValueError(
+                    f"usd_amount {usd_amount} > current position {position_usd:.2f}"
+                )
+            fraction = usd_amount / position_usd
+
+        shares_to_burn = int(beefy_pos.raw_balance * fraction)
+        if shares_to_burn <= 0:
+            raise RuntimeError("computed zero shares to burn")
+
+        usd_label = (
+            f"${usd_amount:.2f}" if usd_amount is not None
+            else f"{fraction*100:.1f}%"
+        )
+        logger.info(
+            f"withdraw_partial: target={usd_label} → fraction {fraction*100:.2f}% → "
+            f"{shares_to_burn} shares (of {beefy_pos.raw_balance})"
+        )
+        self._hub.bootstrap_progress = (
+            f"Sacando {usd_label} da Beefy ({fraction*100:.1f}%)..."
+        )
+        tx = await self._beefy.withdraw(
+            shares=shares_to_burn, min_amount0=0, min_amount1=0,
+        )
+
+        # Snapshot after to report what we got back.
+        beefy_after = await self._beefy_reader.read_position()
+        my_amount0_after = beefy_after.amount0 * beefy_after.share
+        my_amount1_after = beefy_after.amount1 * beefy_after.share
+        delta_t0 = my_amount0 - my_amount0_after
+        delta_t1 = my_amount1 - my_amount1_after
+        delta_usd = delta_t0 * p0_usd + delta_t1 * p1_usd
+        self._hub.bootstrap_progress = ""
+        return {
+            "tx_hash": tx,
+            "shares_burned": shares_to_burn,
+            "fraction": fraction,
+            "withdrew": {
+                "token0": delta_t0,
+                "token1": delta_t1,
+                "usd": delta_usd,
+            },
+            "remaining": {
+                "shares": beefy_after.raw_balance,
+                "token0": my_amount0_after,
+                "token1": my_amount1_after,
+                "usd": (
+                    my_amount0_after * p0_usd + my_amount1_after * p1_usd
+                ),
+            },
+        }
 
     async def cashout_residual(self) -> dict:
         """Swap any residual token0 in the wallet to token1.

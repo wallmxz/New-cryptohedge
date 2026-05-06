@@ -179,10 +179,17 @@ async def start_operation(request: Request):
             if usdc_budget <= 0:
                 return JSONResponse({"error": "usdc_budget must be positive"}, status_code=400)
         if "swap_strategies" in body and isinstance(body["swap_strategies"], dict):
-            valid_choices = {"use_existing", "full_swap", "swap_diff"}
+            # Per-leg accepted values:
+            #   token0 → how to acquire token0 (USDC swap)
+            #   token1 → what to do with existing token1 (consolidate to
+            #     token0 pre-deposit, or keep stranded in wallet)
+            valid_per_leg = {
+                "token0": {"use_existing", "full_swap", "swap_diff"},
+                "token1": {"consolidate", "keep"},
+            }
             raw = body["swap_strategies"]
             cleaned: dict = {}
-            for leg in ("token0", "token1"):
+            for leg, valid_choices in valid_per_leg.items():
                 if leg in raw:
                     choice = str(raw[leg])
                     if choice not in valid_choices:
@@ -266,11 +273,66 @@ async def curve_preview(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+async def hedge_existing(request: Request):
+    """POST /operations/hedge-existing → open shorts against the Beefy
+    position currently in the wallet, without re-doing the bootstrap.
+    Useful when a previous bootstrap deposited but failed to open shorts.
+    """
+    if not hasattr(request.app.state, "engine"):
+        return JSONResponse({"error": "Engine not running"}, status_code=503)
+    engine = request.app.state.engine
+    try:
+        result = await engine.open_shorts_for_existing_position()
+        return JSONResponse(result, status_code=200)
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def withdraw_partial(request: Request):
+    """POST /operations/withdraw-partial {usd_amount?, fraction?} → burn
+    proportional Beefy shares so the matching slice of the LP returns to
+    the wallet. Pass EITHER `usd_amount` (oracle-priced) OR `fraction`
+    (0..1, direct share fraction — preferred when oracle unavailable).
+    """
+    if not hasattr(request.app.state, "engine"):
+        return JSONResponse({"error": "Engine not running"}, status_code=503)
+    engine = request.app.state.engine
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"error": "Body must be JSON {usd_amount?, fraction?}"},
+            status_code=400,
+        )
+    usd_amount = body.get("usd_amount")
+    fraction = body.get("fraction")
+    if (usd_amount is None) == (fraction is None):
+        return JSONResponse(
+            {"error": "pass exactly one of {usd_amount} or {fraction}"},
+            status_code=400,
+        )
+    try:
+        result = await engine.withdraw_partial(
+            usd_amount=float(usd_amount) if usd_amount is not None else None,
+            fraction=float(fraction) if fraction is not None else None,
+        )
+        return JSONResponse(result, status_code=200)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 async def recover_partial(request: Request):
-    """Emergency recovery: withdraw any Beefy shares + swap residuals to USDC.
+    """Emergency recovery: withdraw any Beefy shares; optionally swap
+    residuals to USDC.
 
     For when an operation fails mid-bootstrap and leaves orphaned shares
-    or wallet balances. Idempotent.
+    or wallet balances. Idempotent. Body: `{swap_to_usdc?: bool}`. Default
+    False — keeps tokens in the wallet so the next start_operation reuses
+    them.
     """
     if not hasattr(request.app.state, "engine"):
         return JSONResponse({"error": "Engine not running"}, status_code=503)
@@ -284,8 +346,15 @@ async def recover_partial(request: Request):
             status_code=409,
         )
 
+    swap_to_usdc = False
     try:
-        result = await engine.recover_partial_position()
+        body = await request.json()
+        swap_to_usdc = bool(body.get("swap_to_usdc", False))
+    except Exception:
+        pass
+
+    try:
+        result = await engine.recover_partial_position(swap_to_usdc=swap_to_usdc)
         return JSONResponse(result, status_code=200)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)

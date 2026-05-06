@@ -176,14 +176,54 @@
                             </template>
                         </div>
 
-                        <!-- Token1 leg: in dual-leg mode the Beefy CLM v2
-                             vault zaps internally, so we don't pre-acquire
-                             token1 anymore. Show the user a note instead. -->
-                        <div class="text-xs text-slate-500 italic">
-                            <span x-text="startPreview.pool.token1_symbol"></span>:
-                            o vault da Beefy faz o swap interno do alvo
-                            (<span class="font-mono" x-text="(startPreview.deposit.amount1_target || 0).toFixed(6)"></span>)
-                            a partir do <span x-text="startPreview.pool.token0_symbol"></span> depositado.
+                        <!-- Token1 leg: in single-swap dual-leg model the
+                             vault zaps token0 → token1 internally. We DON'T
+                             buy token1 from USDC pre-deposit (it'd just sit
+                             stranded). If the wallet has pre-existing
+                             token1, the user can consolidate it into
+                             token0 first so it joins the LP capital. -->
+                        <div class="mt-3 pt-3 border-t border-slate-100">
+                            <div class="flex items-baseline justify-between mb-2">
+                                <span class="font-medium text-slate-700"
+                                      x-text="startPreview.pool.token1_symbol"></span>
+                                <span class="text-xs text-slate-500">
+                                    saldo <span class="font-mono" x-text="((startPreview.wallet && startPreview.wallet.token1_balance) || 0).toFixed(6)"></span>
+                                </span>
+                            </div>
+                            <template x-if="((startPreview.wallet && startPreview.wallet.token1_balance) || 0) <= 1e-9">
+                                <div class="text-xs text-slate-500 italic">
+                                    Sem saldo de
+                                    <span x-text="startPreview.pool.token1_symbol"></span>.
+                                    O vault da Beefy faz o zap interno
+                                    <span x-text="startPreview.pool.token0_symbol"></span> →
+                                    <span x-text="startPreview.pool.token1_symbol"></span>
+                                    durante o deposit.
+                                </div>
+                            </template>
+                            <template x-if="((startPreview.wallet && startPreview.wallet.token1_balance) || 0) > 1e-9">
+                                <div>
+                                    <div class="grid grid-cols-2 gap-1 bg-slate-100 rounded p-1">
+                                        <button type="button"
+                                                @click="startSwapStrategy.token1 = 'consolidate'"
+                                                :class="startSwapStrategy.token1 === 'consolidate' ? 'bg-white shadow-sm font-semibold text-indigo-700' : 'text-slate-600 hover:bg-white/60'"
+                                                class="px-2 py-2 rounded text-xs transition text-center">
+                                            Consolidar pra <span x-text="startPreview.pool.token0_symbol"></span>
+                                            <div class="font-mono text-[10px] text-slate-500 mt-0.5">
+                                                swap antes do deposit · vira capital
+                                            </div>
+                                        </button>
+                                        <button type="button"
+                                                @click="startSwapStrategy.token1 = 'keep'"
+                                                :class="startSwapStrategy.token1 === 'keep' ? 'bg-white shadow-sm font-semibold text-indigo-700' : 'text-slate-600 hover:bg-white/60'"
+                                                class="px-2 py-2 rounded text-xs transition text-center">
+                                            Deixar parado
+                                            <div class="font-mono text-[10px] text-slate-500 mt-0.5">
+                                                fica fora da LP
+                                            </div>
+                                        </button>
+                                    </div>
+                                </div>
+                            </template>
                         </div>
                     </div>
                 </template>

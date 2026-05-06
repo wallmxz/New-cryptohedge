@@ -120,18 +120,58 @@ class LighterAdapter(ExchangeAdapter):
         from lighter import (
             ApiClient, Configuration, OrderApi, AccountApi, SignerClient,
         )
+        from lighter import nonce_manager
 
         cfg = Configuration(host=self._url)
         self._api_client = ApiClient(configuration=cfg)
         self._order_api = OrderApi(self._api_client)
         self._account_api = AccountApi(self._api_client)
 
-        # SignerClient holds api_private_keys keyed by api_key_index
+        # SignerClient holds api_private_keys keyed by api_key_index.
+        # `nonce_management_type=API` makes the manager refresh the nonce
+        # from the server before every order. The default OPTIMISTIC mode
+        # caches locally and increments — which causes "invalid signature"
+        # (server code 21120) when the local cache drifts from the server
+        # (e.g. after a failed tx, a restart, or a parallel order). The
+        # API mode adds ~one extra HTTP call per order in exchange for
+        # always-correct nonces. Bootstrap fires few orders so the latency
+        # cost is negligible.
         self._signer = SignerClient(
             url=self._url,
             account_index=self._account_index,
             api_private_keys={self._api_key_index: self._api_private_key},
+            nonce_management_type=nonce_manager.NonceManagerType.API,
         )
+
+        # Pre-flight: verify the configured api_private_key matches the
+        # public key the exchange has registered for this account+slot.
+        # Without this, the first order would fail with "code=21120
+        # invalid signature" — a confusing error that takes several
+        # rounds of debugging to trace back to a wrong .env. CheckClient
+        # is a cheap (~50ms) RPC and surfaces this immediately.
+        try:
+            from lighter.signer_client import decode_and_free
+            err_ptr = self._signer.signer.CheckClient(
+                self._api_key_index, self._account_index,
+            )
+            err = decode_and_free(err_ptr)
+            if err:
+                # Don't raise — let the system come up so the operator can
+                # fix the key without a crash loop. Mark the connection
+                # state and surface the error in logs prominently.
+                logger.error(
+                    f"Lighter CheckClient FAILED — the LIGHTER_API_PRIVATE_KEY "
+                    f"in your .env does NOT match the public key registered "
+                    f"on the server for account {self._account_index} "
+                    f"slot {self._api_key_index}. Detail: {err}"
+                )
+                self._key_validated = False
+            else:
+                logger.info("Lighter CheckClient: OK (key matches server)")
+                self._key_validated = True
+        except Exception as e:
+            logger.warning(f"CheckClient probe failed (non-fatal): {e}")
+            self._key_validated = False
 
         # Load market metadata
         await self._load_market_metadata()
@@ -221,6 +261,21 @@ class LighterAdapter(ExchangeAdapter):
                 f"Size {size} below market step {meta.step_size}",
             )
 
+        # Snapshot pre-trade position so we can detect fills that the
+        # `_verify_fill` cloid lookup misses (account_inactive_orders is
+        # eventually-consistent — under load it can take >2s to surface
+        # a filled order). Without this guard, returning `cancelled` to
+        # the engine when the position actually grew triggers a SECOND
+        # order on the next iteration — exactly the retry loop that
+        # produced the 0.9 ETH over-hedge in this session's postmortem.
+        try:
+            pre_pos = await self.get_position(symbol)
+            pre_size = abs(pre_pos.size) if pre_pos else 0.0
+            pre_side = pre_pos.side if pre_pos else None
+        except Exception:
+            pre_size = 0.0
+            pre_side = None
+
         last_error: str | None = None
         for attempt in range(_TAKER_RETRIES):
             # Read top-of-book on the side we're hitting:
@@ -242,7 +297,16 @@ class LighterAdapter(ExchangeAdapter):
             # (DEFAULT_28_DAY_ORDER_EXPIRY) which is only valid for resting
             # GTC orders; passing -1 with IOC time-in-force makes the
             # exchange reject the order with "OrderExpiry is invalid".
+            #
+            # Bug in lighter SDK 1.x: SignerClient.create_order() does NOT
+            # have @process_api_key_and_nonce wrapping (unlike its sibling
+            # `create_grouped_orders`). When you don't pass api_key_index
+            # and nonce, the SDK passes the sentinel defaults (255 / -1)
+            # straight through to the signer, producing an invalid signature
+            # the server rejects with code=21120 "invalid signature". We
+            # have to allocate from the nonce_manager ourselves.
             from lighter import SignerClient
+            api_key_idx, nonce = self._signer.nonce_manager.next_nonce()
             tx, resp, err = await self._signer.create_order(
                 market_index=meta.market_index,
                 client_order_index=int(cloid_int) & 0xFFFFFFFF,
@@ -252,25 +316,58 @@ class LighterAdapter(ExchangeAdapter):
                 order_type=SignerClient.ORDER_TYPE_LIMIT,
                 time_in_force=SignerClient.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
                 order_expiry=SignerClient.DEFAULT_IOC_EXPIRY,
+                api_key_index=api_key_idx,
+                nonce=nonce,
             )
             if err is not None:
-                # Exchange-side error (insufficient margin, market halted, etc.)
+                # Exchange-side error (insufficient margin, market halted,
+                # nonce conflict, signature drift, etc.). Tell the nonce
+                # manager so the next attempt gets a fresh nonce.
                 last_error = err
+                try:
+                    self._signer.nonce_manager.acknowledge_failure(api_key_idx)
+                except Exception:
+                    pass
+                # Lighter docs: "wait at least 350ms before using the same
+                # api key". Faster retries on the SAME key cause server-side
+                # nonce dedup races even when the manager hits the API for
+                # a fresh value. Back off proportionally.
+                err_s = str(err)
+                if "invalid nonce" in err_s or "invalid signature" in err_s:
+                    try:
+                        self._signer.nonce_manager.hard_refresh_nonce(api_key_idx)
+                    except Exception:
+                        pass
+                    backoff = 0.6  # > 350ms server cooldown
+                else:
+                    backoff = 0.2
                 logger.warning(
                     f"Lighter create_order rejected: {err} "
-                    f"(attempt {attempt+1}/{_TAKER_RETRIES})"
+                    f"(attempt {attempt+1}/{_TAKER_RETRIES}); "
+                    f"sleeping {backoff}s before retry"
                 )
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(backoff)
                 continue
 
-            # Success path: order accepted by the exchange. IOC means it
-            # either filled or was cancelled. Verify which by checking the
-            # order's terminal state.
+            # CRITICAL — once create_order returns err=None, the exchange
+            # accepted the order. Whether IOC filled or auto-cancelled,
+            # the tx exists. We MUST NOT retry — retrying after a server
+            # accept means a SECOND order on the same side, which stacks
+            # short positions and creates over-hedge (real cost: an
+            # earlier version of this code burned ~9× the intended short
+            # size by retrying after every server-accept where _verify_fill
+            # didn't return >0 fast enough).
+            #
+            # If _verify_fill comes back 0 we either (a) didn't fill (book
+            # moved between accept and match — IOC auto-cancels, the order
+            # genuinely didn't take any size) or (b) the cloid lookup is
+            # racing the exchange's internal state. Either way: return as
+            # "no fill" — the engine treats that as a missed opportunity,
+            # NOT as "try again".
             fill_size, fill_price = await self._verify_fill(
                 meta=meta, cloid_int=cloid_int, expected_size=size,
             )
             if fill_size > 0:
-                # Notify engine via fill callback (synthetic Fill record).
                 if self._fill_callback is not None:
                     fill = Fill(
                         fill_id=str(int(time.time() * 1000)),
@@ -289,12 +386,64 @@ class LighterAdapter(ExchangeAdapter):
                     price=self._int_to_price(best_int, meta),
                     status="filled" if fill_size >= size else "partial",
                 )
-            # IOC was accepted but didn't fill — book moved. Retry.
-            logger.debug(
-                f"Lighter IOC accepted but no fill (book moved); "
-                f"retry {attempt+1}/{_TAKER_RETRIES}"
+            # Server accepted but verify_fill didn't return >0. Before
+            # returning "cancelled", reconcile via the position itself:
+            # if our net position grew (sell→short increased, or
+            # buy→short decreased), the order DID fill — verify_fill just
+            # missed it (eventually-consistent inactive_orders endpoint).
+            try:
+                post_pos = await self.get_position(symbol)
+                post_size = abs(post_pos.size) if post_pos else 0.0
+                post_side = post_pos.side if post_pos else pre_side
+            except Exception:
+                post_size = pre_size
+                post_side = pre_side
+
+            position_delta = post_size - pre_size
+            # For a SELL we expect short to grow (positive delta on short side);
+            # for a BUY we expect short to shrink (positive delta when we were long).
+            # Either way, if `|post − pre| ≈ requested size` (within market step),
+            # treat as filled.
+            step = meta.step_size or 1e-12
+            if abs(abs(position_delta) - size) <= step * 2:
+                fill_size_inferred = abs(position_delta)
+                fill_price_inferred = self._int_to_price(best_int, meta)
+                logger.info(
+                    f"Lighter {symbol} {side} {size}: verify_fill missed but "
+                    f"position grew by {position_delta} → treating as filled."
+                )
+                if self._fill_callback is not None:
+                    fill = Fill(
+                        fill_id=str(int(time.time() * 1000)),
+                        order_id=str(cloid_int),
+                        symbol=symbol, side=side,
+                        size=fill_size_inferred, price=fill_price_inferred,
+                        fee=0.0, fee_currency="USDC",
+                        liquidity="taker",
+                        realized_pnl=0.0,
+                        timestamp=time.time(),
+                    )
+                    await self._fill_callback(fill)
+                return Order(
+                    order_id=str(cloid_int), symbol=symbol, side=side,
+                    size=fill_size_inferred, price=fill_price_inferred,
+                    status="filled",
+                )
+
+            # Position didn't change → IOC genuinely didn't fill (book
+            # moved between accept and match). Don't retry, return cancelled.
+            logger.warning(
+                f"Lighter accepted IOC {symbol} {side} {size} but verify_fill=0 "
+                f"and position unchanged. NOT retrying — book likely moved."
+            )
+            return Order(
+                order_id=str(cloid_int), symbol=symbol, side=side,
+                size=0.0,
+                price=self._int_to_price(best_int, meta),
+                status="cancelled",
             )
 
+        # All retries exhausted with err != None on every attempt.
         raise RuntimeError(
             f"LighterAdapter: failed to fill {side} {size} {symbol} after "
             f"{_TAKER_RETRIES} retries (last_error: {last_error})"

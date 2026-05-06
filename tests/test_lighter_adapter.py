@@ -28,6 +28,13 @@ def _install_lighter_stub() -> None:
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs
+            # Mimic the real SDK's nonce_manager: production code allocates
+            # (api_key_index, nonce) before each create_order to work around
+            # a missing decorator in lighter SDK 1.x.
+            self.nonce_manager = MagicMock()
+            self.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
+            self.nonce_manager.acknowledge_failure = MagicMock(return_value=None)
+            self.nonce_manager.hard_refresh_nonce = MagicMock(return_value=None)
 
         async def get_best_price(self, market_index, is_ask, ob_orders=None):
             return 100  # placeholder; tests will mock this
@@ -143,6 +150,10 @@ async def test_place_order_reads_bid_for_sell_and_ask_for_buy(monkeypatch):
 
     # Stub signer with recording mocks
     a._signer = MagicMock()
+    # nonce_manager.next_nonce() must return (api_key_index, nonce) tuple
+    # — production code allocates one before each create_order to work
+    # around a missing decorator in lighter SDK 1.x.
+    a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
     # get_best_price: when called with is_ask=True returns 240000 (=$2400 ask),
     # is_ask=False returns 239900 (=$2399 bid)
     async def fake_best_price(mi, is_ask, ob_orders=None):
@@ -185,6 +196,7 @@ async def test_place_order_uses_ioc_limit():
     a = _make_adapter()
     a._markets["ETH-USD"] = _meta()
     a._signer = MagicMock()
+    a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
     async def fake_best_price(mi, is_ask, ob_orders=None):
         return 240000
     a._signer.get_best_price = fake_best_price
@@ -205,55 +217,67 @@ async def test_place_order_uses_ioc_limit():
 
 
 @pytest.mark.asyncio
-async def test_place_order_retries_when_book_moves():
-    """If first IOC doesn't fill (book moved), retry with refreshed bid/ask."""
+async def test_place_order_no_retry_after_server_accept():
+    """REGRESSION: when create_order returns success (err=None) but
+    _verify_fill comes back 0, the adapter must NOT retry. Retrying
+    after a server-accept means a SECOND order on the same side, which
+    is what produced the 0.9 ETH over-hedge in the 2026-05-06 session.
+    """
     a = _make_adapter()
     a._markets["ETH-USD"] = _meta()
     a._signer = MagicMock()
-
-    # Best price drifts up each call (book moving against us on a buy)
-    prices = [240000, 240010, 240020]
+    a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
     async def fake_best_price(mi, is_ask, ob_orders=None):
-        return prices.pop(0) if prices else 240020
+        return 240000
     a._signer.get_best_price = fake_best_price
     a._signer.create_order = AsyncMock(return_value=(None, MagicMock(), None))
-
-    # First two attempts: fill returns 0 (didn't fill). Third: success.
-    fill_results = [(0.0, 0.0), (0.0, 0.0), (0.01, 2400.20)]
+    # _verify_fill always returns 0 (book moved or stale lookup)
     async def fake_verify(meta, cloid_int, expected_size):
-        return fill_results.pop(0)
+        return 0.0, 0.0
     a._verify_fill = fake_verify  # type: ignore
+    # Position unchanged across the call — fallback inference also says
+    # "didn't fill". Adapter must return cancelled with size=0, NOT retry.
+    a.get_position = AsyncMock(return_value=None)
 
     order = await a.place_long_term_order(
         symbol="ETH-USD", side="buy", size=0.01, price=0,
         cloid_int=999,
     )
-    assert order.size == 0.01
-    # Third call's price was the most recent observed ask (240020)
-    final_kw = a._signer.create_order.call_args.kwargs
-    assert final_kw["price"] == 240020
+    assert order.size == 0.0
+    assert order.status == "cancelled"
+    # Critical: only ONE create_order call, even though verify_fill=0.
+    assert a._signer.create_order.await_count == 1
 
 
 @pytest.mark.asyncio
-async def test_place_order_raises_when_no_fill_after_all_retries():
-    """If all retries fail, raise — never silently swallow."""
+async def test_place_order_infers_fill_from_position_change():
+    """When verify_fill misses but get_position shows the short grew by
+    the requested size, treat as filled (don't retry, don't pretend
+    cancelled — that would make the engine fire ANOTHER order).
+    """
     a = _make_adapter()
     a._markets["ETH-USD"] = _meta()
     a._signer = MagicMock()
+    a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
     async def fake_best_price(mi, is_ask, ob_orders=None):
         return 240000
     a._signer.get_best_price = fake_best_price
     a._signer.create_order = AsyncMock(return_value=(None, MagicMock(), None))
-
     async def fake_verify(meta, cloid_int, expected_size):
-        return 0.0, 0.0  # never fills
+        return 0.0, 0.0  # missed
     a._verify_fill = fake_verify  # type: ignore
+    # Pre: no position. Post: short of 0.01 ETH. Delta = 0.01 = requested.
+    pre_pos = None
+    post_pos = MagicMock(side="short", size=0.01)
+    a.get_position = AsyncMock(side_effect=[pre_pos, post_pos])
 
-    with pytest.raises(RuntimeError, match="failed to fill"):
-        await a.place_long_term_order(
-            symbol="ETH-USD", side="buy", size=0.01, price=0,
-            cloid_int=999,
-        )
+    order = await a.place_long_term_order(
+        symbol="ETH-USD", side="sell", size=0.01, price=0,
+        cloid_int=999,
+    )
+    assert order.size == 0.01
+    assert order.status == "filled"
+    assert a._signer.create_order.await_count == 1
 
 
 @pytest.mark.asyncio

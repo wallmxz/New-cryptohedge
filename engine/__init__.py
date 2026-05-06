@@ -6,13 +6,10 @@ from typing import TYPE_CHECKING
 from state import StateHub
 from db import Database
 from config import Settings
-from math import sqrt
 from chains.uniswap import UniswapV3PoolReader, tick_to_price
 from chains.beefy import BeefyClmReader
-from exchanges.dydx import DydxAdapter
 from exchanges.base import ExchangeAdapter
-from engine.curve import compute_l_from_value, compute_x, compute_y, compute_target_grid, GridLevel
-from engine.grid import GridManager
+from engine.curve import compute_l_from_value, compute_x, compute_y, compute_target_grid
 from engine.operation import Operation, OperationState
 from engine.pnl import compute_operation_pnl
 from engine.reconciler import Reconciler
@@ -56,7 +53,6 @@ class GridMakerEngine:
         self._pair_factory_account = pair_factory_account
         self._decimals0 = decimals0
         self._decimals1 = decimals1
-        self._grid_mgr = GridManager()
         self._task: asyncio.Task | None = None
         self._running = False
         self._cloid_seq = 0
@@ -241,11 +237,9 @@ class GridMakerEngine:
             "min_notional_usd": 3.0,
         }
 
-    async def recover_partial_position(self) -> dict:
-        """Emergency recovery: undo any partial state from a failed bootstrap.
-
-        Mirrors the same lifecycle-routing as preview/start so we work
-        against the SAME vault the user is configured for.
+    async def open_shorts_for_existing_position(self) -> dict:
+        """Open the hedge shorts against the existing Beefy position
+        without going through bootstrap. Routes via selected vault.
         """
         selected_vault_id = await self._db.get_selected_vault_id()
         if (
@@ -261,10 +255,71 @@ class GridMakerEngine:
                 w3=self._pair_factory_w3,
                 account=self._pair_factory_account,
             )
-            return await lifecycle.recover_partial_position()
+            return await lifecycle.open_shorts_for_existing_position()
+        if self._lifecycle is not None:
+            return await self._lifecycle.open_shorts_for_existing_position()
+        raise RuntimeError("No lifecycle configured.")
+
+    async def withdraw_partial(
+        self, *, usd_amount: float | None = None,
+        fraction: float | None = None,
+    ) -> dict:
+        """Withdraw a slice of the Beefy position. Pass EITHER usd_amount
+        (oracle-priced) OR fraction (0..1).
+        """
+        selected_vault_id = await self._db.get_selected_vault_id()
+        if (
+            selected_vault_id
+            and self._pair_factory_w3 is not None
+            and self._pair_factory_account is not None
+        ):
+            from engine.pair_factory import build_lifecycle
+            lifecycle = await build_lifecycle(
+                settings=self._settings, hub=self._hub, db=self._db,
+                exchange=self._exchange,
+                selected_vault_id=selected_vault_id,
+                w3=self._pair_factory_w3,
+                account=self._pair_factory_account,
+            )
+            return await lifecycle.withdraw_partial(
+                usd_amount=usd_amount, fraction=fraction,
+            )
+        if self._lifecycle is not None:
+            return await self._lifecycle.withdraw_partial(
+                usd_amount=usd_amount, fraction=fraction,
+            )
+        raise RuntimeError("No lifecycle configured.")
+
+    async def recover_partial_position(
+        self, *, swap_to_usdc: bool = False,
+    ) -> dict:
+        """Emergency recovery: undo any partial state from a failed bootstrap.
+
+        Mirrors the same lifecycle-routing as preview/start so we work
+        against the SAME vault the user is configured for.
+
+        `swap_to_usdc=False` (default) — only withdraws Beefy shares;
+        keeps token0/token1 in the wallet so they can be reused.
+        `swap_to_usdc=True` — also swaps residuals to native USDC.
+        """
+        selected_vault_id = await self._db.get_selected_vault_id()
+        if (
+            selected_vault_id
+            and self._pair_factory_w3 is not None
+            and self._pair_factory_account is not None
+        ):
+            from engine.pair_factory import build_lifecycle
+            lifecycle = await build_lifecycle(
+                settings=self._settings, hub=self._hub, db=self._db,
+                exchange=self._exchange,
+                selected_vault_id=selected_vault_id,
+                w3=self._pair_factory_w3,
+                account=self._pair_factory_account,
+            )
+            return await lifecycle.recover_partial_position(swap_to_usdc=swap_to_usdc)
 
         if self._lifecycle is not None:
-            return await self._lifecycle.recover_partial_position()
+            return await self._lifecycle.recover_partial_position(swap_to_usdc=swap_to_usdc)
 
         raise RuntimeError("No lifecycle configured.")
 
@@ -587,14 +642,30 @@ class GridMakerEngine:
 
     async def start(self):
         if self._exchange is None:
+            # Lazy import — production deploys with ACTIVE_EXCHANGE=lighter
+            # don't need the dydx-v4-client SDK loaded.
+            from exchanges.dydx import DydxAdapter
             self._exchange = DydxAdapter(
                 mnemonic=self._settings.dydx_mnemonic,
                 wallet_address=self._settings.dydx_address,
                 network=self._settings.dydx_network,
                 subaccount=self._settings.dydx_subaccount,
             )
+        # Exchange connection is best-effort: when the venue's edge (e.g.
+        # CloudFront WAF blocking the IP, regional captcha challenge) is
+        # rejecting requests, the rest of the system (chain reads, recovery
+        # endpoint, dashboard) should still come up. We flag it as
+        # disconnected and let the user see "Offline (exchange)" instead
+        # of having uvicorn crash on startup.
+        try:
             await self._exchange.connect()
             self._hub.connected_exchange = True
+        except Exception as e:
+            logger.error(
+                f"Exchange connect failed at startup ({e!r}); engine will run "
+                f"with exchange offline. Chain ops + recovery endpoint still work."
+            )
+            self._hub.connected_exchange = False
 
         if self._pool_reader is None or self._beefy_reader is None:
             w3 = AsyncWeb3(AsyncHTTPProvider(self._settings.arbitrum_rpc_url))
@@ -634,7 +705,19 @@ class GridMakerEngine:
             self._hub.operation_state = active_op["status"]
             logger.info(f"Restored active operation {active_op['id']} (status={active_op['status']})")
 
-        await self._exchange.subscribe_fills(self._settings.dydx_symbol, self._on_fill)
+        # subscribe_fills is also best-effort. Same rationale as connect():
+        # if the exchange edge is unreachable, we shouldn't kill startup —
+        # the user can still recover funds and inspect state.
+        if self._hub.connected_exchange:
+            try:
+                await self._exchange.subscribe_fills(
+                    self._settings.dydx_symbol, self._on_fill,
+                )
+            except Exception as e:
+                logger.error(
+                    f"subscribe_fills failed ({e!r}); fills won't stream "
+                    f"until reconnect."
+                )
 
         self._running = True
         self._task = asyncio.create_task(self._main_loop())
@@ -802,11 +885,27 @@ class GridMakerEngine:
                     self._hub.hedge_positions.pop(sym, None)
                     self._hub.hedge_unrealized_pnls[sym] = 0.0
 
-            # Compute USD pool value
+            # Compute USD pool value.
+            # Cross-pair fallback caveat: `p_now` is the pool ratio (token1
+            # per token0), NOT a USD price. Using it as a fallback for
+            # `p0_usd` in dual-leg quietly corrupts pool_value_usd when
+            # the oracle is offline (a CloudFront-style block had us
+            # multiplying token0 amount by the WETH/ARB ratio earlier in
+            # this session, inflating reported value by ~ETH-USD price).
+            # Skip the USD computation rather than emit a garbage number.
             if is_dual_leg:
-                p0_usd = oracle_prices.get(symbols[0], p_now)
-                p1_usd = oracle_prices.get(symbols[1], 1.0)
-                pool_value_usd = my_amount0 * p0_usd + my_amount1 * p1_usd
+                p0_usd = oracle_prices.get(symbols[0], 0.0) or 0.0
+                p1_usd = oracle_prices.get(symbols[1], 0.0) or 0.0
+                if p0_usd > 0 and p1_usd > 0:
+                    pool_value_usd = my_amount0 * p0_usd + my_amount1 * p1_usd
+                else:
+                    # Don't pollute hub with a wrong number — leave last
+                    # known value in place. Oracle is briefly offline.
+                    logger.warning(
+                        "Cross-pair oracle unavailable; skipping pool USD "
+                        "value update this iter."
+                    )
+                    pool_value_usd = self._hub.pool_value_usd
             else:
                 p0_usd = oracle_prices.get(symbols[0], p_now)
                 p1_usd = 1.0
@@ -869,12 +968,25 @@ class GridMakerEngine:
             peak_eth_equiv = peak_short_notional_usd / max(p1_usd, 1e-9)
             await self._check_margin_and_alert(peak_eth_equiv, p1_usd)
 
-            # Compute targets per leg
+            # Compute targets per leg.
+            #
+            # Use `my_amount0`/`my_amount1` directly — those are our share
+            # of the strategy's real V3 position from `strategy.balances()`.
+            #
+            # `compute_x(L_user, p_now, p_b)` would be mathematically
+            # equivalent IF and only if the strategy held all its
+            # liquidity in a single range matching [p_a, p_b]. Beefy CLM
+            # v2 typically holds a `positionMain` (the [p_a, p_b] range we
+            # read) PLUS a `positionAlt` (single-sided fee-collection
+            # range). `compute_l_from_value` flattens the alt liquidity
+            # into the main range, inflating `L_user`. Driving the hedge
+            # off `my_amount0`/`my_amount1` is the correct delta even
+            # when an alt range is present.
             targets: dict[str, float] = {
-                symbols[0]: compute_x(L_user, p_now, p_b) * self._hub.hedge_ratio,
+                symbols[0]: my_amount0 * self._hub.hedge_ratio,
             }
             if is_dual_leg:
-                targets[symbols[1]] = compute_y(L_user, p_now, p_a) * self._hub.hedge_ratio
+                targets[symbols[1]] = my_amount1 * self._hub.hedge_ratio
 
             # Fire rebalance per leg
             for sym in symbols:

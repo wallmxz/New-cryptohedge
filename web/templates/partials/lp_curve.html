@@ -57,7 +57,7 @@
                     order: 3,
                 },
                 {
-                    label: 'Buys (fecham short conforme preço sobe)',
+                    label: 'Triggers de buy-back (fecha short conforme preço sobe)',
                     data: buys,
                     backgroundColor: 'rgba(16, 185, 129, 0.9)',
                     borderColor: 'rgb(5, 122, 85)',
@@ -68,7 +68,7 @@
                     order: 2,
                 },
                 {
-                    label: 'Sells (abrem short conforme preço cai)',
+                    label: 'Triggers de sell (abre short conforme preço cai)',
                     data: sells,
                     backgroundColor: 'rgba(239, 68, 68, 0.9)',
                     borderColor: 'rgb(185, 28, 28)',
@@ -265,9 +265,11 @@
                 conforme o preço varia: em <span class="font-mono" x-text="curve.pool.p_a.toFixed(2)"></span> a
                 LP é 100% <span x-text="curve.pool.token0_symbol"></span>; em
                 <span class="font-mono" x-text="curve.pool.p_b.toFixed(2)"></span> a LP é 100%
-                <span x-text="curve.pool.token1_symbol"></span>. Cada ponto = 1 ordem maker
-                replicando essa curva no perp pra manter o delta neutro.
-                Notional alvo por ordem ≈ $<span x-text="curve.min_notional_usd.toFixed(2)"></span>.
+                <span x-text="curve.pool.token1_symbol"></span>. Cada ponto marca um
+                <strong>preço-trigger</strong> onde, se o preço chegar lá, o engine
+                dispara um taker IOC pra ajustar o short (não são ordens maker
+                postadas no order book). Tamanho típico do ajuste ≈
+                $<span x-text="curve.min_notional_usd.toFixed(2)"></span> de notional.
             </p>
         </div>
     </template>

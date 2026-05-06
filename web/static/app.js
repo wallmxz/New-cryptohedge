@@ -237,22 +237,22 @@ function dashboard() {
                 }
                 this.startPreview = data;
                 this.startPreviewAt = new Date().toLocaleTimeString();
-                // Seed strategy per leg. If wallet has no balance of that
-                // token, only "full_swap" makes sense — pin it. If wallet
-                // has some balance, take the server's recommendation as a
-                // starting point (user can override before confirming).
+                // Seed strategy per leg.
+                //   token0: 'full_swap' if no balance, else server hint
+                //   (use_existing | swap_diff).
+                //   token1 (single-swap dual-leg model):
+                //     wallet has t1>0 → 'consolidate' (swap → token0 pre-deposit).
+                //     wallet has t1≈0 → 'consolidate' as no-op (vault zaps).
                 const t0Bal = data.wallet.token0_balance || 0;
                 const t1Bal = data.wallet.token1_balance || 0;
-                const t0Target = (data.deposit && data.deposit.amount0_target) || 0;
-                const t1Target = (data.deposit && data.deposit.amount1_target) || 0;
-                const eps = 1e-9;  // dust threshold
+                const eps = 1e-9;
                 this.startSwapStrategy = {
                     token0: t0Bal <= eps
                         ? 'full_swap'
                         : ((data.strategies && data.strategies.token0) || 'swap_diff'),
                     token1: t1Bal <= eps
-                        ? 'full_swap'
-                        : ((data.strategies && data.strategies.token1) || 'swap_diff'),
+                        ? 'keep'
+                        : ((data.strategies && data.strategies.token1) || 'keep'),
                 };
                 this.startStage = 'preview';
             } catch (e) {
@@ -270,11 +270,14 @@ function dashboard() {
                 // Only forward strategies in dual-leg (cross-pair). Single-leg
                 // path ignores the field server-side, but no point sending it.
                 if (this.startPreview && this.startPreview.is_dual_leg) {
-                    // Dual-leg now uses a single swap (USDC → token0); only
-                    // the token0 strategy is meaningful. token1 is omitted —
-                    // backend ignores it anyway.
+                    // token0: how to acquire WETH (use_existing/swap_diff/full_swap)
+                    // token1: only meaningful if wallet has token1 — then
+                    //   user picks "consolidate" (swap to token0 pre-deposit)
+                    //   or "keep" (leave stranded). When wallet token1 is
+                    //   zero the value is ignored server-side.
                     payload.swap_strategies = {
                         token0: this.startSwapStrategy.token0,
+                        token1: this.startSwapStrategy.token1,
                     };
                 }
                 const resp = await fetch("/operations/start", {

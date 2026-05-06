@@ -94,15 +94,14 @@ async def test_bootstrap_dual_leg_does_two_swaps_sequentially(cross_pair_setting
         op_id = await lifecycle.bootstrap(usdc_budget=300.0)
     assert op_id == 42
 
-    # New (post-2026-05-05 refactor): only ONE swap fires — USDC → token0 —
-    # because Beefy CLM v2 deposit() consumes only `amount0` and zaps
-    # internally to the V3 ratio. Pre-acquiring token1 was wasted gas.
+    # Single-swap model: only ONE USDC→token0 swap fires. Beefy CLM v2
+    # vaults consume only amount0 and zap to V3 ratio internally —
+    # buying token1 pre-deposit was wasted.
     assert len(swap_calls) == 1
-    # The single swap targets token0 (ARB in this fixture).
     assert swap_calls[0]["token_out"] in {"0xARB", cross_pair_settings.token0_address}
 
-    # BOTH perp shorts still fire in parallel — sized from read_position
-    # AFTER the deposit (vault decided the actual t0/t1 split).
+    # BOTH perp shorts fire in parallel — sized from read_position AFTER
+    # the deposit (vault decided the actual t0/t1 split).
     assert exchange.place_long_term_order.await_count == 2
     symbols = [c.kwargs["symbol"] for c in exchange.place_long_term_order.await_args_list]
     assert "ARB-USD" in symbols
