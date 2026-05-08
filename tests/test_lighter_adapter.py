@@ -1129,3 +1129,26 @@ async def test_fetch_position_funding_returns_empty_on_token_error():
     out = await a._fetch_position_funding(limit=100)
     assert out == []
     a._account_api.position_funding.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_trade_pnl_since_default_returns_none_on_base():
+    """Default impl on ExchangeAdapter returns None — adapters that
+    don't expose a cumulative-pnl endpoint inherit the disabled state."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    from exchanges.base import ExchangeAdapter
+    assert hasattr(ExchangeAdapter, "get_trade_pnl_since")
+    class _Dummy(ExchangeAdapter):
+        name = "dummy"
+        async def connect(self): pass
+        async def disconnect(self): pass
+        async def subscribe_orderbook(self, s, c): pass
+        async def subscribe_fills(self, s, c): pass
+        async def get_position(self, s): return None
+        async def get_oracle_prices(self, syms): return {}
+        async def get_fills(self, s, since=None): return []
+        def get_tick_size(self, s): return 0.01
+        def get_min_notional(self, s): return 0.01
+    d = _Dummy()
+    assert await d.get_trade_pnl_since(0.0, 1.0) is None

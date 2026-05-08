@@ -77,3 +77,13 @@ class ExchangeAdapter(ABC):
         operation's funding_paid_token0/1 accumulators.
         """
         return None
+
+    async def get_trade_pnl_since(
+        self, start_ts: float, end_ts: float,
+    ) -> tuple[float, float] | None:
+        """Returns (trade_pnl_baseline, trade_pnl_latest) cumulative
+        trade_pnl from the venue's account-pnl endpoint. The caller
+        subtracts baseline from latest to get pnl during the window.
+        Default: not supported (returns None) — adapters that integrate
+        the venue's cumulative-pnl endpoint override this."""
+        return None
