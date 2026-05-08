@@ -118,6 +118,29 @@ def _make_adapter():
     return a
 
 
+def _seed_book(a, market_index: int, bid: float, ask: float) -> None:
+    """Seed the WS top-of-book cache the way the real WS pump would after
+    a `subscribed/order_book` snapshot. Production reads from this cache
+    in `_place_long_term_order_unlocked` (no HTTP get_best_price calls).
+    Bid and ask are display-units floats (e.g., 2399.5)."""
+    import time as _t
+    a._ws_book_top[market_index] = {
+        "best_bid": bid, "best_ask": ask, "ts": _t.time(),
+    }
+
+
+def _seed_position(a, market_index: int, *, sign: int, size: float,
+                   avg_entry: float, unrealized: float = 0.0) -> None:
+    """Seed the adapter's observed-short-size + metadata caches."""
+    a._observed_short_size[market_index] = size if sign == -1 else 0.0
+    a._observed_position_meta[market_index] = {
+        "sign": sign,
+        "position": size,
+        "avg_entry_price": avg_entry,
+        "unrealized_pnl": unrealized,
+    }
+
+
 @pytest.mark.asyncio
 async def test_size_to_int_uses_market_decimals():
     a = _make_adapter()
@@ -144,9 +167,11 @@ async def test_unknown_symbol_raises():
 @pytest.mark.asyncio
 async def test_place_order_reads_bid_for_sell_and_ask_for_buy(monkeypatch):
     """The constraint: never use the engine's `price` arg as slippage hint —
-    always read bid (for sell) or ask (for buy) from get_best_price."""
+    always read bid (for sell) or ask (for buy) from the WS book cache."""
     a = _make_adapter()
     a._markets["ETH-USD"] = _meta()
+    # Seed WS cache: bid $2399, ask $2400. price_decimals=2 in _meta().
+    _seed_book(a, 0, bid=2399.0, ask=2400.0)
 
     # Stub signer with recording mocks
     a._signer = MagicMock()
@@ -154,11 +179,6 @@ async def test_place_order_reads_bid_for_sell_and_ask_for_buy(monkeypatch):
     # — production code allocates one before each create_order to work
     # around a missing decorator in lighter SDK 1.x.
     a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
-    # get_best_price: when called with is_ask=True returns 240000 (=$2400 ask),
-    # is_ask=False returns 239900 (=$2399 bid)
-    async def fake_best_price(mi, is_ask, ob_orders=None):
-        return 240000 if is_ask else 239900
-    a._signer.get_best_price = fake_best_price
     a._signer.create_order = AsyncMock(return_value=(None, MagicMock(tx_hash="0xabc"), None))
 
     # Stub _verify_fill to claim full fill
@@ -166,19 +186,23 @@ async def test_place_order_reads_bid_for_sell_and_ask_for_buy(monkeypatch):
         return expected_size, 2399.0
     a._verify_fill = fake_verify  # type: ignore
 
-    # SELL → should hit bid (is_ask=False on get_best_price)
+    # SELL → should hit bid from cache
     order = await a.place_long_term_order(
         symbol="ETH-USD", side="sell", size=0.01,
         price=2350.0,  # garbage hint, must be ignored
         cloid_int=12345,
     )
     assert order.status == "filled"
-    # Verify the price sent to create_order was the bid (239900), NOT 2350.0
+    # Verify the price sent to create_order is the cached bid (ticks:
+    # bid=2399 * 10^2 = 239900) — exact, no buffer. The user requires
+    # zero slippage by construction; on book-tick moves during flight
+    # the IOC will simply auto-cancel and the engine's per-leg cooldown
+    # (30s) governs when to re-fire.
     create_kwargs = a._signer.create_order.call_args.kwargs
     assert create_kwargs["price"] == 239900
     assert create_kwargs["is_ask"] is True  # selling
 
-    # BUY → should hit ask
+    # BUY → should hit ask, exact (no buffer above).
     a._signer.create_order.reset_mock()
     order = await a.place_long_term_order(
         symbol="ETH-USD", side="buy", size=0.01,
@@ -195,11 +219,9 @@ async def test_place_order_uses_ioc_limit():
     """Constraint: order_type=LIMIT, time_in_force=IOC. Never market order."""
     a = _make_adapter()
     a._markets["ETH-USD"] = _meta()
+    _seed_book(a, 0, bid=2399.0, ask=2400.0)
     a._signer = MagicMock()
     a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
-    async def fake_best_price(mi, is_ask, ob_orders=None):
-        return 240000
-    a._signer.get_best_price = fake_best_price
     a._signer.create_order = AsyncMock(return_value=(None, MagicMock(), None))
 
     async def fake_verify(meta, cloid_int, expected_size):
@@ -225,11 +247,9 @@ async def test_place_order_no_retry_after_server_accept():
     """
     a = _make_adapter()
     a._markets["ETH-USD"] = _meta()
+    _seed_book(a, 0, bid=2399.0, ask=2400.0)
     a._signer = MagicMock()
     a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
-    async def fake_best_price(mi, is_ask, ob_orders=None):
-        return 240000
-    a._signer.get_best_price = fake_best_price
     a._signer.create_order = AsyncMock(return_value=(None, MagicMock(), None))
     # _verify_fill always returns 0 (book moved or stale lookup)
     async def fake_verify(meta, cloid_int, expected_size):
@@ -257,11 +277,9 @@ async def test_place_order_infers_fill_from_position_change():
     """
     a = _make_adapter()
     a._markets["ETH-USD"] = _meta()
+    _seed_book(a, 0, bid=2399.0, ask=2400.0)
     a._signer = MagicMock()
     a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
-    async def fake_best_price(mi, is_ask, ob_orders=None):
-        return 240000
-    a._signer.get_best_price = fake_best_price
     a._signer.create_order = AsyncMock(return_value=(None, MagicMock(), None))
     async def fake_verify(meta, cloid_int, expected_size):
         return 0.0, 0.0  # missed
@@ -288,3 +306,255 @@ async def test_size_below_step_raises():
         await a.place_long_term_order(
             symbol="ETH-USD", side="buy", size=1e-9, price=0, cloid_int=1,
         )
+
+
+@pytest.mark.asyncio
+async def test_get_position_reads_from_ws_cache():
+    """get_position must NOT call /account — it reads the WS-cached
+    position. Sustained 1Hz HTTP polling triggered the CloudFront WAF
+    in the 2026-05-07 session."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta()
+    # Seed a SHORT position of 0.05 ETH @ $2390 entry, $1.20 unrealized.
+    _seed_position(
+        a, market_index=0, sign=-1, size=0.05,
+        avg_entry=2390.0, unrealized=1.20,
+    )
+    pos = await a.get_position("ETH-USD")
+    assert pos is not None
+    assert pos.side == "short"
+    assert pos.size == 0.05
+    assert pos.entry_price == 2390.0
+    assert pos.unrealized_pnl == 1.20
+    # Empty cache → None (closed position or pre-snapshot).
+    a._observed_short_size = {}
+    a._observed_position_meta = {}
+    assert await a.get_position("ETH-USD") is None
+
+
+@pytest.mark.asyncio
+async def test_get_collateral_reads_from_ws_cache():
+    a = _make_adapter()
+    a._ws_collateral = 137.42
+    assert await a.get_collateral() == 137.42
+    # Pre-snapshot: returns 0.0 (engine treats 0 as "unknown").
+    a._ws_collateral = None
+    assert await a.get_collateral() == 0.0
+
+
+@pytest.mark.asyncio
+async def test_get_oracle_prices_uses_cached_book_midpoint():
+    """Midpoint of cached top-of-book is the new oracle. Previously this
+    was last_trade_price from /orderBookDetails (HTTP), which doubled
+    the polling rate."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta()
+    a._markets["ARB-USD"] = _meta(symbol_user="ARB-USD", market_index=1)
+    _seed_book(a, 0, bid=2399.0, ask=2401.0)
+    _seed_book(a, 1, bid=0.1265, ask=0.1267)
+    prices = await a.get_oracle_prices(["ETH-USD", "ARB-USD"])
+    assert prices["ETH-USD"] == 2400.0  # midpoint
+    assert prices["ARB-USD"] == 0.1266
+    # Empty cache: returns 0.0 per symbol so callers can detect "unknown".
+    a._ws_book_top = {}
+    prices = await a.get_oracle_prices(["ETH-USD"])
+    assert prices["ETH-USD"] == 0.0
+
+
+def test_on_book_update_extracts_best_bid_and_ask():
+    """The WS callback must turn a multi-level book into best_bid/best_ask.
+    Lighter sends prices as strings."""
+    a = _make_adapter()
+    a._on_book_update(
+        market_id=7,
+        state={
+            "asks": [
+                {"price": "100.50", "size": "1"},
+                {"price": "100.10", "size": "5"},
+                {"price": "100.20", "size": "2"},
+            ],
+            "bids": [
+                {"price": "99.80", "size": "3"},
+                {"price": "99.95", "size": "1"},
+                {"price": "99.90", "size": "2"},
+            ],
+        },
+    )
+    top = a._ws_book_top[7]
+    assert top["best_ask"] == 100.10  # lowest ask
+    assert top["best_bid"] == 99.95   # highest bid
+    assert a._ws_first_snapshot.is_set()
+
+
+def test_on_account_update_extracts_positions_and_collateral():
+    """REGRESSION: the WS account_all spec — per
+    apidocs.lighter.xyz/docs/websocket-reference — has TOP-LEVEL fields:
+
+      - `account` is the integer account_id (NOT a nested object!)
+      - `available_balance`, `collateral`, `positions` (DICT keyed by
+        market_id), `assets`, `funding_histories` are all top-level.
+
+    Earlier version of this parser drilled into `state["account"]` as a
+    dict and treated `positions` as a LIST. Both wrong: parse silently
+    failed, cache was empty, engine kept firing hedges thinking
+    `position == 0` after each successful fill → over-hedge stack.
+    """
+    a = _make_adapter()
+    a._on_account_update(
+        account_id=42,
+        state={
+            "type": "subscribed/account_all",
+            "channel": "account_all:42",
+            "timestamp": 1700000000000,
+            "account": 42,  # integer account_id at top level
+            "available_balance": "150.75",
+            "collateral": "200.00",
+            "assets": {
+                "1": {"symbol": "USDC", "asset_id": 1, "balance": "150.75",
+                      "locked_balance": "0"},
+            },
+            "positions": {
+                # Dict keyed by market_id string — NOT a list!
+                "0": {
+                    "market_id": 0, "symbol": "ETH-USD", "sign": -1,
+                    "position": "0.05", "avg_entry_price": "2390.0",
+                    "unrealized_pnl": "1.20",
+                    "position_value": "119.5", "realized_pnl": "0",
+                },
+                "50": {
+                    "market_id": 50, "symbol": "ARB-USD", "sign": 1,
+                    "position": "100.0", "avg_entry_price": "0.13",
+                    "unrealized_pnl": "-0.50",
+                    "position_value": "13", "realized_pnl": "0",
+                },
+            },
+        },
+    )
+    assert a._ws_collateral == 150.75
+    # Magnitude (engine-facing): only shorts (sign=-1) carry magnitude.
+    # Longs are tracked as 0 in this dict so the engine's drift math
+    # doesn't try to hedge against an operator-opened long; the long
+    # is still surfaced through the diagnostic metadata dict.
+    assert a._observed_short_size[0] == 0.05  # ETH short
+    assert a._observed_short_size[50] == 0.0  # ARB long → 0 magnitude
+    # Metadata (diagnostic-facing):
+    assert a._observed_position_meta[0]["sign"] == -1
+    assert a._observed_position_meta[0]["avg_entry_price"] == 2390.0
+    assert a._observed_position_meta[50]["sign"] == 1
+    assert a._observed_position_meta[50]["position"] == 100.0
+
+    # Live-account variant: top-level `available_balance` is null and
+    # the real collateral lives inside `assets[asset_id].margin_balance`.
+    # Probed empirically against the user's mainnet account (issue
+    # 2026-05-07). The parser must fall back to summing assets.
+    a2 = _make_adapter()
+    a2._on_account_update(
+        account_id=42,
+        state={
+            "type": "subscribed/account_all",
+            "account": 42,
+            "available_balance": None,
+            "assets": {
+                "3": {
+                    "symbol": "USDC", "asset_id": 3,
+                    "balance": "0.000000", "locked_balance": "0",
+                    "margin_balance": "197.851681701356",
+                },
+            },
+            "positions": {},
+        },
+    )
+    assert abs(a2._ws_collateral - 197.85168170) < 1e-6
+
+    # Update where ETH position closes: per docs, a closed position
+    # DISAPPEARS from the dict (no size=0 sentinel). The cache must
+    # reflect that — ETH gone, ARB still there.
+    a._on_account_update(
+        account_id=42,
+        state={
+            "type": "update/account_all",
+            "channel": "account_all:42",
+            "account": 42,
+            "available_balance": "100.0",
+            "positions": {
+                "50": {
+                    "market_id": 50, "sign": 1, "position": "100.0",
+                    "avg_entry_price": "0.13", "unrealized_pnl": "-0.30",
+                },
+            },
+        },
+    )
+    # After ETH closes:
+    assert 0 not in a._observed_short_size
+    # ARB long → 0 magnitude, but still tracked.
+    assert a._observed_short_size[50] == 0.0
+    assert a._observed_position_meta[50]["position"] == 100.0
+    assert a._ws_collateral == 100.0
+
+    # Empty positions dict (everything closed) wipes everything.
+    a._on_account_update(
+        account_id=42,
+        state={"account": 42, "available_balance": "200.0", "positions": {}},
+    )
+    # After everything closes:
+    assert a._observed_short_size == {}
+    assert a._observed_position_meta == {}
+    assert a._ws_collateral == 200.0
+
+
+@pytest.mark.asyncio
+async def test_parallel_orders_serialize_with_min_gap(monkeypatch):
+    """Two place_long_term_order calls in parallel must NOT race the
+    nonce_manager — the adapter's internal lock + 600ms min-gap should
+    serialize them. Without this, Lighter rejects the second with
+    code=21120 invalid signature (the loser of the next_nonce race
+    signs a stale nonce). Regression test for the ARB/WETH dual-leg
+    failure on 2026-05-07.
+    """
+    import asyncio
+    a = _make_adapter()
+    # Shorten the gap so the test doesn't take ages but still verifies
+    # the lock + gap mechanism is wired up.
+    a._MIN_GAP_S = 0.05
+    a._markets["ETH-USD"] = _meta()
+    a._markets["ARB-USD"] = _meta(market_index=1)
+    # Both markets need book cache seeded — production adapter reads
+    # them from the WS pump, here we seed directly.
+    _seed_book(a, 0, bid=99.95, ask=100.05)
+    _seed_book(a, 1, bid=99.95, ask=100.05)
+
+    # Record the order in which create_order calls actually hit the signer.
+    call_log: list[tuple[float, str]] = []
+    a._signer = MagicMock()
+    a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
+    a._signer.nonce_manager.acknowledge_failure = MagicMock(return_value=None)
+
+    async def fake_create_order(**kw):
+        # Simulate ~10ms of server work
+        call_log.append((asyncio.get_event_loop().time(), str(kw.get("market_index"))))
+        await asyncio.sleep(0.01)
+        return MagicMock(tx_hash="0x" + "a" * 64), MagicMock(code=0), None
+
+    a._signer.create_order = fake_create_order
+    a.get_position = AsyncMock(return_value=None)
+    a._verify_fill = AsyncMock(return_value=(0.001, 100.0))
+
+    # Fire both legs in parallel — exactly what the previous lifecycle
+    # did via asyncio.gather. The lock must serialize them.
+    await asyncio.gather(
+        a.place_long_term_order(
+            symbol="ETH-USD", side="sell", size=0.001, price=100, cloid_int=1,
+        ),
+        a.place_long_term_order(
+            symbol="ARB-USD", side="sell", size=0.001, price=100, cloid_int=2,
+        ),
+    )
+
+    # Both must have hit the signer, but the gap between them must be
+    # ≥ _MIN_GAP_S (= 50ms here) — proving serialization, not parallel.
+    assert len(call_log) == 2, f"Expected 2 calls, got {len(call_log)}"
+    gap_ms = (call_log[1][0] - call_log[0][0]) * 1000
+    assert gap_ms >= 45, (
+        f"Calls were too close ({gap_ms:.1f}ms apart), lock/gap not "
+        f"working — would race the nonce_manager on real Lighter."
+    )
