@@ -27,6 +27,7 @@ def _install_lighter_stub() -> None:
         ORDER_TIME_IN_FORCE_POST_ONLY = 2
         DEFAULT_IOC_EXPIRY = 0
         DEFAULT_28_DAY_ORDER_EXPIRY = -1
+        DEFAULT_10_MIN_AUTH_EXPIRY = 600
 
         def __init__(self, **kwargs):
             self.kwargs = kwargs
@@ -1003,6 +1004,8 @@ async def test_fetch_position_funding_returns_entries():
         position_fundings=fake_entries,
         next_cursor=None,
     ))
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("TOKEN", None))
     entries = await a._fetch_position_funding(limit=100)
     assert len(entries) == 2
     assert entries[0].funding_id == 1
@@ -1015,6 +1018,8 @@ async def test_fetch_position_funding_returns_empty_on_error():
     a = _make_adapter()
     a._account_api = MagicMock()
     a._account_api.position_funding = AsyncMock(side_effect=RuntimeError("boom"))
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("TOKEN", None))
     entries = await a._fetch_position_funding(limit=100)
     assert entries == []
 
@@ -1034,6 +1039,8 @@ async def test_funding_poller_iteration_fires_callback_per_entry():
     a._account_api.position_funding = AsyncMock(return_value=MagicMock(
         position_fundings=[e1, e2], next_cursor=None,
     ))
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("TOKEN", None))
     received: list = []
     async def cb(entry): received.append(entry)
     a._funding_callback = cb
@@ -1050,6 +1057,8 @@ async def test_funding_poller_iteration_noop_when_no_callback():
     a._account_api.position_funding = AsyncMock(return_value=MagicMock(
         position_fundings=[MagicMock()], next_cursor=None,
     ))
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("TOKEN", None))
     a._funding_callback = None
     await a._funding_poller_iteration()  # must not raise
 
@@ -1084,3 +1093,39 @@ async def test_funding_poller_loop_runs_iteration_then_sleeps():
         _aio.sleep = orig
     assert iters >= 1
     assert sleep_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_position_funding_passes_auth_token():
+    """Per spec 2026-05-08-pnl-fixes-A-B: Lighter rejects position_funding
+    without an auth token. _fetch_position_funding must generate one via
+    signer.create_auth_token_with_expiry and pass it as `auth=`."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._account_api = MagicMock()
+    a._account_api.position_funding = AsyncMock(return_value=MagicMock(
+        position_fundings=[], next_cursor=None,
+    ))
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("TOKEN", None))
+    await a._fetch_position_funding(limit=100)
+    call_kwargs = a._account_api.position_funding.await_args.kwargs
+    assert call_kwargs.get("auth") == "TOKEN"
+
+
+@pytest.mark.asyncio
+async def test_fetch_position_funding_returns_empty_on_token_error():
+    """If signer returns an error, return empty list and DO NOT call the API."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._account_api = MagicMock()
+    a._account_api.position_funding = AsyncMock(return_value=MagicMock(
+        position_fundings=[], next_cursor=None,
+    ))
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(
+        return_value=("", "auth fail")
+    )
+    out = await a._fetch_position_funding(limit=100)
+    assert out == []
+    a._account_api.position_funding.assert_not_called()

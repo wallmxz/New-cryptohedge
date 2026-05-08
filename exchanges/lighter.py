@@ -1148,15 +1148,37 @@ class LighterAdapter(ExchangeAdapter):
         PositionFunding objects (or empty list on HTTP/parse failure
         so the poller doesn't crash).
 
+        Lighter requires an auth token for account-scoped endpoints
+        (code 20001 "auth required for main accounts" without one).
+        We regenerate per call — token TTL is 10 min and the poller
+        runs every 60 s, so it's always fresh.
+
         We do not paginate via cursor here — the poll cadence is 60 s
         and the page size (100) covers far more than one cycle on any
         reasonable funding-history rate. If we ever lag enough that
         100 entries don't cover the gap, the next poll catches up.
         """
+        if self._signer is None:
+            return []
+        try:
+            from lighter import SignerClient as _SignerClient
+            token, err = self._signer.create_auth_token_with_expiry(
+                deadline=_SignerClient.DEFAULT_10_MIN_AUTH_EXPIRY,
+            )
+            if err is not None:
+                logger.warning(
+                    f"_fetch_position_funding: auth token error: {err}"
+                )
+                return []
+        except Exception as e:
+            logger.warning(
+                f"_fetch_position_funding: auth token raised: {e}"
+            )
+            return []
         try:
             resp = await self._account_api.position_funding(
-                account_index=self._account_index,
-                limit=limit,
+                account_index=self._account_index, limit=limit,
+                auth=token,
             )
         except Exception as e:
             logger.warning(f"_fetch_position_funding failed: {e}")
