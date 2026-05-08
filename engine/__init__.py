@@ -837,6 +837,18 @@ class GridMakerEngine:
                 register(active_symbols)
             except Exception as e:
                 logger.warning(f"register_active_symbols failed: {e}")
+        # Re-resolve funding handler mids — `self._settings` was just
+        # replaced with the per-pair settings (which carries the right
+        # `dydx_symbol_token1` for cross-pair). The startup-time call
+        # in app.py only saw the global .env settings where token1 is
+        # empty, so without this re-call `_token1_mid` stays None and
+        # ARB funding entries silently skip in `_on_funding_payment`.
+        try:
+            await self.resolve_market_ids_for_funding()
+        except Exception as e:
+            logger.warning(
+                f"resolve_market_ids_for_funding (post-rebuild) failed: {e}"
+            )
         logger.info(
             f"Engine readers rebuilt for vault {selected} "
             f"({pair_settings.pool_token0_symbol}/{pair_settings.pool_token1_symbol})"

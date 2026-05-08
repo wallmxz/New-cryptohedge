@@ -318,3 +318,92 @@ async def test_iterate_falls_back_when_get_trade_pnl_since_returns_none():
     # override is None, and the in-memory accumulator path is used.
     assert breakdown.get("hedge_pnl") == 1.0
     assert "hedge_pnl" in breakdown  # breakdown was produced (not empty)
+
+
+@pytest.mark.asyncio
+async def test_maybe_rebuild_vault_readers_re_resolves_funding_mids(monkeypatch):
+    """REGRESSION 2026-05-08 (post-deploy): app.py startup calls
+    resolve_market_ids_for_funding with the GLOBAL settings (from .env,
+    where DYDX_SYMBOL_TOKEN1 is empty for cross-pair). Then engine's
+    `_maybe_rebuild_vault_readers` swaps in pair_settings (which has
+    the right token1 symbol). Without re-resolving, _token1_mid stays
+    None and ARB funding entries silently skip the handler — confirmed
+    in DB: funding_paid_token1 = 0 while funding_paid_token0 was
+    receiving entries.
+
+    Fix: rebuild path now calls resolve_market_ids_for_funding after
+    swapping settings. This test verifies that wiring."""
+    from engine import GridMakerEngine
+    from config import Settings
+
+    state = StateHub(hedge_ratio=1.0)
+    initial_settings = MagicMock()
+    initial_settings.dydx_symbol_token0 = "ETH-USD"
+    initial_settings.dydx_symbol_token1 = ""  # empty (USD-pair fallback in .env)
+    initial_settings.threshold_aggressive = 0.01
+    initial_settings.max_open_orders = 200
+    initial_settings.pool_token0_symbol = "ETH"
+    initial_settings.pool_token1_symbol = "USDC"
+    initial_settings.alert_webhook_url = ""
+    initial_settings.dydx_symbol = "ETH-USD"
+    initial_settings.min_rebalance_notional_usd = 0.50
+
+    db = MagicMock()
+    db.get_pair_from_cache = AsyncMock(return_value=None)
+    exchange = MagicMock()
+    exchange.name = "lighter"
+    exchange.subscribe_funding = MagicMock()
+    # Mids per symbol
+    def market_meta_for(sym):
+        m = MagicMock()
+        m.market_index = {"ETH-USD": 0, "ARB-USD": 50}.get(sym, 999)
+        return m
+    exchange.get_market_meta = AsyncMock(side_effect=lambda s: market_meta_for(s))
+    exchange.register_active_symbols = MagicMock()
+
+    pool = MagicMock(); beefy = MagicMock()
+    eng = GridMakerEngine(
+        settings=initial_settings, hub=state, db=db,
+        exchange=exchange, pool_reader=pool, beefy_reader=beefy,
+        decimals0=18, decimals1=6,
+    )
+    # Initial resolve happened in __init__'s subscribe_funding wiring is
+    # synchronous; the explicit resolve is async and runs from app
+    # startup. Simulate that now with the empty-token1 settings.
+    await eng.resolve_market_ids_for_funding()
+    assert eng._token0_mid == 0
+    assert eng._token1_mid is None  # nothing to resolve since "" is falsy
+
+    # Now simulate pair selection: build_readers_for_vault returns new
+    # pair_settings with dydx_symbol_token1="ARB-USD".
+    pair_settings = MagicMock()
+    pair_settings.dydx_symbol_token0 = "ETH-USD"
+    pair_settings.dydx_symbol_token1 = "ARB-USD"
+    pair_settings.pool_token0_symbol = "WETH"
+    pair_settings.pool_token1_symbol = "ARB"
+    pair_settings.alert_webhook_url = ""
+    pair_settings.dydx_symbol = "ETH-USD"
+    pair_settings.min_rebalance_notional_usd = 0.50
+    pair_settings.threshold_aggressive = 0.01
+    pair_settings.max_open_orders = 200
+
+    async def fake_build(*, settings, db, w3, selected_vault_id):
+        return (pair_settings, MagicMock(), MagicMock(), 18, 18)
+
+    monkeypatch.setattr("engine.pair_factory.build_readers_for_vault", fake_build)
+    # also patch the import inside the engine module
+    import engine.pair_factory
+    monkeypatch.setattr(engine.pair_factory, "build_readers_for_vault", fake_build)
+
+    # `_refresh_vault_readers` reads selected_vault_id from db, so stub it.
+    db.get_selected_vault_id = AsyncMock(return_value="0xVAULT")
+    # The method also requires `_pair_factory_w3` non-None to proceed.
+    eng._pair_factory_w3 = MagicMock()
+
+    await eng._refresh_vault_readers()
+
+    # Now both mids should be resolved.
+    assert eng._token0_mid == 0
+    assert eng._token1_mid == 50, (
+        "post-rebuild resolve must populate token1_mid from new pair_settings"
+    )
