@@ -6,6 +6,7 @@ has a similar pattern for dydx_v4_client.
 """
 from __future__ import annotations
 import sys
+import time
 import types
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -749,3 +750,92 @@ async def test_parallel_orders_serialize_with_min_gap(monkeypatch):
         f"Calls were too close ({gap_ms:.1f}ms apart), lock/gap not "
         f"working — would race the nonce_manager on real Lighter."
     )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_once_clears_expected_when_observed_catches_up():
+    """If WS catch-up makes observed match expected within step_size,
+    the reconciler pins expected to observed (no HTTP query)."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta(market_index=0, size_decimals=4)  # step=0.0001
+    a._expected_short_size[0] = 0.0148
+    a._observed_short_size[0] = 0.0148
+    a._last_fire_at[0] = time.monotonic()
+    a._account_api = MagicMock()
+    a._account_api.account = AsyncMock(side_effect=AssertionError(
+        "HTTP must NOT be called when observed already caught up"
+    ))
+    await a._reconcile_once()
+    # Expected pinned to observed (effectively a no-op here since
+    # they were already equal — the assertion is that no HTTP fired).
+
+
+@pytest.mark.asyncio
+async def test_reconcile_once_http_query_on_timeout_confirms_fill():
+    """If divergence persists past RECONCILE_TIMEOUT_S since the last
+    fire, query HTTP. When HTTP confirms the expected size, both
+    observed and expected pin to that truth."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta(market_index=0, size_decimals=4)
+    a._expected_short_size[0] = 0.0148
+    a._observed_short_size[0] = 0.0  # WS lagging
+    a._last_fire_at[0] = time.monotonic() - 31.0  # past timeout
+    a._account_api = MagicMock()
+    a._account_api.account = AsyncMock(return_value=MagicMock(
+        accounts=[MagicMock(positions=[
+            MagicMock(market_id=0, sign=-1, position="0.0148"),
+        ])]
+    ))
+    await a._reconcile_once()
+    assert a._observed_short_size[0] == 0.0148
+    assert a._expected_short_size[0] == 0.0148
+
+
+@pytest.mark.asyncio
+async def test_reconcile_once_http_zero_means_real_failure():
+    """If divergence persists and HTTP returns 0 (the order genuinely
+    didn't fill — IOC auto-cancel), reset BOTH layers to 0. The engine
+    will see drift again on the next iter and fire once more."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta(market_index=0, size_decimals=4)
+    a._expected_short_size[0] = 0.0148
+    a._observed_short_size[0] = 0.0
+    a._last_fire_at[0] = time.monotonic() - 31.0
+    a._account_api = MagicMock()
+    a._account_api.account = AsyncMock(return_value=MagicMock(
+        accounts=[MagicMock(positions=[])]  # no position on this market
+    ))
+    await a._reconcile_once()
+    assert a._observed_short_size[0] == 0.0
+    assert a._expected_short_size[0] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_once_aborts_on_concurrent_fire():
+    """If a new place_long_term_order stamps `_last_fire_at` mid-await,
+    the reconciler must NOT overwrite the new (higher) expected with
+    stale HTTP truth. Race protection from spec § Reconciliation logic."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta(market_index=0, size_decimals=4)
+    a._expected_short_size[0] = 0.0148
+    a._observed_short_size[0] = 0.0
+    initial_fire_at = time.monotonic() - 31.0
+    a._last_fire_at[0] = initial_fire_at
+
+    async def fake_account(**kw):
+        # Simulate a new fire happening DURING the HTTP await.
+        a._last_fire_at[0] = time.monotonic()
+        a._expected_short_size[0] = 0.030  # stamped by hypothetical concurrent place_order
+        return MagicMock(
+            accounts=[MagicMock(positions=[
+                MagicMock(market_id=0, sign=-1, position="0.0148"),
+            ])]
+        )
+    a._account_api = MagicMock()
+    a._account_api.account = AsyncMock(side_effect=fake_account)
+
+    await a._reconcile_once()
+    # Expected stayed at 0.030 (the new stamp), NOT 0.0148 (stale truth).
+    assert a._expected_short_size[0] == 0.030
+    # Observed unchanged — reconciler aborted the write.
+    assert a._observed_short_size[0] == 0.0

@@ -495,6 +495,72 @@ class LighterAdapter(ExchangeAdapter):
         except Exception as e:
             logger.warning(f"WS account update parse failed: {e}")
 
+    # Reconciler tunables. The redesign treats 30 s as "WS should have
+    # delivered by now under any normal load — if we're still seeing
+    # divergence, query HTTP authoritative". Spec discusses the
+    # tradeoffs in § Constants.
+    RECONCILE_TIMEOUT_S = 30.0
+
+    def _step_size_for_mid(self, mid: int) -> float:
+        """Tolerance for treating observed as matching expected — one
+        size tick. Pulled from the per-market metadata cached at connect."""
+        for meta in self._markets.values():
+            if meta.market_index == mid:
+                return meta.step_size
+        return 1e-9  # unknown market — strict equality
+
+    async def _reconcile_once(self) -> None:
+        """One pass over `_expected_short_size`. For each entry:
+          1. If observed already matches expected (within step size),
+             pin expected to observed and clear local credit.
+          2. Else if elapsed since last fire > RECONCILE_TIMEOUT_S,
+             query HTTP authoritative and pin both layers to the
+             returned truth — UNLESS a concurrent fire stamped
+             `_last_fire_at` mid-await, in which case abort to avoid
+             overwriting fresher state with stale truth.
+        """
+        # Snapshot the current state so per-symbol decisions reference
+        # a consistent picture, not values that mutated during awaits.
+        snapshot = {
+            mid: (
+                self._expected_short_size.get(mid, 0.0),
+                self._last_fire_at.get(mid, 0.0),
+            )
+            for mid in list(self._expected_short_size.keys())
+        }
+        for mid, (expected_at_scan, last_fire_at_scan) in snapshot.items():
+            observed = self._observed_short_size.get(mid, 0.0)
+            tol = self._step_size_for_mid(mid)
+            # Catch-up case: WS already shows expected. Pin and move on.
+            if abs(expected_at_scan - observed) <= tol:
+                # Only commit if no new fire happened — otherwise the
+                # newer expected is more current than `observed`.
+                if self._last_fire_at.get(mid, 0.0) == last_fire_at_scan:
+                    self._expected_short_size[mid] = observed
+                continue
+            # Timeout case: if not enough time since last fire, wait.
+            elapsed = time.monotonic() - last_fire_at_scan
+            if elapsed <= self.RECONCILE_TIMEOUT_S:
+                continue
+            # Authoritative query.
+            truth = await self._fetch_short_size_via_http(mid)
+            if truth is None:
+                continue  # HTTP failed — retry next scan
+            # Race guard: did a fire happen during our await?
+            if self._last_fire_at.get(mid, 0.0) != last_fire_at_scan:
+                logger.debug(
+                    f"Reconcile[{mid}] aborted: new fire stamped during "
+                    f"HTTP query — next scan will re-evaluate."
+                )
+                continue
+            self._observed_short_size[mid] = truth
+            self._expected_short_size[mid] = truth
+            logger.info(
+                f"Reconciled short_size[{mid}] via HTTP: "
+                f"observed_was={observed}, expected_was={expected_at_scan}, "
+                f"truth={truth}"
+            )
+
     async def _load_market_metadata(self) -> None:
         """Fetch all order books and build symbol→meta cache."""
         from lighter import OrderApi  # type-hint only
