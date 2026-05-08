@@ -319,6 +319,52 @@ async def test_adapter_inits_expected_state_dicts():
 
 
 @pytest.mark.asyncio
+async def test_place_order_stamps_expected_on_server_accept():
+    """When create_order returns err=None, _expected_short_size must be
+    stamped with the order size — even if _verify_fill returns 0. This
+    is the regression test for the 2026-05-07 over-hedge incidents.
+    Sell increments; buy decrements (clamp at 0)."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta()
+    _seed_book(a, 0, bid=2399.0, ask=2400.0)
+    a._signer = MagicMock()
+    a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
+    a._signer.create_order = AsyncMock(
+        return_value=(None, MagicMock(tx_hash="0xabc"), None)
+    )
+    # Force _verify_fill to LIE: return 0 (no fill confirmed) — this is
+    # the exact failure mode that produced over-hedge today. Stamping
+    # must happen anyway because err is None.
+    async def fake_verify(meta, cloid_int, expected_size):
+        return 0.0, 0.0
+    a._verify_fill = fake_verify  # type: ignore
+    a.get_position = AsyncMock(return_value=None)
+
+    await a.place_long_term_order(
+        symbol="ETH-USD", side="sell", size=0.0148, price=0,
+        cloid_int=42,
+    )
+    # Stamped despite verify_fill=0:
+    assert a._expected_short_size[0] == 0.0148
+    # Timestamp is set:
+    assert 0 in a._last_fire_at
+
+    # A subsequent BUY 0.005 (covering the short) decrements:
+    await a.place_long_term_order(
+        symbol="ETH-USD", side="buy", size=0.005, price=0,
+        cloid_int=43,
+    )
+    assert abs(a._expected_short_size[0] - (0.0148 - 0.005)) < 1e-9
+
+    # A BUY larger than the current expected clamps at 0 (can't go below).
+    await a.place_long_term_order(
+        symbol="ETH-USD", side="buy", size=1.0, price=0,
+        cloid_int=44,
+    )
+    assert a._expected_short_size[0] == 0.0
+
+
+@pytest.mark.asyncio
 async def test_get_position_reads_from_ws_cache():
     """get_position must NOT call /account — it reads the WS-cached
     position. Sustained 1Hz HTTP polling triggered the CloudFront WAF

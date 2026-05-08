@@ -718,6 +718,27 @@ class LighterAdapter(ExchangeAdapter):
             # racing the exchange's internal state. Either way: return as
             # "no fill" — the engine treats that as a missed opportunity,
             # NOT as "try again".
+
+            # Server accepted the order. Stamp the LOCAL expected_short_size
+            # IMMEDIATELY — independent of `_verify_fill`. The whole point
+            # of the position-truth redesign (2026-05-07) is that
+            # verify_fill and the WS account snapshot are both
+            # eventually-consistent and have produced over-hedge stacks
+            # by under-reporting position right after a fill. With the
+            # stamp in place, `get_effective_position` returns the new
+            # expected size on the very next iter, drift goes to 0,
+            # engine doesn't re-fire. The reconciler resolves any genuine
+            # non-fill (IOC auto-cancel) at the 30 s timeout via HTTP.
+            mid = meta.market_index
+            if is_ask:  # side == "sell" — short increases
+                self._expected_short_size[mid] = (
+                    self._expected_short_size.get(mid, 0.0) + size
+                )
+            else:  # side == "buy" — covering short, decrement clamped at 0
+                cur = self._expected_short_size.get(mid, 0.0)
+                self._expected_short_size[mid] = max(0.0, cur - size)
+            self._last_fire_at[mid] = time.monotonic()
+
             fill_size, fill_price = await self._verify_fill(
                 meta=meta, cloid_int=cloid_int, expected_size=size,
             )
