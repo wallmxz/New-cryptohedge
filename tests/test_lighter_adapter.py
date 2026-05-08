@@ -1152,3 +1152,76 @@ async def test_get_trade_pnl_since_default_returns_none_on_base():
         def get_min_notional(self, s): return 0.01
     d = _Dummy()
     assert await d.get_trade_pnl_since(0.0, 1.0) is None
+
+
+@pytest.mark.asyncio
+async def test_get_trade_pnl_since_returns_baseline_and_latest():
+    """Mock pnl response with 3 hourly buckets: ts=1000,2000,3000 with
+    trade_pnl=-1.0,-2.0,-3.0 (cumulative). Request start_ts=1500
+    -> baseline = -1.0 (entry at 1000 has ts<=1500), latest = -3.0."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(
+        return_value=("TOKEN", None)
+    )
+    a._account_api = MagicMock()
+    a._account_api.pnl = AsyncMock(return_value=MagicMock(
+        pnl=[
+            MagicMock(timestamp=1000, trade_pnl=-1.0),
+            MagicMock(timestamp=2000, trade_pnl=-2.0),
+            MagicMock(timestamp=3000, trade_pnl=-3.0),
+        ],
+    ))
+    out = await a.get_trade_pnl_since(start_ts=1500.0, end_ts=3500.0)
+    assert out == (-1.0, -3.0)
+
+
+@pytest.mark.asyncio
+async def test_get_trade_pnl_since_caches_for_30s():
+    """Two calls within 30 s share the cached result; pnl HTTP called once.
+    Bucket at ts=400 (<=start_ts=500) → baseline=-5.0; latest=-5.0."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("TOKEN", None))
+    a._account_api = MagicMock()
+    a._account_api.pnl = AsyncMock(return_value=MagicMock(
+        pnl=[MagicMock(timestamp=400, trade_pnl=-5.0)],
+    ))
+    r1 = await a.get_trade_pnl_since(start_ts=500.0, end_ts=2000.0)
+    r2 = await a.get_trade_pnl_since(start_ts=500.0, end_ts=2000.0)
+    assert r1 == r2 == (-5.0, -5.0)
+    assert a._account_api.pnl.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_get_trade_pnl_since_returns_none_on_error():
+    """HTTP failure -> None; doesn't crash."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("TOKEN", None))
+    a._account_api = MagicMock()
+    a._account_api.pnl = AsyncMock(side_effect=RuntimeError("boom"))
+    out = await a.get_trade_pnl_since(start_ts=100.0, end_ts=200.0)
+    assert out is None
+
+
+@pytest.mark.asyncio
+async def test_get_trade_pnl_since_returns_zero_baseline_when_no_history_before_start():
+    """If all returned buckets are AFTER start_ts, baseline = 0.0
+    (account had no prior cumulative pnl to subtract)."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("TOKEN", None))
+    a._account_api = MagicMock()
+    a._account_api.pnl = AsyncMock(return_value=MagicMock(
+        pnl=[
+            MagicMock(timestamp=2000, trade_pnl=-2.0),
+            MagicMock(timestamp=3000, trade_pnl=-3.0),
+        ],
+    ))
+    out = await a.get_trade_pnl_since(start_ts=1500.0, end_ts=3500.0)
+    assert out == (0.0, -3.0)

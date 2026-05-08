@@ -184,6 +184,13 @@ class LighterAdapter(ExchangeAdapter):
         self._funding_callback: Callable[..., Awaitable[None]] | None = None
         self._funding_task: asyncio.Task | None = None
 
+        # 30-s in-process cache for AccountApi.pnl. The endpoint is
+        # account-level (one snapshot per call) and the panel reads
+        # hedge_pnl every iter (1 Hz). Cache shaves Lighter-side load
+        # without compromising display freshness.
+        # Layout: (cache_at_monotonic, (baseline, latest)) | None.
+        self._trade_pnl_cache: tuple[float, tuple[float, float]] | None = None
+
     # ──────────────────────────────────────────────────────────────────────
     # Connection lifecycle
     # ──────────────────────────────────────────────────────────────────────
@@ -1184,6 +1191,64 @@ class LighterAdapter(ExchangeAdapter):
             logger.warning(f"_fetch_position_funding failed: {e}")
             return []
         return list(getattr(resp, "position_fundings", None) or [])
+
+    async def get_trade_pnl_since(
+        self, start_ts: float, end_ts: float,
+    ) -> tuple[float, float] | None:
+        """Cumulative trade_pnl from Lighter's AccountApi.pnl, returned
+        as (baseline_at_or_before_start_ts, latest). Caller computes
+        delta = latest - baseline to get pnl during the window.
+        Returns None on error so the engine falls back to its in-memory
+        accumulator. 30-s in-process cache.
+        """
+        # Cache check — re-use a recent answer to spare Lighter.
+        now_mono = time.monotonic()
+        if self._trade_pnl_cache is not None:
+            cache_at, cached = self._trade_pnl_cache
+            if now_mono - cache_at < 30.0:
+                return cached
+        if self._signer is None or self._account_api is None:
+            return None
+        try:
+            from lighter import SignerClient as _SignerClient
+            token, err = self._signer.create_auth_token_with_expiry(
+                deadline=_SignerClient.DEFAULT_10_MIN_AUTH_EXPIRY,
+            )
+            if err is not None:
+                logger.warning(f"get_trade_pnl_since: auth token error: {err}")
+                return None
+        except Exception as e:
+            logger.warning(f"get_trade_pnl_since: auth token raised: {e}")
+            return None
+        # 2 h cushion ensures we get an entry whose ts <= start_ts as
+        # the cumulative-pnl baseline (Lighter aligns to hour boundaries).
+        cushion_start = max(0, int(start_ts) - 7200)
+        try:
+            resp = await self._account_api.pnl(
+                by="index", value=str(self._account_index),
+                resolution="1h",
+                start_timestamp=cushion_start, end_timestamp=int(end_ts),
+                count_back=300, auth=token,
+            )
+        except Exception as e:
+            logger.warning(f"get_trade_pnl_since failed: {e}")
+            return None
+        history = list(getattr(resp, "pnl", None) or [])
+        if not history:
+            return None
+        latest = float(getattr(history[-1], "trade_pnl", 0) or 0)
+        # Baseline = latest entry whose timestamp <= start_ts. If none
+        # in the window, default to 0 (account had no prior pnl).
+        baseline = 0.0
+        for entry in history:
+            ts = float(getattr(entry, "timestamp", 0) or 0)
+            if ts <= start_ts:
+                baseline = float(getattr(entry, "trade_pnl", 0) or 0)
+            else:
+                break
+        out = (baseline, latest)
+        self._trade_pnl_cache = (now_mono, out)
+        return out
 
     async def _funding_poller_iteration(self) -> None:
         """One pass: fetch recent funding entries and dispatch each to
