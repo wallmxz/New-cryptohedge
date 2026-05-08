@@ -959,3 +959,15 @@ async def test_reconciler_loop_invokes_reconcile_once_periodically():
     with mock.patch("asyncio.sleep", fast_sleep):
         await a._reconciler_loop()
     assert len(invocations) >= 3
+
+
+def test_subscribe_funding_is_callable_on_base_adapter():
+    """Default no-op satisfies the ABC and accepts a coroutine callback."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    called = []
+    async def cb(entry):
+        called.append(entry)
+    # Should not raise even before connect/poller is wired.
+    a.subscribe_funding(cb)
+    assert callable(getattr(a, "subscribe_funding"))

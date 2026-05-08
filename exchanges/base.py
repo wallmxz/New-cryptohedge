@@ -67,3 +67,13 @@ class ExchangeAdapter(ABC):
     def get_tick_size(self, symbol: str) -> float: ...
     @abstractmethod
     def get_min_notional(self, symbol: str) -> float: ...
+
+    def subscribe_funding(
+        self, callback: "Callable[..., Awaitable[None]]",
+    ) -> None:
+        """Register a callback fired once per funding payment received from
+        the exchange. Default: no-op (adapters that support funding history
+        override this). Engine relies on the override to populate the
+        operation's funding_paid_token0/1 accumulators.
+        """
+        return None
