@@ -28,6 +28,9 @@ def compute_operation_pnl(
     current_eth_price: float | None = None,
     hedge_realized_since_baseline: float | None = None,
     hedge_unrealized_since_baseline: float | None = None,
+    # Authoritative hedge_pnl override (used when the venue exposes
+    # cumulative trade_pnl since op start — survives uvicorn restarts).
+    hedge_pnl_aggregate_override: float | None = None,
 ) -> dict:
     """Returns the live PnL breakdown for an operation.
 
@@ -59,8 +62,15 @@ def compute_operation_pnl(
     hodl_value = op.baseline_amount0 * p0_now + op.baseline_amount1 * p1_now
     il_natural = current_pool_value_usd - hodl_value
 
-    # Hedge PnL — per-leg dicts in cross-pair, single aggregate in legacy.
-    if is_cross_pair:
+    # Hedge PnL.
+    if hedge_pnl_aggregate_override is not None:
+        # Authoritative venue-side cumulative trade_pnl since op start
+        # (e.g., LighterAdapter.get_trade_pnl_since). Per-leg attribution
+        # isn't available at this level, so the full value lives on
+        # token0 and token1 stays 0 — the aggregate is what users see.
+        hedge_pnl_t0 = hedge_pnl_aggregate_override
+        hedge_pnl_t1 = 0.0
+    elif is_cross_pair:
         rps = hedge_realized_per_symbol or {}
         ups = hedge_unrealized_per_symbol or {}
         # Symbol order is whatever's in the dicts; we pick keys deterministically

@@ -77,3 +77,57 @@ def test_single_leg_backward_compat():
     assert "il_natural" in bd
     assert "hedge_pnl" in bd
     assert "net_pnl" in bd
+
+
+def test_compute_operation_pnl_uses_override_when_provided():
+    """When hedge_pnl_aggregate_override is provided (e.g., from a
+    venue-side cumulative pnl query), it replaces the per-leg sum and
+    becomes the authoritative hedge_pnl. Per-leg fields collapse: the
+    full value goes on token0 for display consistency, token1 = 0."""
+    from engine.pnl import compute_operation_pnl
+    from engine.operation import Operation, OperationState
+    op = Operation(
+        id=1, started_at=1700000000.0, state=OperationState.ACTIVE,
+        baseline_eth_price=2000.0, baseline_pool_value_usd=50.0,
+        baseline_amount0=0.01, baseline_amount1=100.0,
+        baseline_collateral=100.0,
+        baseline_token0_usd_price=2000.0, baseline_token1_usd_price=0.10,
+    )
+    out = compute_operation_pnl(
+        op,
+        current_pool_value_usd=50.0,
+        current_token0_usd_price=2000.0,
+        current_token1_usd_price=0.10,
+        hedge_realized_per_symbol={"ETH-USD": 1.0, "ARB-USD": 2.0},
+        hedge_unrealized_per_symbol={"ETH-USD": 0.5, "ARB-USD": 0.5},
+        hedge_pnl_aggregate_override=-7.5,
+    )
+    assert out["hedge_pnl"] == -7.5
+    assert out["hedge_pnl_token0"] == -7.5
+    assert out["hedge_pnl_token1"] == 0.0
+
+
+def test_compute_operation_pnl_keeps_per_leg_when_no_override():
+    """When override is None (default), the existing per-leg sum
+    behavior is preserved — backwards compatible."""
+    from engine.pnl import compute_operation_pnl
+    from engine.operation import Operation, OperationState
+    op = Operation(
+        id=1, started_at=1700000000.0, state=OperationState.ACTIVE,
+        baseline_eth_price=2000.0, baseline_pool_value_usd=50.0,
+        baseline_amount0=0.01, baseline_amount1=100.0,
+        baseline_collateral=100.0,
+        baseline_token0_usd_price=2000.0, baseline_token1_usd_price=0.10,
+    )
+    out = compute_operation_pnl(
+        op,
+        current_pool_value_usd=50.0,
+        current_token0_usd_price=2000.0,
+        current_token1_usd_price=0.10,
+        hedge_realized_per_symbol={"ARB-USD": 2.0, "ETH-USD": 1.0},
+        hedge_unrealized_per_symbol={"ARB-USD": 0.5, "ETH-USD": 0.5},
+    )
+    # sorted keys: ARB-USD < ETH-USD lexicographically -> token0_key="ARB-USD"
+    assert out["hedge_pnl_token0"] == 2.5  # ARB realized + unrealized
+    assert out["hedge_pnl_token1"] == 1.5  # ETH realized + unrealized
+    assert out["hedge_pnl"] == 4.0
