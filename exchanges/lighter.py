@@ -502,6 +502,35 @@ class LighterAdapter(ExchangeAdapter):
                             pos.get("unrealized_pnl", 0) or 0
                         ),
                     }
+            # Defensive merge instead of wholesale replace.
+            #
+            # `update/account_all` is documented as a FULL snapshot, so
+            # missing-from-message → "position closed". In practice we
+            # have observed transient snapshots that drop a still-open
+            # position mid-iteration (probably a race in Lighter's match
+            # engine emitting an intermediate state during a fill). When
+            # that happens and we wholesale-replace, the engine reads
+            # current=0, computes drift=full_target, and OPENS the
+            # entire hedge a second time — observed in production
+            # 2026-05-08 (incidents on op #28).
+            #
+            # Fix: keep mids that were previously non-zero but missing
+            # from this snapshot. The reconciler runs every 5 s and will
+            # query HTTP authoritative within RECONCILE_TIMEOUT_S to
+            # confirm a genuine close, so this only DEFERS clearing —
+            # it doesn't permanently mask a closed position.
+            for mid, prev_size in self._observed_short_size.items():
+                if mid in new_short_size:
+                    continue  # explicit value in new snapshot — accept it
+                if prev_size > 0:
+                    # Held back. Reconciler will verify via HTTP.
+                    new_short_size[mid] = prev_size
+                    if mid in self._observed_position_meta:
+                        new_position_meta[mid] = self._observed_position_meta[mid]
+                    logger.warning(
+                        f"WS dropped mid={mid} (was {prev_size}); preserving "
+                        f"until reconciler confirms via HTTP."
+                    )
             self._observed_short_size = new_short_size
             self._observed_position_meta = new_position_meta
             self._ws_first_snapshot.set()

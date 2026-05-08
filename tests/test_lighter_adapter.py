@@ -587,9 +587,12 @@ def test_on_account_update_extracts_positions_and_collateral():
     )
     assert abs(a2._ws_collateral - 197.85168170) < 1e-6
 
-    # Update where ETH position closes: per docs, a closed position
-    # DISAPPEARS from the dict (no size=0 sentinel). The cache must
-    # reflect that — ETH gone, ARB still there.
+    # Update where ETH disappears from the snapshot: with the defensive
+    # merge (2026-05-08 fix), a missing-from-message mid that was
+    # previously non-zero is PRESERVED until the reconciler confirms
+    # the close via HTTP. This protects against transient empty
+    # snapshots from Lighter's match engine that were over-hedging
+    # the engine on every WS wobble.
     a._on_account_update(
         account_id=42,
         state={
@@ -605,22 +608,113 @@ def test_on_account_update_extracts_positions_and_collateral():
             },
         },
     )
-    # After ETH closes:
-    assert 0 not in a._observed_short_size
-    # ARB long → 0 magnitude, but still tracked.
+    # ETH was non-zero before → preserved. ARB long → 0 magnitude.
+    assert 0 in a._observed_short_size
+    assert a._observed_short_size[0] > 0  # preserved old value
     assert a._observed_short_size[50] == 0.0
     assert a._observed_position_meta[50]["position"] == 100.0
     assert a._ws_collateral == 100.0
 
-    # Empty positions dict (everything closed) wipes everything.
+    # Empty positions dict (transient snapshot or all-closed): all
+    # previously non-zero mids stay preserved. Reconciler will verify.
     a._on_account_update(
         account_id=42,
         state={"account": 42, "available_balance": "200.0", "positions": {}},
     )
-    # After everything closes:
-    assert a._observed_short_size == {}
-    assert a._observed_position_meta == {}
+    # ETH (was non-zero) preserved. ARB (was 0) cleared since the
+    # defensive merge only preserves NON-ZERO previous values.
+    assert 0 in a._observed_short_size
+    assert 50 not in a._observed_short_size
     assert a._ws_collateral == 200.0
+
+
+def test_on_account_update_defensive_merge_against_ws_wobble():
+    """REGRESSION: 2026-05-08 — over-hedge on op #28.
+
+    Lighter's WS occasionally pushes a transient `update/account_all`
+    snapshot that drops a still-open position (probably an
+    intermediate match-engine state during a fill). Wholesale-replace
+    of `_observed_short_size` made the engine read current=0 while the
+    real position was open; combined with `_expected_short_size` only
+    accumulating fire-deltas (not the full position), the engine fired
+    a SECOND full-target hedge on top, doubling positions.
+
+    Fix: when a snapshot is missing a mid that was previously non-zero,
+    keep the old value pending reconciler HTTP verification. The
+    reconciler runs every 5 s and confirms-or-clears within
+    RECONCILE_TIMEOUT_S, so a genuine close still propagates — just
+    deferred by a few seconds.
+
+    This test wires the exact scenario from the production log:
+      1. Real position ETH=0.0148 short, ARB=128 short (sign=-1)
+      2. WS pushes transient snapshot with positions={} (empty)
+      3. Engine reads observed → must NOT see 0/empty
+    """
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta(market_index=0, size_decimals=4)
+    a._markets["ARB-USD"] = _meta(market_index=50, size_decimals=1)
+
+    # Step 1: WS pushes correct initial snapshot.
+    a._on_account_update(
+        account_id=42,
+        state={
+            "type": "subscribed/account_all", "account": 42,
+            "available_balance": "100.0",
+            "positions": {
+                "0": {
+                    "market_id": 0, "sign": -1, "position": "0.0148",
+                    "avg_entry_price": "2280", "unrealized_pnl": "0",
+                },
+                "50": {
+                    "market_id": 50, "sign": -1, "position": "128.0",
+                    "avg_entry_price": "0.128", "unrealized_pnl": "0",
+                },
+            },
+        },
+    )
+    assert a._observed_short_size[0] == 0.0148
+    assert a._observed_short_size[50] == 128.0
+
+    # Step 2: WS pushes TRANSIENT EMPTY snapshot — the wobble.
+    a._on_account_update(
+        account_id=42,
+        state={
+            "type": "update/account_all", "account": 42,
+            "available_balance": "100.0",
+            "positions": {},  # ← the wobble
+        },
+    )
+    # CRITICAL: observed must NOT have been wiped. If it was, the
+    # engine would read current=0, compute drift=full_target, and
+    # OPEN the entire hedge a second time — over-hedge regression.
+    assert a._observed_short_size[0] == 0.0148, (
+        "WS wobble wiped ETH observed — engine would over-hedge"
+    )
+    assert a._observed_short_size[50] == 128.0, (
+        "WS wobble wiped ARB observed — engine would over-hedge"
+    )
+
+    # Step 3: WS recovers, real snapshot returns. New values accepted.
+    a._on_account_update(
+        account_id=42,
+        state={
+            "type": "update/account_all", "account": 42,
+            "available_balance": "100.0",
+            "positions": {
+                "0": {
+                    "market_id": 0, "sign": -1, "position": "0.0148",
+                    "avg_entry_price": "2280", "unrealized_pnl": "0",
+                },
+                "50": {
+                    "market_id": 50, "sign": -1, "position": "128.0",
+                    "avg_entry_price": "0.128", "unrealized_pnl": "0",
+                },
+            },
+        },
+    )
+    assert a._observed_short_size[0] == 0.0148
+    assert a._observed_short_size[50] == 128.0
 
 
 @pytest.mark.asyncio
