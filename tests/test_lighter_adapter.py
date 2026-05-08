@@ -623,6 +623,50 @@ def test_on_account_update_extracts_positions_and_collateral():
 
 
 @pytest.mark.asyncio
+async def test_get_effective_position_uses_max_of_observed_and_expected():
+    """`get_effective_position(symbol)` must return a Position whose
+    size is max(observed, expected). This is what the engine reads as
+    `current_short_size` — covering both the WS-observed-only case
+    (steady state) and the just-stamped-not-yet-WS-confirmed case
+    (immediately after fire, before WS catch-up)."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta()
+
+    # Case 1: both empty → None.
+    assert await a.get_effective_position("ETH-USD") is None
+
+    # Case 2: only observed populated (WS pushed; we never fired).
+    _seed_position(
+        a, market_index=0, sign=-1, size=0.05,
+        avg_entry=2390.0, unrealized=1.20,
+    )
+    pos = await a.get_effective_position("ETH-USD")
+    assert pos is not None
+    assert pos.size == 0.05
+    assert pos.side == "short"
+
+    # Case 3: only expected populated (just fired, WS hasn't caught up).
+    a._observed_short_size = {}
+    a._observed_position_meta = {}
+    a._expected_short_size = {0: 0.0148}
+    pos = await a.get_effective_position("ETH-USD")
+    assert pos is not None
+    assert pos.size == 0.0148
+    assert pos.side == "short"
+
+    # Case 4: both populated, expected is larger (just fired delta on
+    # top of an existing short — engine sees the LARGER value to
+    # avoid re-firing).
+    _seed_position(
+        a, market_index=0, sign=-1, size=0.0148,
+        avg_entry=2390.0,
+    )
+    a._expected_short_size = {0: 0.020}
+    pos = await a.get_effective_position("ETH-USD")
+    assert pos.size == 0.020
+
+
+@pytest.mark.asyncio
 async def test_parallel_orders_serialize_with_min_gap(monkeypatch):
     """Two place_long_term_order calls in parallel must NOT race the
     nonce_manager — the adapter's internal lock + 600ms min-gap should

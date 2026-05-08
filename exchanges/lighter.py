@@ -888,6 +888,42 @@ class LighterAdapter(ExchangeAdapter):
             unrealized_pnl=meta_d["unrealized_pnl"],
         )
 
+    async def get_effective_position(self, symbol: str) -> Position | None:
+        """Returns the position the hedge engine should drive drift
+        against. Fuses the WS-observed magnitude with the locally-
+        stamped expected magnitude:
+
+            size = max(_observed_short_size, _expected_short_size)
+
+        Right after a successful `place_long_term_order`, expected jumps
+        to the new total. WS observed lags (eventually-consistent up to
+        ~30 s under load). Without this fusion the engine would read
+        observed=0 immediately after a fill, compute drift=target,
+        fire ANOTHER order — that's the over-hedge stack from
+        2026-05-07. The fusion makes the race structurally impossible.
+
+        Returns None when both layers report 0 (closed position).
+        """
+        meta = self._market_meta_or_raise(symbol)
+        mid = meta.market_index
+        observed = self._observed_short_size.get(mid, 0.0)
+        expected = self._expected_short_size.get(mid, 0.0)
+        size = max(observed, expected)
+        if size <= 0:
+            return None
+        # Metadata (entry, unrealized PnL) only available when WS has
+        # reported observed. If we're in the just-fired window with
+        # observed=0, return placeholder zeros — the engine doesn't
+        # use these for drift, only for display.
+        meta_d = self._observed_position_meta.get(mid)
+        return Position(
+            symbol=symbol,
+            side="short",
+            size=size,
+            entry_price=(meta_d or {}).get("avg_entry_price", 0.0),
+            unrealized_pnl=(meta_d or {}).get("unrealized_pnl", 0.0),
+        )
+
     async def get_oracle_prices(self, symbols: list[str]) -> dict[str, float]:
         """Returns the WS top-of-book midpoint per symbol. We previously
         used `last_trade_price` from /orderBookDetails (HTTP); now the
