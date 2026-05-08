@@ -667,6 +667,33 @@ async def test_get_effective_position_uses_max_of_observed_and_expected():
 
 
 @pytest.mark.asyncio
+async def test_fetch_short_size_via_http_returns_short_magnitude():
+    """`_fetch_short_size_via_http(market_index)` must call /account,
+    find the position for the given market_id, and return:
+      - the unsigned magnitude if it's a short (sign=-1),
+      - 0.0 if flat or long,
+      - None on error (so the caller skips reconciliation that scan)."""
+    a = _make_adapter()
+    a._account_index = 724201
+
+    # Stub: /account returns a short of 0.05 ETH on market_id=0.
+    a._account_api = MagicMock()
+    a._account_api.account = AsyncMock(return_value=MagicMock(
+        accounts=[MagicMock(positions=[
+            MagicMock(market_id=0, sign=-1, position="0.05"),
+            MagicMock(market_id=50, sign=1, position="100.0"),  # long
+        ])]
+    ))
+    assert await a._fetch_short_size_via_http(0) == 0.05
+    assert await a._fetch_short_size_via_http(50) == 0.0  # long → 0
+    assert await a._fetch_short_size_via_http(99) == 0.0  # not in list → 0
+
+    # Stub: HTTP raises (network blip) → return None.
+    a._account_api.account = AsyncMock(side_effect=RuntimeError("net err"))
+    assert await a._fetch_short_size_via_http(0) is None
+
+
+@pytest.mark.asyncio
 async def test_parallel_orders_serialize_with_min_gap(monkeypatch):
     """Two place_long_term_order calls in parallel must NOT race the
     nonce_manager — the adapter's internal lock + 600ms min-gap should

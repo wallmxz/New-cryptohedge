@@ -924,6 +924,44 @@ class LighterAdapter(ExchangeAdapter):
             unrealized_pnl=(meta_d or {}).get("unrealized_pnl", 0.0),
         )
 
+    async def _fetch_short_size_via_http(self, market_index: int) -> float | None:
+        """Authoritative HTTP query for the current short magnitude.
+        Used by the reconciler when WS hasn't caught up to expected
+        within the timeout. Returns:
+          - the unsigned magnitude if the position is a short (sign=-1),
+          - 0.0 if the position is flat or long (we don't track longs),
+          - None on HTTP/parse error so the caller can skip and retry
+            on the next reconciler scan without overwriting state.
+        """
+        try:
+            resp = await self._account_api.account(
+                by="index", value=str(self._account_index),
+            )
+        except Exception as e:
+            logger.warning(
+                f"_fetch_short_size_via_http({market_index}) failed: {e}"
+            )
+            return None
+        accounts = getattr(resp, "accounts", None) or []
+        if not accounts:
+            return 0.0
+        positions = getattr(accounts[0], "positions", None) or []
+        for pos in positions:
+            try:
+                pos_mid = int(getattr(pos, "market_id"))
+            except (TypeError, ValueError):
+                continue
+            if pos_mid != market_index:
+                continue
+            sign = int(getattr(pos, "sign", 1))
+            if sign != -1:
+                return 0.0  # long or flat → no short to track
+            try:
+                return float(getattr(pos, "position", 0))
+            except (TypeError, ValueError):
+                return 0.0
+        return 0.0  # market not in account → no position
+
     async def get_oracle_prices(self, symbols: list[str]) -> dict[str, float]:
         """Returns the WS top-of-book midpoint per symbol. We previously
         used `last_trade_price` from /orderBookDetails (HTTP); now the
