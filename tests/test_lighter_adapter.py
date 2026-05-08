@@ -365,6 +365,70 @@ async def test_place_order_stamps_expected_on_server_accept():
 
 
 @pytest.mark.asyncio
+async def test_place_order_consecutive_sells_accumulate():
+    """Two successive sells must accumulate in `_expected_short_size`.
+    Each successful create_order is a separate physical order on the
+    exchange — engine fires deltas, adapter accumulates them. The
+    over-hedge incidents of 2026-05-07 happened because the engine kept
+    refiring deltas while position read as 0; the redesign assumes the
+    engine fires intentional deltas, so double-stamp is correct here."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta()
+    _seed_book(a, 0, bid=2399.0, ask=2400.0)
+    a._signer = MagicMock()
+    a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
+    a._signer.create_order = AsyncMock(
+        return_value=(None, MagicMock(tx_hash="0xabc"), None)
+    )
+    async def fake_verify(meta, cloid_int, expected_size):
+        return 0.0, 0.0
+    a._verify_fill = fake_verify  # type: ignore
+    a.get_position = AsyncMock(return_value=None)
+
+    await a.place_long_term_order(
+        symbol="ETH-USD", side="sell", size=0.005, price=0,
+        cloid_int=100,
+    )
+    await a.place_long_term_order(
+        symbol="ETH-USD", side="sell", size=0.005, price=0,
+        cloid_int=101,
+    )
+    # Sells accumulate.
+    assert abs(a._expected_short_size[0] - 0.010) < 1e-12
+
+
+@pytest.mark.asyncio
+async def test_place_order_buy_decrement_handles_fp_residue():
+    """Chained buys whose deltas sum exactly to the current expected
+    must clamp to exactly 0.0, not leak a denormal positive residue.
+    `0.0148 - 0.005 - 0.005 - 0.0048` is `8.67e-19` in float arithmetic;
+    the clamp must zero this out."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta()  # step_size=0.0001 from helper
+    _seed_book(a, 0, bid=2399.0, ask=2400.0)
+    a._signer = MagicMock()
+    a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
+    a._signer.create_order = AsyncMock(
+        return_value=(None, MagicMock(tx_hash="0xabc"), None)
+    )
+    async def fake_verify(meta, cloid_int, expected_size):
+        return 0.0, 0.0
+    a._verify_fill = fake_verify  # type: ignore
+    a.get_position = AsyncMock(return_value=None)
+
+    await a.place_long_term_order(
+        symbol="ETH-USD", side="sell", size=0.0148, price=0, cloid_int=200,
+    )
+    # Three buys whose sizes sum to exactly 0.0148.
+    for size, cloid in [(0.005, 201), (0.005, 202), (0.0048, 203)]:
+        await a.place_long_term_order(
+            symbol="ETH-USD", side="buy", size=size, price=0, cloid_int=cloid,
+        )
+    # Must be EXACTLY 0.0, not 8.67e-19.
+    assert a._expected_short_size[0] == 0.0
+
+
+@pytest.mark.asyncio
 async def test_get_position_reads_from_ws_cache():
     """get_position must NOT call /account — it reads the WS-cached
     position. Sustained 1Hz HTTP polling triggered the CloudFront WAF

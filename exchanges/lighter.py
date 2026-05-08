@@ -736,7 +736,12 @@ class LighterAdapter(ExchangeAdapter):
                 )
             else:  # side == "buy" — covering short, decrement clamped at 0
                 cur = self._expected_short_size.get(mid, 0.0)
-                self._expected_short_size[mid] = max(0.0, cur - size)
+                new = cur - size
+                # Clamp denormals/FP residue from chained decrements to
+                # exact 0. Threshold = quarter of one market step (size_decimals
+                # tick), well below any real position the engine can act on.
+                step = meta.step_size or 1e-12
+                self._expected_short_size[mid] = 0.0 if new < step / 4 else new
             self._last_fire_at[mid] = time.monotonic()
 
             fill_size, fill_price = await self._verify_fill(
