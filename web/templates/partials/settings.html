@@ -82,15 +82,19 @@
                         <p class="cfg-hint">Definido no .env</p>
                     </div>
                     <div class="cfg-group">
-                        <label>WETH residual em wallet</label>
-                        <p class="text-sm" x-text="state.weth_balance ? state.weth_balance.toFixed(6) + ' WETH (~$' + (state.weth_balance * 3000).toFixed(2) + ')' : '0'"></p>
+                        <label x-text="(config.pool_token0_symbol || 'token0') + ' residual em wallet'">token0 residual em wallet</label>
+                        <!-- Token0 USD price comes from /wallet endpoint (oracle-priced).
+                             Earlier this was hardcoded as `state.weth_balance * 3000`
+                             which assumed ETH=$3000 forever — display was off by ~30%
+                             in 2026-05 when ETH was ~$2280. Now uses live oracle. -->
+                        <p class="text-sm" x-text="state.weth_balance ? state.weth_balance.toFixed(6) + ' ' + (config.pool_token0_symbol || 'token0') + ' (~$' + (state.weth_balance * (state.token0_usd_price || 0)).toFixed(2) + ')' : '0'"></p>
                         <button @click="cashOut()"
                                 :disabled="!state.weth_balance || state.weth_balance < 1e-6"
                                 class="px-3 py-2 bg-amber-500 text-white rounded text-sm mt-2 disabled:opacity-50">
-                            Cash out remaining WETH
+                            <span x-text="'Cash out remaining ' + (config.pool_token0_symbol || 'token0')"></span>
                         </button>
                         <p class="cfg-hint">
-                            Converte WETH residual da wallet de volta pra USDC. Só funciona
+                            Converte resíduo da wallet de volta pra USDC. Só funciona
                             se não houver operação ativa.
                         </p>
                     </div>

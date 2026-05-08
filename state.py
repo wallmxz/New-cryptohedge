@@ -64,6 +64,14 @@ class StateHub:
     wallet_eth_balance: float = 0.0
     bootstrap_progress: str = ""  # human-readable string for UI ("Swapping...", "Depositing...")
 
+    # Live USD prices for the active pair's tokens (from exchange oracle —
+    # WS midpoint on Lighter). The dashboard uses these to USD-format
+    # the wallet residual balance, the LP curve preview, etc. Without
+    # them the UI used to hardcode `* 3000` (assuming ETH=$3000), which
+    # was off by ~30% as of 2026-05.
+    token0_usd_price: float = 0.0
+    token1_usd_price: float = 0.0
+
     @property
     def hedge_position(self) -> dict | None:
         """Legacy compat: returns first hedge position (single-leg) or None."""

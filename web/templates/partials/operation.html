@@ -54,6 +54,12 @@
 
     <div class="flex justify-end mt-3 gap-2">
         <button x-show="state.operation_state === 'none'"
+                @click="openImportModal()"
+                title="Detecta posição existente na Beefy e abre os shorts pra hedgear (sem swap, sem novo deposit)"
+                class="px-4 py-1.5 text-sm bg-slate-100 text-slate-700 rounded-lg hover:bg-slate-200 border border-slate-300">
+            Importar operação existente
+        </button>
+        <button x-show="state.operation_state === 'none'"
                 @click="openStartModal()"
                 class="px-4 py-1.5 text-sm bg-emerald-600 text-white rounded-lg hover:bg-emerald-700">
             Iniciar operação
@@ -63,5 +69,76 @@
                 class="px-4 py-1.5 text-sm bg-red-500 text-white rounded-lg hover:bg-red-600">
             Encerrar operação
         </button>
+    </div>
+</div>
+
+<!-- Modal: Importar operação existente -->
+<div x-show="showImportModal" x-cloak
+     class="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+     @click.self="closeImportModal()">
+    <div class="bg-white rounded-2xl p-6 w-full max-w-lg shadow-xl">
+        <div class="flex items-center justify-between mb-4">
+            <h3 class="text-lg font-semibold text-slate-800">Importar operação existente</h3>
+            <button @click="closeImportModal()" class="text-slate-400 hover:text-slate-600 text-xl leading-none">&times;</button>
+        </div>
+
+        <p class="text-sm text-slate-600 mb-4">
+            Vai ler a posição que já está depositada na Beefy e abrir os shorts dimensionados pra ela.
+            <span class="text-slate-500">Não faz swap, não faz novo deposit.</span>
+        </p>
+
+        <!-- Loading -->
+        <div x-show="importLoading" x-cloak class="text-center py-6">
+            <p class="text-sm text-slate-500" x-text="importLoadingMsg"></p>
+        </div>
+
+        <!-- Preview -->
+        <div x-show="!importLoading && importPreview" x-cloak class="space-y-3">
+            <div class="bg-slate-50 rounded-lg p-3 text-sm space-y-1">
+                <p class="text-xs uppercase tracking-wider text-slate-500 mb-1">Posição detectada na Beefy</p>
+                <div class="flex justify-between font-mono">
+                    <span x-text="importPreview && importPreview.position && importPreview.position.token0_symbol"></span>
+                    <span x-text="importPreview && importPreview.position ? importPreview.position.token0.toFixed(6) : '—'"></span>
+                </div>
+                <div class="flex justify-between font-mono" x-show="importPreview && importPreview.position && importPreview.position.token1 > 0">
+                    <span x-text="importPreview && importPreview.position && importPreview.position.token1_symbol"></span>
+                    <span x-text="importPreview && importPreview.position ? importPreview.position.token1.toFixed(6) : '—'"></span>
+                </div>
+                <div class="flex justify-between font-mono pt-1 mt-1 border-t border-slate-200 font-semibold">
+                    <span>Valor total</span>
+                    <span x-text="importPreview && importPreview.position ? '$' + importPreview.position.pool_value_usd.toFixed(2) : '—'"></span>
+                </div>
+            </div>
+
+            <div class="bg-amber-50 border border-amber-200 rounded-lg p-3 text-sm">
+                <p class="text-xs uppercase tracking-wider text-amber-700 mb-1">Shorts que serão abertos</p>
+                <template x-for="s in (importPreview ? importPreview.shorts_planned : [])" :key="s.symbol">
+                    <div class="flex justify-between font-mono text-amber-900">
+                        <span x-text="'short ' + s.symbol"></span>
+                        <span x-text="s.size.toFixed(6) + ' @ ~$' + s.ref_price_usd.toFixed(4)"></span>
+                    </div>
+                </template>
+            </div>
+
+            <p class="text-xs text-slate-500">
+                Hedge ratio atual: <span class="font-mono" x-text="(state.hedge_ratio || 1).toFixed(2)"></span>.
+                Após abrir, o bot toma controle e usa level-triggered taker (só fira ordens quando |drift| × preço ≥ min_notional).
+            </p>
+        </div>
+
+        <!-- Error -->
+        <div x-show="!importLoading && importError" x-cloak class="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700" x-text="importError"></div>
+
+        <div class="flex justify-end gap-2 mt-5">
+            <button @click="closeImportModal()"
+                    class="px-4 py-1.5 text-sm bg-slate-100 text-slate-700 rounded-lg hover:bg-slate-200">
+                Cancelar
+            </button>
+            <button x-show="!importLoading && importPreview && !importError" x-cloak
+                    @click="confirmImport()"
+                    class="px-4 py-1.5 text-sm bg-emerald-600 text-white rounded-lg hover:bg-emerald-700">
+                Confirmar e abrir shorts
+            </button>
+        </div>
     </div>
 </div>

@@ -52,6 +52,15 @@ function dashboard() {
         showStartModal: false,
         startBudget: 300.0,
         startBudgetMax: 0.0,
+
+        // "Importar operação existente" modal — adopts a Beefy position
+        // already deposited in the wallet (e.g. user did manual deposit
+        // or a previous bootstrap died after deposit but before shorts).
+        showImportModal: false,
+        importLoading: false,
+        importLoadingMsg: '',
+        importPreview: null,    // { position, shorts_planned }
+        importError: '',
         // Two-stage start flow: 'budget' (input) -> 'preview' (review plan)
         startStage: 'budget',
         startPreview: null,
@@ -307,6 +316,102 @@ function dashboard() {
                 }
             } catch (e) {
                 alert("Erro: " + e);
+            }
+        },
+
+        // ----- Importar operação existente -----
+
+        async openImportModal() {
+            this.importPreview = null;
+            this.importError = '';
+            this.importLoading = true;
+            this.importLoadingMsg = 'Lendo posição na Beefy...';
+            this.showImportModal = true;
+            try {
+                // /curve gives us the on-chain Beefy position; /wallet gives
+                // us oracle USD prices for sizing the planned shorts.
+                const [curveResp, walletResp] = await Promise.all([
+                    fetch("/curve"),
+                    fetch("/wallet"),
+                ]);
+                const curve = await curveResp.json();
+                const wallet = await walletResp.json();
+                if (!curveResp.ok || curve.error) {
+                    this.importError = curve.error === 'no_pair_selected'
+                        ? 'Nenhum par selecionado. Escolha um par antes de importar.'
+                        : (curve.error || 'Falha ao ler curva.');
+                    return;
+                }
+                const my0 = (curve.position && curve.position.my_amount0) || 0;
+                const my1 = (curve.position && curve.position.my_amount1) || 0;
+                const poolUsd = (curve.position && curve.position.pool_value_usd) || 0;
+                if (my0 <= 0 && my1 <= 0) {
+                    this.importError = 'Nenhuma posição encontrada na Beefy. Faça um depósito primeiro (manual ou via "Iniciar operação").';
+                    return;
+                }
+                const isDual = !!curve.is_dual_leg;
+                const ratio = curve.hedge_ratio || (this.state.hedge_ratio || 1);
+                const t0Sym = (curve.pool && curve.pool.token0_symbol) || '';
+                const t1Sym = (curve.pool && curve.pool.token1_symbol) || '';
+                const p0 = wallet.token0_usd_price || 0;
+                const p1 = wallet.token1_usd_price || 0;
+                // Server adapts symbols to the active exchange's perp ticker
+                // (e.g. "ETH-USD" or just "ETH"). Display the underlying token
+                // symbol — server will compute the actual perp ticker.
+                const planned = [
+                    {
+                        symbol: t0Sym, size: my0 * ratio, ref_price_usd: p0,
+                    },
+                ];
+                if (isDual && my1 > 0) {
+                    planned.push({
+                        symbol: t1Sym, size: my1 * ratio, ref_price_usd: p1,
+                    });
+                }
+                this.importPreview = {
+                    position: {
+                        token0: my0, token1: my1,
+                        token0_symbol: t0Sym, token1_symbol: t1Sym,
+                        pool_value_usd: poolUsd,
+                    },
+                    shorts_planned: planned.filter(s => s.size > 0),
+                };
+            } catch (e) {
+                this.importError = 'Erro lendo posição: ' + e;
+            } finally {
+                this.importLoading = false;
+                this.importLoadingMsg = '';
+            }
+        },
+
+        closeImportModal() {
+            this.showImportModal = false;
+            this.importPreview = null;
+            this.importError = '';
+            this.importLoading = false;
+        },
+
+        async confirmImport() {
+            this.importLoading = true;
+            this.importLoadingMsg = 'Abrindo shorts...';
+            try {
+                const resp = await fetch("/operations/hedge-existing", {
+                    method: "POST",
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    this.importError = data.error || ('HTTP ' + resp.status);
+                    return;
+                }
+                // Success — operation now ACTIVE. Engine main loop will pick
+                // it up on next iter (1Hz). Close modal so the operation
+                // card takes over.
+                this.closeImportModal();
+            } catch (e) {
+                this.importError = 'Erro ao abrir shorts: ' + e;
+            } finally {
+                this.importLoading = false;
+                this.importLoadingMsg = '';
             }
         },
 
