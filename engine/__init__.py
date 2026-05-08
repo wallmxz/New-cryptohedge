@@ -73,6 +73,11 @@ class GridMakerEngine:
         # awaitable completes — handler tolerates).
         self._token0_mid: int | None = None
         self._token1_mid: int | None = None
+        # Funding payments already attributed to the current op (dedup
+        # against the poller emitting the same entry on consecutive
+        # iterations). Cleared on op transitions.
+        self._seen_funding_ids: set[int] = set()
+        self._seen_funding_ids_op_id: int | None = None
         # Funding accumulator: adapter calls our handler per payment.
         # Default no-op on adapters that don't implement it.
         if self._exchange is not None:
@@ -1162,9 +1167,74 @@ class GridMakerEngine:
         )
 
     async def _on_funding_payment(self, entry) -> None:
-        """Handle one funding payment from the exchange. Stub —
-        implemented in Task 7."""
-        return None
+        """Handle one funding payment from the exchange.
+
+        Skips:
+          - no active op (op_id is None) → entry will be picked up by
+            the next op if/when one starts (engine doesn't carry funding
+            across op boundaries).
+          - market_id not in our hedged legs.
+          - market_ids unresolved (don't mark seen — next call retries).
+          - timestamp before op.started_at (backfill bound).
+          - funding_id already counted for this op (dedup).
+
+        Writes signed amount to the appropriate per-leg DB column,
+        respecting pnl.py's convention that 'positive in DB = we paid':
+          entry.change > 0 (user received) → DB delta = -change
+          entry.change < 0 (user paid)     → DB delta = -change (= +|change|)
+        """
+        op_id = self._hub.current_operation_id
+        if op_id is None:
+            return
+        # Reset dedup set on op transitions — funding from prior ops
+        # was already attributed to those ops.
+        if self._seen_funding_ids_op_id != op_id:
+            self._seen_funding_ids = set()
+            self._seen_funding_ids_op_id = op_id
+
+        try:
+            mid = int(getattr(entry, "market_id"))
+            funding_id = int(getattr(entry, "funding_id"))
+            ts = float(getattr(entry, "timestamp"))
+            change = float(getattr(entry, "change") or 0)
+        except (TypeError, ValueError, AttributeError) as e:
+            logger.warning(f"funding payment parse failed: {e}")
+            return
+
+        # Resolve the leg.
+        if self._token0_mid is None and self._token1_mid is None:
+            # Metadata hasn't loaded yet — defer (don't mark seen).
+            return
+        if mid == self._token0_mid:
+            field = "funding_paid_token0"
+        elif mid == self._token1_mid:
+            field = "funding_paid_token1"
+        else:
+            return  # not a leg we're hedging
+
+        # Filter by op start.
+        try:
+            op_row = await self._db.get_operation(op_id)
+            op_started_at = float((op_row or {}).get("started_at") or 0)
+        except Exception:
+            op_started_at = 0.0
+        if ts < op_started_at:
+            return
+
+        # Dedup.
+        if funding_id in self._seen_funding_ids:
+            return
+        self._seen_funding_ids.add(funding_id)
+
+        delta = -change
+        try:
+            await self._db.add_to_operation_accumulator(op_id, field, delta)
+        except Exception as e:
+            logger.warning(
+                f"funding accumulator write failed (op={op_id}, field={field}, "
+                f"delta={delta}): {e}"
+            )
+            self._seen_funding_ids.discard(funding_id)  # allow retry
 
     async def _on_fill(self, fill):
         """Handle a fill event from the exchange WS, attribute to active operation."""
