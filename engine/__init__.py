@@ -61,26 +61,6 @@ class GridMakerEngine:
         self._iter_count = 0
         self.RECONCILE_EVERY_N_ITERATIONS = 30  # ~30s
         self._last_alert_level: str | None = None
-        # Cooldown for aggressive correction: prevents re-firing the same
-        # taker correction every iteration while a previous one is still in
-        # flight (taker on real dYdX fills in ~100ms, but on the simulator
-        # mock or under network latency it can lag). Without this, multiple
-        # corrections stack up and explode the position when price crosses.
-        self._last_aggressive_correction_at: float = 0.0
-        self.AGGRESSIVE_CORRECTION_COOLDOWN_SECONDS = 30.0
-        # Idle-state throttle for exchange polling. When NO operation is
-        # active, the bot doesn't need fresh position/oracle/collateral
-        # every second — it has nothing to react to. We only hit the
-        # exchange every IDLE_EXCHANGE_POLL_INTERVAL_S seconds in that
-        # state. Without this, sustained 1Hz polling triggers Lighter's
-        # CloudFront WAF, which then geo/IP-blocks ALL endpoints with a
-        # CAPTCHA challenge — not just orders, but read-only state too,
-        # leaving the bot unable to recover until the WAF cools off
-        # (~1 hour). The skip ONLY applies to exchange calls; chain
-        # reads (Beefy + Uniswap) keep their full cadence so the LP
-        # curve preview and out-of-range alerts stay live.
-        self._last_idle_exchange_poll_at: float = 0.0
-        self.IDLE_EXCHANGE_POLL_INTERVAL_S = 30.0
         # Cache of (vault_id, readers, pair_settings). Rebuilt when DB's
         # selected_vault_id changes. Lets the main loop read the SAME
         # pool/vault that start_operation would target, instead of the
@@ -1149,25 +1129,6 @@ class GridMakerEngine:
             ((self._run_id & 0xFFFF) << 16) |
             (leg_byte << 8) |
             (self._cloid_seq & 0xFF)
-        )
-
-    async def _aggressive_correct(self, current_short, target_short, p_now, meta):
-        """Deprecated thin wrapper: delegates to _maybe_rebalance_leg for the
-        single-leg (token0) symbol. Task 10 refactors `_iterate` to call
-        `_maybe_rebalance_leg` directly per leg; until then, keep this wrapper
-        so the existing single-leg `_iterate` call site and its tests still
-        work.
-        """
-        symbol = self._settings.dydx_symbol_token0
-        min_notional = (
-            meta.min_notional * p_now if meta is not None else 0.0
-        )
-        await self._maybe_rebalance_leg(
-            symbol=symbol,
-            target=target_short,
-            current=current_short,
-            min_notional=min_notional,
-            ref_price=p_now,
         )
 
     async def _on_fill(self, fill):
