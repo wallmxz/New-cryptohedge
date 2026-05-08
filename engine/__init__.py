@@ -68,6 +68,15 @@ class GridMakerEngine:
         self._vault_readers_cache: tuple[
             str, UniswapV3PoolReader, BeefyClmReader, "Settings", int, int,
         ] | None = None
+        # Per-leg market IDs (resolved post-init via
+        # resolve_market_ids_for_funding(); may be None until that
+        # awaitable completes — handler tolerates).
+        self._token0_mid: int | None = None
+        self._token1_mid: int | None = None
+        # Funding accumulator: adapter calls our handler per payment.
+        # Default no-op on adapters that don't implement it.
+        if self._exchange is not None:
+            self._exchange.subscribe_funding(self._on_funding_payment)
 
     def _ensure_reconciler(self):
         if self._reconciler is None and self._exchange is not None:
@@ -1046,6 +1055,27 @@ class GridMakerEngine:
         except Exception:
             return None
 
+    async def resolve_market_ids_for_funding(self) -> None:
+        """Resolve the market_index for token0 and token1 perp symbols.
+        Called once from the app startup path after the adapter is
+        connected (and metadata cached). Stored mids are used by
+        _on_funding_payment to route per-leg DB writes.
+        """
+        try:
+            t0 = self._settings.dydx_symbol_token0
+            if t0:
+                m0 = await self._exchange.get_market_meta(t0)
+                self._token0_mid = int(m0.market_index)
+        except Exception as e:
+            logger.warning(f"resolve_market_ids_for_funding token0 failed: {e}")
+        try:
+            t1 = self._settings.dydx_symbol_token1
+            if t1:
+                m1 = await self._exchange.get_market_meta(t1)
+                self._token1_mid = int(m1.market_index)
+        except Exception as e:
+            logger.warning(f"resolve_market_ids_for_funding token1 failed: {e}")
+
     async def _safe_get_position(self, symbol: str | None = None):
         """Returns the position the engine should drive drift against.
 
@@ -1130,6 +1160,11 @@ class GridMakerEngine:
             (leg_byte << 8) |
             (self._cloid_seq & 0xFF)
         )
+
+    async def _on_funding_payment(self, entry) -> None:
+        """Handle one funding payment from the exchange. Stub —
+        implemented in Task 7."""
+        return None
 
     async def _on_fill(self, fill):
         """Handle a fill event from the exchange WS, attribute to active operation."""
