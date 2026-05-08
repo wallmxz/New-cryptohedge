@@ -985,6 +985,30 @@ class GridMakerEngine:
                     op_row = await self._db.get_operation(self._hub.current_operation_id)
                     if op_row:
                         op = Operation.from_db_row(op_row)
+
+                        # Authoritative venue-side hedge_pnl since op.started_at
+                        # (overrides in-memory accumulator that resets on uvicorn
+                        # restart). None = fall back.
+                        hedge_pnl_override = None
+                        try:
+                            op_started_at = float(op_row.get("started_at") or 0)
+                        except Exception:
+                            op_started_at = 0.0
+                        if op_started_at > 0:
+                            try:
+                                getter = getattr(
+                                    self._exchange, "get_trade_pnl_since", None,
+                                )
+                                if getter is not None:
+                                    r = await getter(op_started_at, time.time())
+                                    if r is not None:
+                                        baseline, latest = r
+                                        hedge_pnl_override = latest - baseline
+                            except Exception as e:
+                                logger.warning(
+                                    f"get_trade_pnl_since failed: {e}"
+                                )
+
                         if is_dual_leg:
                             self._hub.operation_pnl_breakdown = compute_operation_pnl(
                                 op,
@@ -993,6 +1017,7 @@ class GridMakerEngine:
                                 current_token1_usd_price=p1_usd,
                                 hedge_realized_per_symbol=dict(self._hub.hedge_realized_pnls),
                                 hedge_unrealized_per_symbol=dict(self._hub.hedge_unrealized_pnls),
+                                hedge_pnl_aggregate_override=hedge_pnl_override,
                             )
                         else:
                             self._hub.operation_pnl_breakdown = compute_operation_pnl(
@@ -1001,6 +1026,7 @@ class GridMakerEngine:
                                 current_eth_price=p_now,
                                 hedge_realized_since_baseline=self._hub.hedge_realized_pnl,
                                 hedge_unrealized_since_baseline=self._hub.hedge_unrealized_pnl,
+                                hedge_pnl_aggregate_override=hedge_pnl_override,
                             )
                 except Exception as e:
                     logger.error(f"PnL breakdown update failed: {e}")
