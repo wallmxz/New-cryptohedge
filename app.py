@@ -155,6 +155,15 @@ def create_app(start_engine: bool = True) -> Starlette:
                 lifecycle=lifecycle,
                 **factory_kwargs,
             )
+            # Resolve token0/token1 market_ids for funding handler.
+            # Adapter metadata is populated by connect() — this is when
+            # we can ask for market_index per symbol.
+            try:
+                await engine.resolve_market_ids_for_funding()
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    f"resolve_market_ids_for_funding skipped: {e}"
+                )
             await engine.start()
             app.state.engine = engine
         yield
