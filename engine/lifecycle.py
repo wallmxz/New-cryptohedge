@@ -63,6 +63,73 @@ _QUOTER_V2_ABI = [{
 }]
 
 
+_PREVIEW_DEPOSIT_ABI = [{
+    "inputs": [
+        {"name": "amount0", "type": "uint256"},
+        {"name": "amount1", "type": "uint256"},
+    ],
+    "name": "previewDeposit",
+    "outputs": [
+        {"name": "shares", "type": "uint256"},
+        {"name": "amount0Used", "type": "uint256"},
+        {"name": "amount1Used", "type": "uint256"},
+    ],
+    "stateMutability": "view",
+    "type": "function",
+}]
+
+
+async def _detect_deposit_direction(
+    w3, earn_address: str,
+    *,
+    decimals0: int, decimals1: int,
+) -> str:
+    """Probe Beefy CLM v2's `previewDeposit` to find which token it
+    currently accepts.
+
+    Beefy CLM v2 vaults zap internally to the V3 ratio at the current
+    tick, but the zap is uni-directional: when the tick is near p_a the
+    LP is rich in token0, so the vault wants token1 deposits (and zaps
+    half to token0). When the tick is near p_b the inverse.
+
+    Returns "token0" or "token1" — the side the vault will mint shares
+    against. Raises if neither side mints (vault paused / out of range
+    / liquidity exhausted).
+    """
+    earn = w3.eth.contract(
+        address=w3.to_checksum_address(earn_address),
+        abi=_PREVIEW_DEPOSIT_ABI,
+    )
+    # Probe with small amounts on each side. Use values big enough to
+    # avoid integer rounding to 0 in any minShares calc, small enough
+    # to never matter for fee.
+    probe0 = 10 ** (decimals0 - 2)  # 0.01 token0
+    probe1 = 10 ** (decimals1 - 2)  # 0.01 token1
+    try:
+        r0 = await earn.functions.previewDeposit(probe0, 0).call()
+        shares0 = int(r0[0])
+    except Exception:
+        shares0 = 0
+    try:
+        r1 = await earn.functions.previewDeposit(0, probe1).call()
+        shares1 = int(r1[0])
+    except Exception:
+        shares1 = 0
+
+    if shares0 > 0 and shares1 > 0:
+        # Both sides accept — pick whichever mints more shares per
+        # nominal unit. Rare; happens during a tick transition.
+        return "token0" if shares0 >= shares1 else "token1"
+    if shares0 > 0:
+        return "token0"
+    if shares1 > 0:
+        return "token1"
+    raise RuntimeError(
+        f"Beefy vault {earn_address} won't mint shares for either side. "
+        f"Vault may be paused or in a transient state — try again in a moment."
+    )
+
+
 async def _fetch_coinbase_spot_usd(symbol: str) -> float | None:
     """Query Coinbase public spot price for `symbol-USD` (e.g. ETH, ARB).
     Returns price as float, or None on failure. No auth, no key needed.
@@ -530,27 +597,55 @@ class OperationLifecycle:
             # token1, we offer to consolidate it → token0 first.
             token0_sym = self._settings.dydx_symbol_token0
             token1_sym = self._settings.dydx_symbol_token1
-            total_in_token0 = usdc_budget / p0_usd if p0_usd > 0 else 0.0
-            usdc_for_t0 = total_in_token0 * p0_usd
+            # Detect which side the vault accepts at the current tick.
+            # The bootstrap will swap USDC into THAT side and deposit.
+            try:
+                deposit_side = await _detect_deposit_direction(
+                    self._uniswap._w3, self._settings.clm_vault_address,
+                    decimals0=self._decimals0, decimals1=self._decimals1,
+                )
+            except Exception as e:
+                logger.warning(f"deposit direction detect failed: {e}")
+                deposit_side = "token0"  # fallback
+            plan["deposit_side"] = deposit_side
+            if deposit_side == "token0":
+                deposit_label = token0_sym_label
+                deposit_addr = token0_addr
+                deposit_usd = p0_usd
+            else:
+                deposit_label = token1_sym_label
+                deposit_addr = token1_addr
+                deposit_usd = p1_usd
+            total_in_deposit = (
+                usdc_budget / deposit_usd if deposit_usd > 0 else 0.0
+            )
+            usdc_for_swap = total_in_deposit * deposit_usd
             plan["swaps"] = [
                 {
-                    "leg": "token0",
+                    "leg": deposit_side,
                     "router": router,
                     "token_in_symbol": "USDC",
                     "token_in_address": _USDC_ADDRESS_ARBITRUM,
-                    "token_out_symbol": token0_sym_label,
-                    "token_out_address": token0_addr,
-                    "amount_in_max_usdc": usdc_for_t0 * (1 + slippage),
-                    "amount_out": total_in_token0,
+                    "token_out_symbol": deposit_label,
+                    "token_out_address": deposit_addr,
+                    "amount_in_max_usdc": usdc_for_swap * (1 + slippage),
+                    "amount_out": total_in_deposit,
                     "fee_param": pool_fee,
                 },
             ]
             plan["strategies"] = {
-                "token0": recommend_strategy(wallet_bal["token0"], total_in_token0),
+                "token0": recommend_strategy(
+                    wallet_bal[deposit_side], total_in_deposit,
+                ),
                 # token1 default = "keep" (don't touch). User opts in to
-                # "consolidate" only when they explicitly want existing
-                # token1 to be swapped into token0 and consumed.
-                "token1": "keep" if wallet_bal["token1"] > 0 else None,
+                # "consolidate" only when they explicitly want the
+                # other-side balance swapped into the deposit-side and
+                # consumed.
+                "token1": (
+                    "keep" if wallet_bal[
+                        "token1" if deposit_side == "token0" else "token0"
+                    ] > 0 else None
+                ),
             }
             plan["hedge"] = [
                 {
@@ -852,105 +947,139 @@ class OperationLifecycle:
             await self._db.update_bootstrap_state(op_id, "approving")
             self._hub.bootstrap_progress = "Approving tokens (dual-leg)..."
             # USDC must be approved for the router (we spend USDC for the
-            # single token0 swap).
+            # deposit-side swap).
             await self._uniswap.ensure_approval(
                 token_address=_USDC_ADDRESS_ARBITRUM,
                 amount=2**256 - 1,
                 spender=self._settings.uniswap_v3_router_address,
             )
-            # token0 needs approval for the Beefy earn vault — that's
-            # what gets transferred in by deposit(). The vault zaps token0
-            # → token1 internally to the V3 ratio, so we don't approve or
-            # send token1.
-            await self._beefy.ensure_approval(
-                token_address=self._settings.token0_address, amount=2**256 - 1,
-            )
 
             slippage = self._settings.slippage_bps / 10000.0
 
-            # Cross-pair single-swap model:
-            # 1. Optionally consolidate any existing wallet token1 into
-            #    token0 first (so prior residuals join the LP capital
-            #    instead of staying stranded).
-            # 2. ONE swap USDC → token0 covering whatever's still missing
-            #    to hit the full budget expressed in token0 units.
-            # 3. Deposit amount0 only; vault zaps internally.
+            # Detect which token the vault accepts RIGHT NOW. Beefy CLM
+            # v2's zap is uni-directional and depends on the current tick
+            # within the LP range:
+            #   - tick near p_a → LP rich in token0 → vault accepts token1
+            #   - tick near p_b → LP rich in token1 → vault accepts token0
+            # We probe `previewDeposit(probe, 0)` and `previewDeposit(0,
+            # probe)` to see which side mints shares, then route the
+            # bootstrap through that side.
+            self._hub.bootstrap_progress = "Detectando direção do vault..."
+            deposit_side = await _detect_deposit_direction(
+                self._uniswap._w3,
+                self._settings.clm_vault_address,
+                decimals0=self._decimals0,
+                decimals1=self._decimals1,
+            )
+            logger.info(
+                f"Beefy vault accepts deposit on {deposit_side} side "
+                f"(tick={await self._pool_reader.read_price():.4f})"
+            )
 
-            # ---- Step 1: consolidate token1 → token0 (optional) ----
+            # Approve the side we'll be depositing for the earn vault.
+            if deposit_side == "token0":
+                deposit_token_addr = self._settings.token0_address
+                deposit_token_symbol = self._settings.pool_token0_symbol
+                deposit_token_decimals = self._decimals0
+                deposit_token_usd = baseline_t0_usd
+            else:
+                deposit_token_addr = self._settings.token1_address
+                deposit_token_symbol = self._settings.pool_token1_symbol
+                deposit_token_decimals = self._decimals1
+                deposit_token_usd = baseline_t1_usd
+            await self._beefy.ensure_approval(
+                token_address=deposit_token_addr, amount=2**256 - 1,
+            )
+
+            # ---- Step 1: optional consolidation ----
+            # If wallet has the OTHER token (the side the vault rejects
+            # right now) and user picked "consolidate", swap it into the
+            # accepted side before the USDC swap.
             current_bal = await self._read_wallet_balance()
-            if strat_t1 == "consolidate" and current_bal["token1"] > 0:
-                token1_erc = self._uniswap._erc20(self._settings.token1_address)
-                token1_raw = await token1_erc.functions.balanceOf(
+            other_side = "token1" if deposit_side == "token0" else "token0"
+            other_balance = current_bal[other_side]
+            if strat_t1 == "consolidate" and other_balance > 0:
+                other_addr = (
+                    self._settings.token1_address if other_side == "token1"
+                    else self._settings.token0_address
+                )
+                other_decimals = (
+                    self._decimals1 if other_side == "token1" else self._decimals0
+                )
+                other_symbol = (
+                    self._settings.pool_token1_symbol if other_side == "token1"
+                    else self._settings.pool_token0_symbol
+                )
+                other_erc = self._uniswap._erc20(other_addr)
+                other_raw = await other_erc.functions.balanceOf(
                     self._uniswap.address,
                 ).call()
-                if token1_raw > 0:
+                if other_raw > 0:
                     self._hub.bootstrap_progress = (
-                        f"Consolidando {self._settings.pool_token1_symbol} -> "
-                        f"{self._settings.pool_token0_symbol}..."
+                        f"Consolidando {other_symbol} -> {deposit_token_symbol}..."
                     )
                     await self._uniswap.ensure_approval(
-                        token_address=self._settings.token1_address,
+                        token_address=other_addr,
                         amount=2**256 - 1,
                         spender=self._settings.uniswap_v3_router_address,
                     )
                     fee_tier = await _best_swap_fee_tier(
-                        self._uniswap._w3,
-                        self._settings.token1_address,
-                        self._settings.token0_address,
+                        self._uniswap._w3, other_addr, deposit_token_addr,
                     ) or self._settings.uniswap_v3_pool_fee
                     logger.info(
-                        f"Consolidating {token1_raw} raw "
-                        f"({token1_raw/10**self._decimals1:.6f}) "
-                        f"{self._settings.pool_token1_symbol} -> "
-                        f"{self._settings.pool_token0_symbol} at fee {fee_tier}"
+                        f"Consolidating {other_raw} raw "
+                        f"({other_raw/10**other_decimals:.6f}) {other_symbol} "
+                        f"-> {deposit_token_symbol} at fee {fee_tier}"
                     )
                     await self._uniswap.swap_exact_input(
-                        token_in=self._settings.token1_address,
-                        token_out=self._settings.token0_address,
+                        token_in=other_addr,
+                        token_out=deposit_token_addr,
                         fee=fee_tier,
-                        amount_in=token1_raw,
+                        amount_in=other_raw,
                         amount_out_minimum=0,
                         recipient=self._uniswap.address,
                         deadline=int(time.time()) + DEFAULT_DEADLINE_SECONDS,
                     )
 
-            # ---- Step 2: single swap USDC → token0 ----
-            # Budget expressed in token0 units = total USD / token0 USD price.
+            # ---- Step 2: single swap USDC → deposit_token ----
+            # Budget expressed in deposit_token units.
             await self._db.update_bootstrap_state(op_id, "swap_token0_pending")
             self._hub.bootstrap_progress = (
-                f"Swapping USDC -> {self._settings.pool_token0_symbol}..."
+                f"Swapping USDC -> {deposit_token_symbol}..."
             )
-            total_in_token0 = (
-                usdc_budget / baseline_t0_usd if baseline_t0_usd > 0 else 0.0
+            total_in_deposit_token = (
+                usdc_budget / deposit_token_usd if deposit_token_usd > 0 else 0.0
             )
             current_bal = await self._read_wallet_balance()
             tx0 = await self._maybe_swap_to_token(
                 strategy=strat_t0,
-                target_amount=total_in_token0,
-                wallet_balance=current_bal["token0"],
-                token_out=self._settings.token0_address,
-                token_out_symbol=self._settings.pool_token0_symbol,
-                token_out_decimals=self._decimals0,
+                target_amount=total_in_deposit_token,
+                wallet_balance=current_bal[deposit_side],
+                token_out=deposit_token_addr,
+                token_out_symbol=deposit_token_symbol,
+                token_out_decimals=deposit_token_decimals,
                 slippage=slippage,
             )
             await self._db.update_bootstrap_state(
                 op_id, "swaps_done", swap_tx_hash=tx0,
             )
 
-            # ---- Step 3: deposit token0 only ----
-            # Beefy CLM v2 vaults consume only amount0 and zap to V3 ratio
-            # internally. amount1=0 by design.
-            # Use RAW uint256 from balanceOf (never `float × 10**dec` which
-            # rounds up and triggers transferFrom STF).
+            # ---- Step 3: deposit on the accepted side only ----
+            # Use RAW uint256 from balanceOf (never `float × 10**dec`).
             await self._db.update_bootstrap_state(op_id, "deposit_pending")
             self._hub.bootstrap_progress = "Depositing in Beefy..."
-            token0_erc = self._uniswap._erc20(self._settings.token0_address)
-            amount0_raw = await token0_erc.functions.balanceOf(
+            deposit_erc = self._uniswap._erc20(deposit_token_addr)
+            deposit_amount_raw = await deposit_erc.functions.balanceOf(
                 self._uniswap.address,
             ).call()
-            tx_dep = await self._beefy.deposit(
-                amount0=amount0_raw, amount1=0, min_shares=0,
-            )
+            if deposit_side == "token0":
+                tx_dep = await self._beefy.deposit(
+                    amount0=deposit_amount_raw, amount1=0, min_shares=0,
+                )
+            else:
+                tx_dep = await self._beefy.deposit(
+                    amount0=0, amount1=deposit_amount_raw, min_shares=0,
+                )
             await self._db.update_bootstrap_state(
                 op_id, "deposit_done", deposit_tx_hash=tx_dep,
             )
@@ -1585,35 +1714,64 @@ class OperationLifecycle:
                 cloid_int=self._next_cloid(998),
                 ttl_seconds=60,
             )
-            slippage_usd = 0.0005 * size * ref_usd
-            await self._db.add_to_operation_accumulator(
-                op_id, accumulator, slippage_usd,
-            )
+            # Lighter is zero-fee for both maker and taker, so no perp_fees
+            # accumulator on this path. (Previous version booked 0.05% as
+            # synthetic "slippage" which polluted the operation breakdown
+            # under the "Perp Fees" label even though the real charge is
+            # $0. When dYdX support returns, wire fee from adapter meta
+            # rather than hardcoding here.)
             return {"symbol": symbol, "size": size, "ref_price_usd": ref_usd}
 
+        # Sequential, NOT parallel: Lighter's nonce_manager races on
+        # parallel `next_nonce()` (server-side dedup window), and the loser
+        # gets stale nonce → code=21120 invalid signature. The adapter has
+        # an internal lock now too, but doing them sequentially in the
+        # caller makes the failure mode cleaner: if the first leg fails we
+        # never open the second one (no orphan). If the SECOND leg fails
+        # after the first opened, we close the first to leave a clean
+        # state instead of stranding hedge on one side.
+        opened_shorts: list[dict] = []
         try:
             if is_dual_leg:
-                short_t0_task = _open_short(
+                short_t0 = await _open_short(
                     t0_sym, target_short_t0, p0_usd, "perp_fees_paid_token0",
                 )
-                short_t1_task = _open_short(
+                if short_t0:
+                    opened_shorts.append(short_t0)
+                    result["shorts"].append(short_t0)
+                short_t1 = await _open_short(
                     t1_sym, target_short_t1, p1_usd, "perp_fees_paid_token1",
                 )
-                short_t0, short_t1 = await asyncio.gather(short_t0_task, short_t1_task)
-                if short_t0:
-                    result["shorts"].append(short_t0)
                 if short_t1:
+                    opened_shorts.append(short_t1)
                     result["shorts"].append(short_t1)
             else:
                 short = await _open_short(
                     t0_sym, target_short_t0, p_now, "bootstrap_slippage",
                 )
                 if short:
+                    opened_shorts.append(short)
                     result["shorts"].append(short)
         except Exception as e:
-            # Shorts failed → mark op as FAILED so the engine main loop
-            # doesn't try to manage a half-built operation.
+            # Shorts failed → close any leg that DID open so we don't
+            # leave an orphan hedge, then mark op as FAILED.
             logger.exception(f"open_shorts_for_existing_position: short open failed: {e}")
+            for s in opened_shorts:
+                try:
+                    logger.warning(
+                        f"Cleaning up orphan short {s['symbol']} size={s['size']:.6f}"
+                    )
+                    await self._exchange.place_long_term_order(
+                        symbol=s["symbol"], side="buy", size=s["size"],
+                        price=s["ref_price_usd"] * 1.001,  # taker buy
+                        cloid_int=self._next_cloid(997),
+                        ttl_seconds=60,
+                    )
+                except Exception as cleanup_err:
+                    logger.error(
+                        f"Failed to clean up orphan {s['symbol']}: {cleanup_err}. "
+                        f"Manual close required on the exchange."
+                    )
             await self._db.update_operation_status(op_id, OperationState.FAILED.value)
             await self._db.update_bootstrap_state(op_id, "failed")
             self._hub.operation_state = OperationState.FAILED.value

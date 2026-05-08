@@ -90,7 +90,8 @@ async def test_bootstrap_dual_leg_does_two_swaps_sequentially(cross_pair_setting
     # hit Arbitrum mainnet RPC. Quoter returns the integer amountIn the pool
     # would charge — here we just echo a reasonable USDC amount per swap.
     with patch("engine.lifecycle._best_swap_fee_tier", AsyncMock(return_value=3000)), \
-         patch("engine.lifecycle._quote_exact_output", AsyncMock(return_value=150 * 10**6)):
+         patch("engine.lifecycle._quote_exact_output", AsyncMock(return_value=150 * 10**6)), \
+         patch("engine.lifecycle._detect_deposit_direction", AsyncMock(return_value="token0")):
         op_id = await lifecycle.bootstrap(usdc_budget=300.0)
     assert op_id == 42
 
