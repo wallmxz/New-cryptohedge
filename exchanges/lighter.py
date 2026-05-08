@@ -177,6 +177,13 @@ class LighterAdapter(ExchangeAdapter):
         self._reconcile_task: asyncio.Task | None = None
         self._ws_closing = False
 
+        # Funding poller (Lighter-specific): periodic HTTP poll of
+        # AccountApi.position_funding emits each entry to the callback
+        # registered via subscribe_funding. Engine uses this to populate
+        # funding_paid_token0/1 on the active operation.
+        self._funding_callback: Callable[..., Awaitable[None]] | None = None
+        self._funding_task: asyncio.Task | None = None
+
     # ──────────────────────────────────────────────────────────────────────
     # Connection lifecycle
     # ──────────────────────────────────────────────────────────────────────
@@ -675,6 +682,14 @@ class LighterAdapter(ExchangeAdapter):
         # response and synthesized into the engine's Fill record. WS upgrade
         # for async fill notifications is a follow-up.
         self._fill_callback = callback
+
+    def subscribe_funding(
+        self, callback: Callable[..., Awaitable[None]],
+    ) -> None:
+        """Register a callback invoked per funding payment. Engine uses
+        this to populate funding_paid_token0/1 on the active operation.
+        The poller (started in connect) drives invocations."""
+        self._funding_callback = callback
 
     # ──────────────────────────────────────────────────────────────────────
     # Order placement (the constraint-critical path)

@@ -971,3 +971,12 @@ def test_subscribe_funding_is_callable_on_base_adapter():
     # Should not raise even before connect/poller is wired.
     a.subscribe_funding(cb)
     assert callable(getattr(a, "subscribe_funding"))
+
+
+def test_subscribe_funding_stores_callback_on_lighter():
+    """LighterAdapter override persists the callback for the poller."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    async def cb(entry): pass
+    a.subscribe_funding(cb)
+    assert a._funding_callback is cb
