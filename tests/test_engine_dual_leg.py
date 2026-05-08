@@ -1,8 +1,14 @@
 """Engine._maybe_rebalance_leg: level-triggered taker per perp."""
+import time
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 from engine import GridMakerEngine
 from state import StateHub
+# Importing test_lighter_adapter triggers `_install_lighter_stub()` at module
+# import time, which makes `from exchanges.lighter import LighterAdapter` work
+# in environments where the real lighter SDK isn't installed (Windows). On
+# Linux/Fly.io the real SDK is present and the stub is a no-op.
+from tests import test_lighter_adapter as _lighter_stub_loader  # noqa: F401
 
 
 @pytest.fixture
@@ -253,3 +259,110 @@ async def test_iterate_single_leg_only_calls_token0():
 
     await engine._iterate()
     assert rebalance_calls == ["ETH-USD"]  # only token0 leg
+
+
+@pytest.mark.asyncio
+async def test_engine_does_not_double_fire_during_ws_lag():
+    """REGRESSION: 2026-05-07 over-hedge incidents (ops #25/#26/#27).
+
+    The bot fired hedge orders, the orders filled on Lighter, but the
+    bot's verify_fill returned 0 AND the WS account_all push lagged
+    longer than expected. The engine read `current=0`, computed
+    `drift=target`, and fired ANOTHER order — stacking 3-5x over.
+
+    The position-truth redesign moved the guard into the adapter:
+    `get_effective_position` returns max(observed, expected), and
+    `place_long_term_order` stamps `_expected_short_size` on
+    `create_order` server-accept (regardless of `_verify_fill`).
+
+    This test wires a REAL LighterAdapter (with the existing sys.modules
+    stub for the lighter SDK) into the engine, simulates two iters
+    where the WS NEVER pushes the post-fire account update, and asserts
+    that the engine fires `place_long_term_order` exactly ONCE.
+
+    A MagicMock-only test wouldn't catch a regression where stamping
+    is mistakenly wired back through verify_fill — the adapter's path
+    must be exercised end-to-end.
+    """
+    # `_install_lighter_stub` runs at import time; LighterAdapter
+    # already importable here.
+    from exchanges.lighter import LighterAdapter, _MarketMeta
+
+    # Build a real adapter (no connect — we'll wire its internals
+    # manually so we don't actually open WS or HTTP).
+    a = LighterAdapter(
+        url="https://stub", account_index=42,
+        api_private_key="0x" + "1" * 64, api_key_index=2,
+    )
+    a._markets["ETH-USD"] = _MarketMeta(
+        symbol_user="ETH-USD", symbol_lighter="ETH",
+        market_index=0, price_decimals=2, size_decimals=4,
+        tick_size=0.01, step_size=0.0001,
+        min_base_amount=0.005, min_quote_amount=10.0,
+    )
+    # Seed a top-of-book so place_long_term_order can run without WS.
+    a._ws_book_top[0] = {
+        "best_bid": 2399.0, "best_ask": 2400.0, "ts": time.time(),
+    }
+    # Real signer is unwanted — replace with a stub that succeeds.
+    a._signer = MagicMock()
+    a._signer.nonce_manager.next_nonce = MagicMock(return_value=(2, 1))
+    a._signer.create_order = AsyncMock(
+        return_value=(None, MagicMock(tx_hash="0x" + "a" * 64), None)
+    )
+    # _verify_fill LIES (returns 0) — this is the failure mode that
+    # produced over-hedge today.
+    async def lying_verify(meta, cloid_int, expected_size):
+        return 0.0, 0.0
+    a._verify_fill = lying_verify  # type: ignore
+
+    # Bypass the ≥350ms inter-order cooldown for this test.
+    a._MIN_GAP_S = 0.0
+
+    # WS account snapshot: NEVER updates. _observed_short_size stays
+    # empty for the duration of the test. This simulates the worst-case
+    # WS lag (>30 s) we observed today.
+    # (The reconciler isn't started — we only test the get_effective_position
+    # fusion path here, not HTTP authoritative reconciliation.)
+
+    # Hook the adapter into the engine.
+    state = StateHub(hedge_ratio=1.0)
+    state.current_operation_id = 42
+    state.operation_state = "active"
+    settings = MagicMock()
+    settings.dydx_symbol_token0 = "ETH-USD"
+    settings.dydx_symbol_token1 = ""
+    db = MagicMock()
+    db.add_to_operation_accumulator = AsyncMock()
+    db.insert_order_log = AsyncMock()
+    pool = MagicMock(); beefy = MagicMock()
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=a, pool_reader=pool, beefy_reader=beefy,
+    )
+
+    # ITER 1: target = 0.0148, current = 0 → drift > min_notional → fire.
+    await engine._maybe_rebalance_leg(
+        symbol="ETH-USD", target=0.0148, current=0.0,
+        min_notional=10.0, ref_price=2400.0,
+    )
+    assert a._signer.create_order.await_count == 1
+    # After fire, expected was stamped:
+    assert a._expected_short_size[0] == 0.0148
+
+    # ITER 2: engine recomputes `current` via _safe_get_position →
+    # _exchange.get_effective_position → max(observed=0, expected=0.0148)
+    # = 0.0148. Drift = 0.0148 - 0.0148 = 0 → no fire.
+    current = (await engine._safe_get_position("ETH-USD")).size
+    assert current == 0.0148  # the fused value
+
+    await engine._maybe_rebalance_leg(
+        symbol="ETH-USD", target=0.0148, current=current,
+        min_notional=10.0, ref_price=2400.0,
+    )
+    # Critical assertion: still only ONE create_order call.
+    assert a._signer.create_order.await_count == 1, (
+        f"Engine fired again during WS lag — over-hedge regression. "
+        f"Got {a._signer.create_order.await_count} fires, expected 1."
+    )
