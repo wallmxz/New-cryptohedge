@@ -1111,6 +1111,29 @@ class LighterAdapter(ExchangeAdapter):
                 return 0.0
         return 0.0  # market not in account → no position
 
+    async def _fetch_position_funding(
+        self, *, limit: int = 100,
+    ) -> list:
+        """Fetch the most-recent funding payments for this account from
+        Lighter's position_funding endpoint. Returns the SDK's typed
+        PositionFunding objects (or empty list on HTTP/parse failure
+        so the poller doesn't crash).
+
+        We do not paginate via cursor here — the poll cadence is 60 s
+        and the page size (100) covers far more than one cycle on any
+        reasonable funding-history rate. If we ever lag enough that
+        100 entries don't cover the gap, the next poll catches up.
+        """
+        try:
+            resp = await self._account_api.position_funding(
+                account_index=self._account_index,
+                limit=limit,
+            )
+        except Exception as e:
+            logger.warning(f"_fetch_position_funding failed: {e}")
+            return []
+        return list(getattr(resp, "position_fundings", None) or [])
+
     async def get_oracle_prices(self, symbols: list[str]) -> dict[str, float]:
         """Returns the WS top-of-book midpoint per symbol. We previously
         used `last_trade_price` from /orderBookDetails (HTTP); now the

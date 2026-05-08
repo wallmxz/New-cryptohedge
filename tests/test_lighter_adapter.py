@@ -980,3 +980,39 @@ def test_subscribe_funding_stores_callback_on_lighter():
     async def cb(entry): pass
     a.subscribe_funding(cb)
     assert a._funding_callback is cb
+
+
+@pytest.mark.asyncio
+async def test_fetch_position_funding_returns_entries():
+    """_fetch_position_funding wraps account_api.position_funding and
+    returns the entries list (or empty on error)."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    # Mock SDK response
+    a._account_api = MagicMock()
+    fake_entries = [
+        MagicMock(funding_id=1, market_id=0, timestamp=1700000000,
+                  change="0.10", rate="0.0001", position_size="0.0148",
+                  position_side="short"),
+        MagicMock(funding_id=2, market_id=50, timestamp=1700000005,
+                  change="-0.05", rate="-0.0001", position_size="100.0",
+                  position_side="short"),
+    ]
+    a._account_api.position_funding = AsyncMock(return_value=MagicMock(
+        position_fundings=fake_entries,
+        next_cursor=None,
+    ))
+    entries = await a._fetch_position_funding(limit=100)
+    assert len(entries) == 2
+    assert entries[0].funding_id == 1
+    assert entries[1].market_id == 50
+
+@pytest.mark.asyncio
+async def test_fetch_position_funding_returns_empty_on_error():
+    """HTTP errors must not crash the poller — return empty list."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._account_api = MagicMock()
+    a._account_api.position_funding = AsyncMock(side_effect=RuntimeError("boom"))
+    entries = await a._fetch_position_funding(limit=100)
+    assert entries == []
