@@ -68,6 +68,29 @@ class GridMakerEngine:
         # corrections stack up and explode the position when price crosses.
         self._last_aggressive_correction_at: float = 0.0
         self.AGGRESSIVE_CORRECTION_COOLDOWN_SECONDS = 30.0
+        # Idle-state throttle for exchange polling. When NO operation is
+        # active, the bot doesn't need fresh position/oracle/collateral
+        # every second — it has nothing to react to. We only hit the
+        # exchange every IDLE_EXCHANGE_POLL_INTERVAL_S seconds in that
+        # state. Without this, sustained 1Hz polling triggers Lighter's
+        # CloudFront WAF, which then geo/IP-blocks ALL endpoints with a
+        # CAPTCHA challenge — not just orders, but read-only state too,
+        # leaving the bot unable to recover until the WAF cools off
+        # (~1 hour). The skip ONLY applies to exchange calls; chain
+        # reads (Beefy + Uniswap) keep their full cadence so the LP
+        # curve preview and out-of-range alerts stay live.
+        self._last_idle_exchange_poll_at: float = 0.0
+        self.IDLE_EXCHANGE_POLL_INTERVAL_S = 30.0
+        # Per-leg taker cooldown — when we fire a correction taker, we
+        # block any further taker on THAT leg for REBALANCE_COOLDOWN_S
+        # seconds. Defense in depth against the over-hedge mechanism we
+        # observed on 2026-05-07: order fills, but verify_fill or the
+        # WS-cached position read briefly returns 0 (eventually-
+        # consistent), engine reads drift = target → fires another
+        # taker → fills → over-hedge. Even with a working WS parser,
+        # this cooldown caps the damage at 1 fill per cooldown window.
+        self._last_rebalance_at_per_leg: dict[str, float] = {}
+        self.REBALANCE_COOLDOWN_S = 30.0
         # Cache of (vault_id, readers, pair_settings). Rebuilt when DB's
         # selected_vault_id changes. Lets the main loop read the SAME
         # pool/vault that start_operation would target, instead of the
@@ -815,6 +838,21 @@ class GridMakerEngine:
         self._vault_readers_cache = (
             selected, pool_reader, beefy_reader, pair_settings, dec0, dec1,
         )
+        # Register the active perp symbols with the exchange adapter so
+        # its WS pump subscribes to ONLY those order books. Subscribing
+        # to all 170+ Lighter markets at once trips the server's "Too
+        # Many Inflight Messages" guard (code 30010) and the WS keeps
+        # dropping. Adapter subscribes to whatever's registered when its
+        # WS pump (re)connects.
+        active_symbols = [pair_settings.dydx_symbol_token0]
+        if pair_settings.dydx_symbol_token1:
+            active_symbols.append(pair_settings.dydx_symbol_token1)
+        register = getattr(self._exchange, "register_active_symbols", None)
+        if callable(register):
+            try:
+                register(active_symbols)
+            except Exception as e:
+                logger.warning(f"register_active_symbols failed: {e}")
         logger.info(
             f"Engine readers rebuilt for vault {selected} "
             f"({pair_settings.pool_token0_symbol}/{pair_settings.pool_token1_symbol})"
@@ -864,6 +902,17 @@ class GridMakerEngine:
             if is_dual_leg:
                 symbols.append(self._settings.dydx_symbol_token1)
 
+            # No idle throttle — the LighterAdapter migrated to WebSocket
+            # subscriptions, so positions/oracle/collateral are read from
+            # in-memory cache (zero HTTP per call). The throttle was a
+            # mitigation for the CloudFront WAF that kicked in under
+            # sustained 1Hz HTTP polling; since we no longer poll over
+            # HTTP, the throttle just made dashboard state stale (token
+            # USD prices stuck at 0, etc.) without buying anything.
+            is_active = (
+                self._hub.operation_state == OperationState.ACTIVE.value
+            )
+
             # One round-trip each: positions per symbol, oracle prices, collateral
             positions, oracle_prices, collateral = await asyncio.gather(
                 asyncio.gather(*[self._safe_get_position(s) for s in symbols]),
@@ -872,6 +921,18 @@ class GridMakerEngine:
             )
             if collateral is not None:
                 self._hub.dydx_collateral = collateral
+
+            # Publish live token USD prices so the dashboard can format
+            # wallet residuals, curve previews, etc. without hardcoded
+            # multipliers (the previous UI assumed ETH=$3000 forever).
+            if oracle_prices:
+                p0 = oracle_prices.get(symbols[0])
+                if p0 and p0 > 0:
+                    self._hub.token0_usd_price = float(p0)
+                if is_dual_leg:
+                    p1 = oracle_prices.get(symbols[1])
+                    if p1 and p1 > 0:
+                        self._hub.token1_usd_price = float(p1)
 
             # Update hub state for each leg
             for sym, pos in zip(symbols, positions):
@@ -1016,9 +1077,23 @@ class GridMakerEngine:
             return None
 
     async def _safe_get_position(self, symbol: str | None = None):
+        """Returns the position the engine should drive drift against.
+
+        On the LighterAdapter this returns `get_effective_position`,
+        which fuses WS-observed state with locally-stamped expected
+        state from recent fires — making the over-hedge race
+        documented in 2026-05-07 structurally impossible. Adapters
+        that don't implement `get_effective_position` (e.g. test
+        mocks, alternative exchanges) fall back to `get_position`.
+        """
         sym = symbol if symbol is not None else self._settings.dydx_symbol
         try:
-            return await self._exchange.get_position(sym)
+            getter = getattr(
+                self._exchange, "get_effective_position", None,
+            )
+            if getter is None:
+                return await self._exchange.get_position(sym)
+            return await getter(sym)
         except Exception:
             return None
 
@@ -1037,31 +1112,46 @@ class GridMakerEngine:
         Cross-spread convention for taker:
           side=sell -> price = ref_price * 0.999 (cross the bid)
           side=buy  -> price = ref_price * 1.001 (cross the ask)
+
+        Per-leg cooldown: after firing a taker, we suppress further
+        takers on this symbol for `REBALANCE_COOLDOWN_S` seconds. Hard
+        regression guard from the 2026-05-07 over-hedge incident: when
+        WS account_all parsing was broken, the cache returned position=0
+        right after a successful fill, so each iter saw drift = target,
+        fired ANOTHER taker, stacked positions 5× over. The cooldown
+        gives WS state time to settle and bounds blast radius even if
+        readers regress.
         """
         drift = target - current
         notional_drift_usd = abs(drift) * ref_price
         if notional_drift_usd < min_notional:
             return  # sub-level, idle
 
+        last = self._last_rebalance_at_per_leg.get(symbol, 0.0)
+        cooldown_left = self.REBALANCE_COOLDOWN_S - (time.monotonic() - last)
+        if cooldown_left > 0:
+            logger.debug(
+                f"Rebalance cooldown [{symbol}]: {cooldown_left:.1f}s left, skipping"
+            )
+            return
+
         side = "sell" if drift > 0 else "buy"
         size = abs(drift)
         cross_price = ref_price * (0.999 if side == "sell" else 1.001)
         cloid = self._next_cloid_for_leg(symbol)
         metrics.aggressive_corrections_total.inc()
+        # Stamp the cooldown BEFORE the await — even if place_long_term_order
+        # raises mid-flight (network blip), we don't want a tight retry
+        # loop to fire the next iter and double-up.
+        self._last_rebalance_at_per_leg[symbol] = time.monotonic()
         try:
             await self._exchange.place_long_term_order(
                 symbol=symbol, side=side, size=size, price=cross_price,
                 cloid_int=cloid, ttl_seconds=60,
             )
-            op_id = self._hub.current_operation_id
-            if op_id is not None:
-                slippage_usd = 0.0005 * size * ref_price
-                field = (
-                    "perp_fees_paid_token0"
-                    if symbol == self._settings.dydx_symbol_token0
-                    else "perp_fees_paid_token1"
-                )
-                await self._db.add_to_operation_accumulator(op_id, field, slippage_usd)
+            # Lighter is zero-fee, so no slippage accumulator on this
+            # path. (When dYdX support comes back, wire fee model from
+            # adapter meta instead of hardcoding 0.05% here.)
             await self._db.insert_order_log(
                 timestamp=time.time(), exchange=self._exchange.name,
                 action="place", side=side, size=size, price=cross_price,

@@ -249,6 +249,9 @@ async def test_engine_fires_warning_alert_when_margin_low(monkeypatch):
     exchange.get_position = AsyncMock(return_value=MagicMock(
         side="short", size=0.103, entry_price=2982, unrealized_pnl=0,
     ))
+    # Force engine fallback to get_position (test mock pattern from
+    # 2026-05-07 position-truth redesign).
+    exchange.get_effective_position = None
     exchange.get_collateral = AsyncMock(return_value=50.0)  # tight margin
     exchange.batch_place = AsyncMock(return_value=[])
     exchange.batch_cancel = AsyncMock(return_value=0)
@@ -693,6 +696,9 @@ async def test_engine_updates_gauge_metrics(tmp_path):
     exchange.get_position = AsyncMock(return_value=MagicMock(
         side="short", size=0.00476, entry_price=3000.0, unrealized_pnl=0.0,
     ))
+    # Force engine fallback to get_position (test mock pattern from
+    # 2026-05-07 position-truth redesign).
+    exchange.get_effective_position = None
     exchange.get_collateral = AsyncMock(return_value=130.0)
     exchange.batch_place = AsyncMock(return_value=[])
     exchange.batch_cancel = AsyncMock(return_value=0)
