@@ -60,9 +60,13 @@ def create_app(start_engine: bool = True) -> Starlette:
             from chains.beefy_executor import BeefyExecutor
             from chains.uniswap import UniswapV3PoolReader
             from chains.beefy import BeefyClmReader
-            from exchanges.dydx import DydxAdapter
             from web3 import AsyncWeb3, AsyncHTTPProvider
             from eth_account import Account
+            # Defer importing the dYdX adapter — its native deps
+            # (`ed25519-blake2b`, `coincurve`, `grpcio`) lack prebuilt
+            # wheels on Windows + Python 3.13, so users running
+            # ACTIVE_EXCHANGE=lighter shouldn't be forced to install
+            # MSVC build tools just to boot the bot.
 
             w3 = AsyncWeb3(AsyncHTTPProvider(settings.arbitrum_rpc_url))
             # Lazy account: only create if private key looks plausible (real 0x-prefixed
@@ -101,6 +105,7 @@ def create_app(start_engine: bool = True) -> Starlette:
                     api_key_index=settings.lighter_api_key_index,
                 )
             else:
+                from exchanges.dydx import DydxAdapter
                 exchange = DydxAdapter(
                     mnemonic=settings.dydx_mnemonic,
                     wallet_address=settings.dydx_address,

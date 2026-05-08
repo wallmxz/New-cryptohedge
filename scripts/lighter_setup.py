@@ -88,8 +88,11 @@ async def main() -> int:
         await api_client.close()
         return 1
 
-    # 3. Pick an unused api_key_index (we'll just use the next slot)
-    api_key_index = 1  # 0 is reserved by the SDK as default; start at 1
+    # 3. Pick an unused api_key_index (we'll just use the next slot).
+    # Lighter docs: slots 0 and 1 are RESERVED for the web and mobile UIs
+    # — programmatic keys MUST use 2-254 or the server rejects every
+    # signature with code=21120 ("invalid signature"). Default to 2.
+    api_key_index = 2
 
     # 4. Register via change_api_key signed with the eth wallet
     signer = SignerClient(
@@ -97,8 +100,11 @@ async def main() -> int:
         account_index=account_index,
         api_private_keys={api_key_index: api_priv},
     )
-    print(f"Registering API key (slot {api_key_index})…")
-    tx, resp_send, err = await signer.change_api_key(
+    print(f"Registering API key (slot {api_key_index})...")
+    # SDK 1.0.9 returns (api_response, error). Older versions returned
+    # (tx, response, error) — keep this matching the installed lighter-sdk
+    # version or the script will crash with "not enough values to unpack".
+    api_response, err = await signer.change_api_key(
         eth_private_key=eth_pk,
         new_pubkey=api_pub,
         api_key_index=api_key_index,
@@ -108,7 +114,7 @@ async def main() -> int:
         await signer.close()
         await api_client.close()
         return 1
-    print(f"  tx_hash = {getattr(resp_send, 'tx_hash', '?')}")
+    print(f"  tx_hash = {getattr(api_response, 'tx_hash', '?')}")
 
     await signer.close()
     await api_client.close()
