@@ -1016,3 +1016,38 @@ async def test_fetch_position_funding_returns_empty_on_error():
     a._account_api.position_funding = AsyncMock(side_effect=RuntimeError("boom"))
     entries = await a._fetch_position_funding(limit=100)
     assert entries == []
+
+@pytest.mark.asyncio
+async def test_funding_poller_iteration_fires_callback_per_entry():
+    """One poller iteration fetches entries and fires the callback per
+    entry. Dedup happens engine-side, so adapter emits everything."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._account_api = MagicMock()
+    e1 = MagicMock(funding_id=1, market_id=0, timestamp=1700000000,
+                   change="0.10", rate="0.0001", position_size="0.0148",
+                   position_side="short")
+    e2 = MagicMock(funding_id=2, market_id=50, timestamp=1700000005,
+                   change="-0.05", rate="-0.0001", position_size="100.0",
+                   position_side="short")
+    a._account_api.position_funding = AsyncMock(return_value=MagicMock(
+        position_fundings=[e1, e2], next_cursor=None,
+    ))
+    received: list = []
+    async def cb(entry): received.append(entry)
+    a._funding_callback = cb
+    await a._funding_poller_iteration()
+    assert received == [e1, e2]
+
+@pytest.mark.asyncio
+async def test_funding_poller_iteration_noop_when_no_callback():
+    """If subscribe_funding hasn't been called yet, iteration still
+    fetches but doesn't crash."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._account_api = MagicMock()
+    a._account_api.position_funding = AsyncMock(return_value=MagicMock(
+        position_fundings=[MagicMock()], next_cursor=None,
+    ))
+    a._funding_callback = None
+    await a._funding_poller_iteration()  # must not raise

@@ -1134,6 +1134,26 @@ class LighterAdapter(ExchangeAdapter):
             return []
         return list(getattr(resp, "position_fundings", None) or [])
 
+    async def _funding_poller_iteration(self) -> None:
+        """One pass: fetch recent funding entries and dispatch each to
+        the engine callback. Dedup + ts filtering live on the engine
+        side (it knows the active op's started_at and what funding_ids
+        have been counted)."""
+        if self._funding_callback is None:
+            # Still fetch (cheap and forces an API health probe), then
+            # drop on the floor — engine hasn't subscribed yet.
+            await self._fetch_position_funding(limit=100)
+            return
+        entries = await self._fetch_position_funding(limit=100)
+        for entry in entries:
+            try:
+                await self._funding_callback(entry)
+            except Exception as e:
+                logger.warning(
+                    f"funding callback raised on entry "
+                    f"{getattr(entry, 'funding_id', '?')}: {e}"
+                )
+
     async def get_oracle_prices(self, symbols: list[str]) -> dict[str, float]:
         """Returns the WS top-of-book midpoint per symbol. We previously
         used `last_trade_price` from /orderBookDetails (HTTP); now the
