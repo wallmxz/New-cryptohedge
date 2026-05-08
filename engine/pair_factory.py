@@ -10,6 +10,8 @@ import dataclasses
 import logging
 from typing import TYPE_CHECKING
 
+import httpx
+
 from chains.uniswap import UniswapV3PoolReader
 from chains.beefy import BeefyClmReader
 from chains.uniswap_executor import UniswapExecutor
@@ -23,6 +25,58 @@ logger = logging.getLogger(__name__)
 # Decimals combos supported in MVP. WBTC (8 dec) and exotic combos are
 # rejected at the factory; broaden as the curve math gets generalized.
 SUPPORTED_DECIMALS_PAIR = {(18, 6), (18, 18)}
+
+# Process-level cache: maps a vault contract address (hex, lowercased)
+# to its Beefy gov-vault (reward pool) contract address, or None if no
+# reward pool exists. Populated lazily on first lifecycle build per
+# vault. We don't TTL this — Beefy reward pool addresses don't change
+# once published, and a process restart re-fetches anyway.
+_REWARD_POOL_CACHE: dict[str, str | None] = {}
+
+
+async def _resolve_reward_pool(vault_address: str) -> str | None:
+    """Look up the Beefy CLM reward pool ("gov-vault") that stakes a
+    given Beefy CLM earn vault.
+
+    Beefy CLM v2 separates the earn vault (the ERC20 holding LP
+    accounting) from the optional reward pool (where users stake their
+    LP tokens to receive boost rewards). The reward pool's
+    `tokenAddress` field in `/gov-vaults` matches the earn vault's
+    address — we use that to find the pair.
+
+    Returns the reward pool contract address, or None if this vault
+    has no reward pool / the API is unreachable. None is the safe
+    fallback: the reader still works (it just won't see staked
+    balances), so the operation still bootstraps if the user hasn't
+    staked.
+    """
+    key = (vault_address or "").lower()
+    if not key:
+        return None
+    if key in _REWARD_POOL_CACHE:
+        return _REWARD_POOL_CACHE[key]
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get("https://api.beefy.finance/gov-vaults")
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as e:
+        logger.warning(f"gov-vaults fetch failed: {e!r}")
+        # Don't cache failures — let the next build retry.
+        return None
+    matched: str | None = None
+    if isinstance(data, list):
+        for entry in data:
+            staked = (entry.get("tokenAddress") or "").lower()
+            if staked == key:
+                matched = entry.get("earnContractAddress") or None
+                break
+    _REWARD_POOL_CACHE[key] = matched
+    if matched:
+        logger.info(
+            f"Resolved reward pool for vault {vault_address}: {matched}"
+        )
+    return matched
 
 
 async def build_lifecycle(
@@ -97,6 +151,13 @@ async def build_lifecycle(
         uniswap_v3_pool_fee=int(pair["pool_fee"]),
     )
 
+    # Resolve the optional Beefy reward pool ("gov-vault") for this earn
+    # vault. If the user has staked their LP into the reward pool, that
+    # ERC20 balance only shows up via this contract — without it, the
+    # reader sees raw_balance=0 and the engine thinks the user has no
+    # position to hedge. Caching is process-level (see _REWARD_POOL_CACHE).
+    reward_pool_address = await _resolve_reward_pool(pair["vault_id"])
+
     pool_reader = UniswapV3PoolReader(
         w3=w3, pool_address=pair["pool_address"],
         decimals0=decimals0, decimals1=decimals1,
@@ -106,6 +167,7 @@ async def build_lifecycle(
         earn_address=pair["vault_id"],
         wallet_address=settings.wallet_address,
         decimals0=decimals0, decimals1=decimals1,
+        reward_pool_address=reward_pool_address,
     )
     uniswap_exec = UniswapExecutor(
         w3=w3, account=account,
@@ -170,6 +232,9 @@ async def build_readers_for_vault(*, settings, db, w3, selected_vault_id: str):
         clm_pool_address=pair["pool_address"],
         uniswap_v3_pool_fee=int(pair["pool_fee"]),
     )
+    # Same reward-pool wiring as build_lifecycle — see _resolve_reward_pool.
+    reward_pool_address = await _resolve_reward_pool(pair["vault_id"])
+
     pool_reader = UniswapV3PoolReader(
         w3=w3, pool_address=pair["pool_address"],
         decimals0=decimals0, decimals1=decimals1,
@@ -179,5 +244,6 @@ async def build_readers_for_vault(*, settings, db, w3, selected_vault_id: str):
         earn_address=pair["vault_id"],
         wallet_address=settings.wallet_address,
         decimals0=decimals0, decimals1=decimals1,
+        reward_pool_address=reward_pool_address,
     )
     return (pair_settings, pool_reader, beefy_reader, decimals0, decimals1)
