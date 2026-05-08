@@ -1,9 +1,31 @@
 # Predictive Curve-Grid Hedge — Design Spec
 
 **Date:** 2026-05-08
-**Status:** Draft (pending user review)
+**Status:** Draft — **needs single-grid rewrite before planning** (see below)
 **Branch:** `feature/cross-pair-dual-hedge`
 **Depends on:** Position-truth redesign (commits 3e34ed9..3f9475c, spec 2026-05-07)
+
+## Handoff note (2026-05-08, end of context window)
+
+This spec currently describes **two grids** per leg (`_grid_eth`, `_grid_arb`). User asked "pq 2 grids?" and I (assistant) acknowledged that's over-engineered. Agreed direction is a **single grid** keyed on pool ratio `p`, with two parallel amount arrays — one per leg:
+
+```
+LevelGrid:
+    p_a, p_b, L
+    p_levels: [p1, p2, p3, ...]
+    amount0_at: [...]    # WETH at each level
+    amount1_at: [...]    # ARB at each level
+```
+
+Each level crossing checks both legs independently and fires per-leg if `|delta| × leg_price ≥ $0.50`. Spec body still says "per leg" grid in places — those need to be rewritten before this can be turned into a plan. The *math* (V3 curve formulas, $0.50 floor, pool-ratio trigger source) is correct; it's just the data-structure description that needs to collapse from two grids into one.
+
+**Next steps when resuming:**
+1. Rewrite this spec to single-grid (replace "Grid construction (per leg)" + "Trigger logic" sections, keep math + WAF/race-safety sections as-is)
+2. User reviews rewritten spec
+3. Invoke `superpowers:writing-plans` for implementation plan
+4. Execute via `superpowers:subagent-driven-development`
+5. **Then** address the deferred PnL breakdown card bug (operation card shows $0.00 across LP fees, IL natural, Hedge PnL, Funding, Perp Fees, Bootstrap Slippage — needs its own brainstorm/spec)
+
 
 ## Problem
 
