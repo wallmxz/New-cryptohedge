@@ -81,16 +81,6 @@ class GridMakerEngine:
         # curve preview and out-of-range alerts stay live.
         self._last_idle_exchange_poll_at: float = 0.0
         self.IDLE_EXCHANGE_POLL_INTERVAL_S = 30.0
-        # Per-leg taker cooldown — when we fire a correction taker, we
-        # block any further taker on THAT leg for REBALANCE_COOLDOWN_S
-        # seconds. Defense in depth against the over-hedge mechanism we
-        # observed on 2026-05-07: order fills, but verify_fill or the
-        # WS-cached position read briefly returns 0 (eventually-
-        # consistent), engine reads drift = target → fires another
-        # taker → fills → over-hedge. Even with a working WS parser,
-        # this cooldown caps the damage at 1 fill per cooldown window.
-        self._last_rebalance_at_per_leg: dict[str, float] = {}
-        self.REBALANCE_COOLDOWN_S = 30.0
         # Cache of (vault_id, readers, pair_settings). Rebuilt when DB's
         # selected_vault_id changes. Lets the main loop read the SAME
         # pool/vault that start_operation would target, instead of the
@@ -1113,37 +1103,23 @@ class GridMakerEngine:
           side=sell -> price = ref_price * 0.999 (cross the bid)
           side=buy  -> price = ref_price * 1.001 (cross the ask)
 
-        Per-leg cooldown: after firing a taker, we suppress further
-        takers on this symbol for `REBALANCE_COOLDOWN_S` seconds. Hard
-        regression guard from the 2026-05-07 over-hedge incident: when
-        WS account_all parsing was broken, the cache returned position=0
-        right after a successful fill, so each iter saw drift = target,
-        fired ANOTHER taker, stacked positions 5× over. The cooldown
-        gives WS state time to settle and bounds blast radius even if
-        readers regress.
+        Over-hedge protection lives in the LighterAdapter's
+        `get_effective_position` (see 2026-05-07 position-truth redesign).
+        Engine reads `current` via `_safe_get_position`, which now
+        returns the fused observed+expected magnitude — drift goes to 0
+        right after a successful fire, so re-fire is impossible during
+        WS lag. No engine-level cooldown needed.
         """
         drift = target - current
         notional_drift_usd = abs(drift) * ref_price
         if notional_drift_usd < min_notional:
             return  # sub-level, idle
 
-        last = self._last_rebalance_at_per_leg.get(symbol, 0.0)
-        cooldown_left = self.REBALANCE_COOLDOWN_S - (time.monotonic() - last)
-        if cooldown_left > 0:
-            logger.debug(
-                f"Rebalance cooldown [{symbol}]: {cooldown_left:.1f}s left, skipping"
-            )
-            return
-
         side = "sell" if drift > 0 else "buy"
         size = abs(drift)
         cross_price = ref_price * (0.999 if side == "sell" else 1.001)
         cloid = self._next_cloid_for_leg(symbol)
         metrics.aggressive_corrections_total.inc()
-        # Stamp the cooldown BEFORE the await — even if place_long_term_order
-        # raises mid-flight (network blip), we don't want a tight retry
-        # loop to fire the next iter and double-up.
-        self._last_rebalance_at_per_leg[symbol] = time.monotonic()
         try:
             await self._exchange.place_long_term_order(
                 symbol=symbol, side=side, size=size, price=cross_price,

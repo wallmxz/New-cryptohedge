@@ -73,23 +73,28 @@ async def test_rebalance_leg_fires_buy_when_over_shorted(engine_for_rebalance):
 
 
 @pytest.mark.asyncio
-async def test_rebalance_leg_attributes_fee_to_correct_leg_token0(engine_for_rebalance):
+async def test_rebalance_leg_does_not_book_synthetic_fee_on_lighter(engine_for_rebalance):
+    """Lighter is zero-fee for both maker and taker. Earlier the engine
+    booked a fake 0.05% × notional as `perp_fees_paid_token0` to model
+    dYdX taker fees, which polluted the operation breakdown's "Perp
+    Fees" line on Lighter operations even though the real charge is
+    $0. Removed in 2026-05-07. The order must still fire — only the
+    accumulator call is gone."""
     engine, exchange, db = engine_for_rebalance
     engine._hub.current_operation_id = 42
     await engine._maybe_rebalance_leg(
         symbol="ARB-USD", target=105.0, current=100.0,
         min_notional=1.0, ref_price=1.50,
     )
-    db.add_to_operation_accumulator.assert_awaited_once()
-    call = db.add_to_operation_accumulator.await_args
-    # Positional args: (op_id, field, delta)
-    assert call.args[1] == "perp_fees_paid_token0"
-    assert call.args[2] > 0
+    # Order placed → still expected.
+    exchange.place_long_term_order.assert_awaited_once()
+    # Synthetic slippage accumulator → MUST NOT be called.
+    db.add_to_operation_accumulator.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_rebalance_leg_attributes_fee_to_token1_when_dual_leg():
-    """In dual-leg, when symbol matches dydx_symbol_token1, fee goes to token1 accumulator."""
+async def test_rebalance_leg_token1_no_synthetic_fee_either():
+    """Same expectation for the dual-leg token1 (ETH) leg."""
     state = StateHub(hedge_ratio=1.0)
     state.current_operation_id = 42
     state.operation_state = "active"
@@ -103,7 +108,7 @@ async def test_rebalance_leg_attributes_fee_to_token1_when_dual_leg():
     db.insert_order_log = AsyncMock()
 
     exchange = MagicMock()
-    exchange.name = "dydx"
+    exchange.name = "lighter"
     exchange.place_long_term_order = AsyncMock()
 
     pool = MagicMock(); beefy = MagicMock()
@@ -112,15 +117,12 @@ async def test_rebalance_leg_attributes_fee_to_token1_when_dual_leg():
         exchange=exchange, pool_reader=pool, beefy_reader=beefy,
     )
 
-    # Fire on the ETH-USD leg
     await engine._maybe_rebalance_leg(
         symbol="ETH-USD", target=0.05, current=0.04,
         min_notional=1.0, ref_price=4000.0,
     )
-
-    db.add_to_operation_accumulator.assert_awaited_once()
-    call = db.add_to_operation_accumulator.await_args
-    assert call.args[1] == "perp_fees_paid_token1"  # ETH-USD is token1
+    exchange.place_long_term_order.assert_awaited_once()
+    db.add_to_operation_accumulator.assert_not_awaited()
 
 
 @pytest.mark.asyncio
