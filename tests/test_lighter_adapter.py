@@ -5,6 +5,7 @@ environment without needing the real package. The conftest.py already
 has a similar pattern for dydx_v4_client.
 """
 from __future__ import annotations
+import asyncio
 import sys
 import time
 import types
@@ -1051,3 +1052,35 @@ async def test_funding_poller_iteration_noop_when_no_callback():
     ))
     a._funding_callback = None
     await a._funding_poller_iteration()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_funding_poller_loop_runs_iteration_then_sleeps():
+    """The loop body calls _funding_poller_iteration once, then awaits
+    the sleep — patched to fire CancelledError so we exit deterministically."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    iters = 0
+    async def fake_iteration():
+        nonlocal iters
+        iters += 1
+    a._funding_poller_iteration = fake_iteration
+    # Patch sleep to short-circuit and exit after first iter
+    a._ws_closing = False
+    sleep_calls = 0
+    real_sleep = asyncio.sleep
+    async def fake_sleep(d):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 1:
+            a._ws_closing = True  # exit loop on next while check
+        await real_sleep(0)
+    import asyncio as _aio
+    orig = _aio.sleep
+    _aio.sleep = fake_sleep
+    try:
+        await a._funding_poller_loop()
+    finally:
+        _aio.sleep = orig
+    assert iters >= 1
+    assert sleep_calls >= 1

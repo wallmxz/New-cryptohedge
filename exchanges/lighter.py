@@ -266,6 +266,7 @@ class LighterAdapter(ExchangeAdapter):
         # divergence via HTTP authoritative query. See spec/2026-05-07-
         # position-truth-redesign-design.md § Reconciliation logic.
         self._reconcile_task = asyncio.create_task(self._reconciler_loop())
+        self._funding_task = asyncio.create_task(self._funding_poller_loop())
 
     async def disconnect(self) -> None:
         self._ws_closing = True
@@ -281,6 +282,14 @@ class LighterAdapter(ExchangeAdapter):
             rec_task.cancel()
             try:
                 await rec_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # Cancel the funding poller task — symmetric with reconciler.
+        funding_task = getattr(self, "_funding_task", None)
+        if funding_task is not None and not funding_task.done():
+            funding_task.cancel()
+            try:
+                await funding_task
             except (asyncio.CancelledError, Exception):
                 pass
         if self._signer is not None:
@@ -633,6 +642,26 @@ class LighterAdapter(ExchangeAdapter):
                 )
             try:
                 await asyncio.sleep(5.0)
+            except asyncio.CancelledError:
+                return
+
+    async def _funding_poller_loop(self) -> None:
+        """Background task: every 60 s, run one funding poller iteration.
+        Started in connect(), cancelled in disconnect(). Catches
+        per-iteration exceptions so a transient HTTP error doesn't crash
+        the loop — next sleep retries.
+        """
+        while not self._ws_closing:
+            try:
+                await self._funding_poller_iteration()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.warning(
+                    f"Funding poller iteration failed: {type(e).__name__}: {e}"
+                )
+            try:
+                await asyncio.sleep(60.0)
             except asyncio.CancelledError:
                 return
 
