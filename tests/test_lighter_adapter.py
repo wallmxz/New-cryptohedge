@@ -309,6 +309,16 @@ async def test_size_below_step_raises():
 
 
 @pytest.mark.asyncio
+async def test_adapter_inits_expected_state_dicts():
+    """The position-truth redesign requires `_expected_short_size` and
+    `_last_fire_at` to start empty on a freshly constructed adapter.
+    Subsequent tasks stamp them on `place_long_term_order` success."""
+    a = _make_adapter()
+    assert a._expected_short_size == {}
+    assert a._last_fire_at == {}
+
+
+@pytest.mark.asyncio
 async def test_get_position_reads_from_ws_cache():
     """get_position must NOT call /account — it reads the WS-cached
     position. Sustained 1Hz HTTP polling triggered the CloudFront WAF

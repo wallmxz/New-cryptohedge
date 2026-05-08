@@ -146,6 +146,19 @@ class LighterAdapter(ExchangeAdapter):
         self._observed_short_size: dict[int, float] = {}
         self._observed_position_meta: dict[int, dict] = {}
         self._ws_collateral: float | None = None
+        # Locally-stamped expected magnitude per market_id. Written by
+        # `place_long_term_order` when `create_order` returns
+        # err=None (server-accept), regardless of `_verify_fill`.
+        # Reset by `_reconciler_loop` when the WS-observed value catches
+        # up, OR when an HTTP authoritative query confirms the truth.
+        # See spec/2026-05-07-position-truth-redesign-design.md §
+        # "Reconciliation logic" for the stamping/reset rules.
+        self._expected_short_size: dict[int, float] = {}
+        # Monotonic timestamp of the latest successful create_order on
+        # this market_id. Reconciler measures HTTP-query timeout from
+        # this; rewritten on every fire so a chain of fires within
+        # 30 s waits for the latest fire to age out.
+        self._last_fire_at: dict[int, float] = {}
         # Markets to subscribe to via WS. Subset of self._markets keys
         # populated by `register_active_symbols`. Lighter rejects mass
         # subscribes (>~10 at once) with "Too Many Inflight Messages"
