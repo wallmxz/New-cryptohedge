@@ -26,6 +26,12 @@ class Settings:
     # Safety net for execution failures (bot offline, exchange congestion, price gaps).
     # In healthy operation the predictive grid drives exposure to ~0% and this never fires.
     threshold_aggressive: float
+    # Minimum drift in USD before the engine fires a rebalance taker.
+    # Lighter declares min_quote_amount = $10 across all markets, but the
+    # matching engine accepts much smaller orders (down to step_size). We
+    # override with $0.50 so the engine tracks LP composition at fine
+    # granularity instead of waiting for $10 of drift to accumulate.
+    min_rebalance_notional_usd: float
     active_exchange: str
     pool_token0_symbol: str
     pool_token1_symbol: str
@@ -79,6 +85,9 @@ class Settings:
             hedge_ratio=float(os.environ.get("HEDGE_RATIO", "1.0")),
             max_open_orders=int(os.environ.get("MAX_OPEN_ORDERS", "200")),
             threshold_aggressive=float(os.environ.get("THRESHOLD_AGGRESSIVE", "0.01")),
+            min_rebalance_notional_usd=float(
+                os.environ.get("MIN_REBALANCE_NOTIONAL_USD", "0.50"),
+            ),
             active_exchange=os.environ.get("ACTIVE_EXCHANGE", "dydx"),
             pool_token0_symbol=os.environ.get("POOL_TOKEN0_SYMBOL", "WETH"),
             pool_token1_symbol=os.environ.get("POOL_TOKEN1_SYMBOL", "USDC"),

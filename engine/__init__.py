@@ -1021,7 +1021,6 @@ class GridMakerEngine:
 
             # Fire rebalance per leg
             for sym in symbols:
-                meta = await self._exchange.get_market_meta(sym)
                 idx = symbols.index(sym)
                 current = abs(positions[idx].size) if positions[idx] else 0.0
                 ref_price = oracle_prices.get(sym, 0.0)
@@ -1029,7 +1028,8 @@ class GridMakerEngine:
                     continue
                 await self._maybe_rebalance_leg(
                     symbol=sym, target=targets[sym], current=current,
-                    min_notional=meta.min_notional, ref_price=ref_price,
+                    min_notional=self._settings.min_rebalance_notional_usd,
+                    ref_price=ref_price,
                 )
         finally:
             timings["total"] = (time.monotonic() - iter_start) * 1000

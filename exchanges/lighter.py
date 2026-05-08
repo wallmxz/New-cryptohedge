@@ -508,11 +508,17 @@ class LighterAdapter(ExchangeAdapter):
         except Exception as e:
             logger.warning(f"WS account update parse failed: {e}")
 
-    # Reconciler tunables. The redesign treats 30 s as "WS should have
-    # delivered by now under any normal load — if we're still seeing
-    # divergence, query HTTP authoritative". Spec discusses the
-    # tradeoffs in § Constants.
-    RECONCILE_TIMEOUT_S = 30.0
+    # Reconciler tunables. WS account_all pushes typically land in <1 s
+    # under normal Lighter load; we treat 10 s as "definitely should
+    # have delivered, if we're still seeing divergence the IOC must
+    # have failed to fill — query HTTP authoritative". Tightened from
+    # the original 30 s after observing that real-world WS lag never
+    # exceeds 5 s. Faster recovery from no-fill scenarios at the cost
+    # of one extra HTTP call per genuinely-failed fire (the over-hedge
+    # protection in get_effective_position is independent of this
+    # value). Engine-level over-hedge race is structurally impossible
+    # regardless of timeout — see 2026-05-07 position-truth redesign.
+    RECONCILE_TIMEOUT_S = 10.0
 
     def _step_size_for_mid(self, mid: int) -> float:
         """Tolerance for treating observed as matching expected — one

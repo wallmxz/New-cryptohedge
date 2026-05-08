@@ -21,6 +21,7 @@ def cross_pair_settings():
         token0_address="0xARB", token1_address="0xWETH",
         token0_decimals=18, token1_decimals=18,
         slippage_bps=30, uniswap_v3_pool_fee=3000,
+        min_rebalance_notional_usd=0.50,
     )
 
 

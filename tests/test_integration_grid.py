@@ -39,6 +39,7 @@ async def test_engine_full_loop_in_range(tmp_path):
     settings.dydx_symbol_token1 = ""
     settings.alert_webhook_url = ""
     settings.threshold_aggressive = 0.05
+    settings.min_rebalance_notional_usd = 0.50
     settings.max_open_orders = 50
     settings.pool_token0_symbol = "WETH"
     settings.pool_token1_symbol = "USDC"

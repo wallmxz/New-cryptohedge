@@ -160,6 +160,7 @@ async def test_iterate_dual_leg_calls_rebalance_for_both_legs():
     settings.pool_token1_symbol = "WETH"
     settings.alert_webhook_url = ""
     settings.dydx_symbol = "ARB-USD"  # legacy property; some callers read it
+    settings.min_rebalance_notional_usd = 0.50
 
     db = MagicMock()
     db.get_active_grid_orders = AsyncMock(return_value=[])
@@ -204,6 +205,84 @@ async def test_iterate_dual_leg_calls_rebalance_for_both_legs():
 
 
 @pytest.mark.asyncio
+async def test_iterate_uses_settings_min_rebalance_not_meta_min_notional():
+    """REGRESSION: 2026-05-08 — Lighter declares min_quote_amount=$10 across
+    every market, but the matching engine accepts orders down to step_size.
+    The engine must use `settings.min_rebalance_notional_usd` (default 0.50)
+    as the rebalance trigger floor, NOT `meta.min_notional`. Otherwise the
+    bot stays idle through up to $10 of LP drift — the very bug observed
+    on op #28.
+    """
+    from engine import GridMakerEngine
+    state = StateHub(hedge_ratio=1.0)
+    state.operation_state = "active"
+    state.current_operation_id = 1
+
+    settings = MagicMock()
+    settings.dydx_symbol_token0 = "ETH-USD"
+    settings.dydx_symbol_token1 = ""
+    settings.threshold_aggressive = 0.01
+    settings.max_open_orders = 200
+    settings.pool_token0_symbol = "WETH"
+    settings.pool_token1_symbol = "USDC"
+    settings.alert_webhook_url = ""
+    settings.dydx_symbol = "ETH-USD"
+    settings.min_rebalance_notional_usd = 0.50
+
+    db = MagicMock()
+    db.get_active_grid_orders = AsyncMock(return_value=[])
+    db.add_to_operation_accumulator = AsyncMock()
+    db.insert_order_log = AsyncMock()
+    db.get_operation = AsyncMock(return_value=None)
+
+    exchange = MagicMock()
+    exchange.name = "lighter"
+    exchange.place_long_term_order = AsyncMock()
+    exchange.get_collateral = AsyncMock(return_value=130.0)
+    exchange.get_position = AsyncMock(return_value=None)
+    # Lighter declares $10 across every market — engine must IGNORE this
+    # and use settings.min_rebalance_notional_usd (0.50) instead.
+    exchange.get_market_meta = AsyncMock(return_value=MagicMock(min_notional=10.0))
+    exchange.get_oracle_prices = AsyncMock(return_value={"ETH-USD": 4000.0})
+    exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+
+    pool = MagicMock()
+    pool.read_price = AsyncMock(return_value=4000.0)
+    beefy = MagicMock()
+    # Beefy holds 0.0002 ETH (~$0.80 at $4000/ETH) — this drift is BELOW
+    # the $10 declared min_notional but ABOVE the $0.50 settings floor.
+    # Engine must fire (proving it uses settings, not meta).
+    beefy.read_position = AsyncMock(return_value=MagicMock(
+        tick_lower=-887272, tick_upper=887272,  # full-range
+        amount0=0.0002, amount1=0.0, share=1.0, raw_balance=10**18,
+    ))
+
+    engine = GridMakerEngine(
+        settings=settings, hub=state, db=db,
+        exchange=exchange, pool_reader=pool, beefy_reader=beefy,
+        decimals0=18, decimals1=6,
+    )
+
+    captured: list[dict] = []
+    original = engine._maybe_rebalance_leg
+    async def spy(**kwargs):
+        captured.append(kwargs)
+        return await original(**kwargs)
+    engine._maybe_rebalance_leg = spy
+
+    await engine._iterate()
+    assert len(captured) == 1, f"expected 1 leg call, got {captured}"
+    # The smoking-gun assertion: engine passed the settings value, NOT $10.
+    assert captured[0]["min_notional"] == 0.50, (
+        f"engine used min_notional={captured[0]['min_notional']}; "
+        f"must come from settings.min_rebalance_notional_usd (0.50), "
+        f"not meta.min_notional (10.0)"
+    )
+    # And actually fired (drift $0.80 > $0.50).
+    assert exchange.place_long_term_order.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_iterate_single_leg_only_calls_token0():
     from engine import GridMakerEngine
     state = StateHub(hedge_ratio=1.0)
@@ -219,6 +298,7 @@ async def test_iterate_single_leg_only_calls_token0():
     settings.pool_token1_symbol = "USDC"
     settings.alert_webhook_url = ""
     settings.dydx_symbol = "ETH-USD"
+    settings.min_rebalance_notional_usd = 0.50
 
     db = MagicMock()
     db.get_active_grid_orders = AsyncMock(return_value=[])

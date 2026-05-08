@@ -19,6 +19,7 @@ async def test_engine_skips_grid_when_operation_state_none():
     settings.dydx_symbol_token1 = ""
     settings.alert_webhook_url = ""
     settings.threshold_aggressive = 0.05
+    settings.min_rebalance_notional_usd = 0.50
     settings.max_open_orders = 50
     settings.pool_token0_symbol = "WETH"
     settings.pool_token1_symbol = "USDC"
@@ -80,6 +81,7 @@ async def test_engine_iteration_in_range_builds_grid():
     settings.pool_token0_symbol = "WETH"
     settings.pool_token1_symbol = "USDC"
     settings.threshold_aggressive = 0.05
+    settings.min_rebalance_notional_usd = 0.50
     settings.max_open_orders = 200
     settings.clm_vault_address = "0xvault"
     settings.clm_pool_address = "0xpool"
@@ -174,6 +176,7 @@ async def test_engine_reconcile_runs_periodically():
     settings.dydx_symbol_token0 = "ETH-USD"
     settings.dydx_symbol_token1 = ""
     settings.threshold_aggressive = 0.05
+    settings.min_rebalance_notional_usd = 0.50
     settings.max_open_orders = 200
     settings.pool_token0_symbol = "WETH"
     settings.pool_token1_symbol = "USDC"
@@ -232,6 +235,7 @@ async def test_engine_fires_warning_alert_when_margin_low(monkeypatch):
     settings.dydx_symbol_token1 = ""
     settings.alert_webhook_url = "https://hooks.test/x"
     settings.threshold_aggressive = 0.05
+    settings.min_rebalance_notional_usd = 0.50
     settings.max_open_orders = 200
     settings.pool_token0_symbol = "WETH"
     settings.pool_token1_symbol = "USDC"
@@ -572,6 +576,7 @@ async def test_engine_updates_live_pnl_breakdown(tmp_path):
     settings.dydx_symbol_token1 = ""
     settings.alert_webhook_url = ""
     settings.threshold_aggressive = 0.05
+    settings.min_rebalance_notional_usd = 0.50
     settings.max_open_orders = 50
     settings.pool_token0_symbol = "WETH"
     settings.pool_token1_symbol = "USDC"
@@ -626,6 +631,7 @@ async def test_engine_populates_last_iter_timings(tmp_path):
     settings.dydx_symbol_token1 = ""
     settings.alert_webhook_url = ""
     settings.threshold_aggressive = 0.05
+    settings.min_rebalance_notional_usd = 0.50
     settings.max_open_orders = 50
     settings.pool_token0_symbol = "WETH"
     settings.pool_token1_symbol = "USDC"
@@ -686,6 +692,7 @@ async def test_engine_updates_gauge_metrics(tmp_path):
     settings.dydx_symbol_token1 = ""
     settings.alert_webhook_url = ""
     settings.threshold_aggressive = 0.05
+    settings.min_rebalance_notional_usd = 0.50
     settings.max_open_orders = 50
     settings.pool_token0_symbol = "WETH"
     settings.pool_token1_symbol = "USDC"

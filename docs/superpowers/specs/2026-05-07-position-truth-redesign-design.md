@@ -228,9 +228,12 @@ async def _reconcile_once(self):
 
 ### Constants
 
-- `RECONCILE_TIMEOUT_S = 30.0` — enough time for WS to push under normal
-  load, short enough that a stuck position becomes self-healing within
-  ~half a minute.
+- `RECONCILE_TIMEOUT_S = 10.0` — WS account_all pushes typically land in
+  <1 s; 10 s is "definitely should have arrived". Tightened from the
+  original 30 s after observing real-world WS lag never exceeds 5 s.
+  Faster recovery from genuinely-failed IOC fills at the cost of one
+  extra HTTP call per failed fire. Over-hedge protection in
+  `get_effective_position` is independent of this value.
 - `step_size_for(mid)` reads the symbol's step_size from `_markets`
   (already cached at connect time) — tolerance equals one tick on the
   size axis.

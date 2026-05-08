@@ -24,6 +24,7 @@ def mock_settings():
         token0_address="0xWETH", token1_address="0xUSDC",
         token0_decimals=18, token1_decimals=6,
         slippage_bps=10, uniswap_v3_pool_fee=500,
+        min_rebalance_notional_usd=0.50,
     )
     return s
 
