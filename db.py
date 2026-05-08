@@ -188,6 +188,15 @@ class Database:
             except aiosqlite.OperationalError:
                 pass
 
+        # Manual deposit baseline (Pool $ feature, 2026-05-08)
+        try:
+            await self._conn.execute(
+                "ALTER TABLE operations ADD COLUMN baseline_deposit_usd REAL"
+            )
+            await self._conn.commit()
+        except aiosqlite.OperationalError:
+            pass  # already added
+
         try:
             await self._conn.execute(
                 "ALTER TABLE beefy_pairs_cache ADD COLUMN dydx_perp_token1 TEXT"
@@ -495,6 +504,24 @@ class Database:
         await self._conn.execute(
             f"UPDATE operations SET {field} = {field} + ? WHERE id = ?",
             (delta, op_id),
+        )
+        await self._conn.commit()
+
+    async def update_operation_baseline_deposit(
+        self, op_id: int, usd_value: float,
+    ) -> None:
+        """Persist the user-set baseline_deposit_usd on an ACTIVE operation.
+        Used by POST /operations/<id>/baseline so the panel's Pool $ row
+        reflects the user's actual cost basis (versus the HODL fallback
+        for ops without it set).
+
+        WHERE status='active' guard prevents accidental writes against
+        closed ops during a teardown race or stale UI session.
+        """
+        await self._conn.execute(
+            "UPDATE operations SET baseline_deposit_usd = ? "
+            "WHERE id = ? AND status = 'active'",
+            (usd_value, op_id),
         )
         await self._conn.commit()
 
