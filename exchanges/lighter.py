@@ -174,6 +174,7 @@ class LighterAdapter(ExchangeAdapter):
         # populated state instead of empty cache.
         self._ws_first_snapshot = asyncio.Event()
         self._ws_task: asyncio.Task | None = None
+        self._reconcile_task: asyncio.Task | None = None
         self._ws_closing = False
 
     # ──────────────────────────────────────────────────────────────────────
@@ -254,6 +255,10 @@ class LighterAdapter(ExchangeAdapter):
         # engine treats those as "unknown" rather than active state.
         self._ws_closing = False
         self._ws_task = asyncio.create_task(self._run_ws_pump())
+        # Background reconciler — resolves persistent observed/expected
+        # divergence via HTTP authoritative query. See spec/2026-05-07-
+        # position-truth-redesign-design.md § Reconciliation logic.
+        self._reconcile_task = asyncio.create_task(self._reconciler_loop())
 
     async def disconnect(self) -> None:
         self._ws_closing = True
@@ -261,6 +266,14 @@ class LighterAdapter(ExchangeAdapter):
             self._ws_task.cancel()
             try:
                 await self._ws_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # Cancel the reconciler task too — symmetric with WS.
+        rec_task = getattr(self, "_reconcile_task", None)
+        if rec_task is not None and not rec_task.done():
+            rec_task.cancel()
+            try:
+                await rec_task
             except (asyncio.CancelledError, Exception):
                 pass
         if self._signer is not None:
@@ -560,6 +573,26 @@ class LighterAdapter(ExchangeAdapter):
                 f"observed_was={observed}, expected_was={expected_at_scan}, "
                 f"truth={truth}"
             )
+
+    async def _reconciler_loop(self) -> None:
+        """Background task that calls `_reconcile_once` every 5 s for
+        the lifetime of the adapter. Started in `connect()`, cancelled
+        in `disconnect()`. Catches per-iteration exceptions so a
+        transient HTTP error doesn't crash the loop — next scan retries.
+        """
+        while not self._ws_closing:
+            try:
+                await self._reconcile_once()
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.warning(
+                    f"Reconciler iteration failed: {type(e).__name__}: {e}"
+                )
+            try:
+                await asyncio.sleep(5.0)
+            except asyncio.CancelledError:
+                return
 
     async def _load_market_metadata(self) -> None:
         """Fetch all order books and build symbol→meta cache."""

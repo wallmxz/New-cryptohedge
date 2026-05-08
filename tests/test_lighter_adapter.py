@@ -839,3 +839,29 @@ async def test_reconcile_once_aborts_on_concurrent_fire():
     assert a._expected_short_size[0] == 0.030
     # Observed unchanged — reconciler aborted the write.
     assert a._observed_short_size[0] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_reconciler_loop_invokes_reconcile_once_periodically():
+    """The background loop must invoke `_reconcile_once` repeatedly,
+    sleeping between iterations. Test by patching the method to count
+    invocations and the sleep to no-op."""
+    import asyncio
+    a = _make_adapter()
+    invocations = []
+
+    async def fake_reconcile_once():
+        invocations.append(time.monotonic())
+        if len(invocations) >= 3:
+            a._ws_closing = True  # exit the loop
+
+    a._reconcile_once = fake_reconcile_once  # type: ignore
+
+    # Patch sleep to a noop so the test doesn't take 15 s.
+    real_sleep = asyncio.sleep
+    async def fast_sleep(s):
+        await real_sleep(0)
+    import unittest.mock as mock
+    with mock.patch("asyncio.sleep", fast_sleep):
+        await a._reconciler_loop()
+    assert len(invocations) >= 3
