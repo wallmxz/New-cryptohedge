@@ -124,3 +124,17 @@ def test_build_grid_tick_range_stored():
     )
     assert grid.tick_lower == -81121
     assert grid.tick_upper == -76012
+
+
+def test_predictive_unavailable_is_exception():
+    """Engine raises PredictiveUnavailable when fallback should run."""
+    from engine import PredictiveUnavailable
+    exc = PredictiveUnavailable("book empty")
+    assert isinstance(exc, Exception)
+    assert str(exc) == "book empty"
+
+
+def test_state_hub_has_predictive_status_field():
+    from state import StateHub
+    hub = StateHub(hedge_ratio=0.98)
+    assert hub.predictive_status == "idle"

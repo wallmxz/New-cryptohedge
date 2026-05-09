@@ -64,6 +64,11 @@ class StateHub:
     wallet_eth_balance: float = 0.0
     bootstrap_progress: str = ""  # human-readable string for UI ("Swapping...", "Depositing...")
 
+    # Predictive grid status (predictive grid spec 2026-05-08).
+    # Values: "idle", "active", "warmup", "no_grid",
+    #         "fallback: <reason>". Surfaces in dashboard.
+    predictive_status: str = "idle"
+
     # Live USD prices for the active pair's tokens (from exchange oracle —
     # WS midpoint on Lighter). The dashboard uses these to USD-format
     # the wallet residual balance, the LP curve preview, etc. Without

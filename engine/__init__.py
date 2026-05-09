@@ -24,6 +24,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class PredictiveUnavailable(Exception):
+    """Raised by predictive_grid path when this iter can't fire predictively
+    (book empty, RPC down, grid not built yet). Caller falls back to the
+    reactive `_maybe_rebalance_leg` path. Per spec
+    2026-05-08-predictive-curve-grid-hedge-design § Coexistence.
+    """
+
+
 class GridMakerEngine:
     """Main loop:
     1. Read pool position (Beefy + Uniswap pool)
