@@ -1157,8 +1157,11 @@ class GridMakerEngine:
             position_main = await (
                 self._beefy_reader._strategy.functions.positionMain().call()
             )
-            new_lower = int(position_main[0][0])
-            new_upper = int(position_main[0][1])
+            # Beefy CLM v2 returns positionMain as flat [tickLower, tickUpper]
+            # (verified against vault 0xBfaDfc... strategy 0xC443a6...).
+            # Earlier spec assumed nested ((tickLower,tickUpper),...) — wrong.
+            new_lower = int(position_main[0])
+            new_upper = int(position_main[1])
         except Exception as e:
             logger.warning(f"_refresh_grid: positionMain() failed: {e}")
             self._last_grid_check_at = time.monotonic()  # avoid retry storm

@@ -36,9 +36,12 @@ def _engine_with_predictive():
     beefy = MagicMock()
     beefy._strategy = MagicMock()
     beefy._strategy.functions = MagicMock()
+    # Beefy CLM v2 positionMain() returns flat [tickLower, tickUpper]
+    # (verified against live strategy 0xC443a6...). Old fixture used the
+    # wrong nested shape ((tickLower,tickUpper),...) which masked the bug.
     beefy._strategy.functions.positionMain = MagicMock(
         return_value=MagicMock(
-            call=AsyncMock(return_value=((-81121, -76012), (0, 0), 0, 0)),
+            call=AsyncMock(return_value=[-81121, -76012]),
         )
     )
 
