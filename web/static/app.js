@@ -20,6 +20,8 @@ function dashboard() {
             current_operation_id: null,
             operation_state: "none",
             operation_pnl_breakdown: {},
+            baselineModal: false,
+            baselineInput: "",
             last_iter_timings: {},
             wallet_eth_balance: 0,
             weth_balance: 0,
@@ -113,7 +115,7 @@ function dashboard() {
 
         get pnl() {
             const b = this.state.operation_pnl_breakdown || {};
-            const pool = (b.lp_fees_earned || 0) + (b.beefy_perf_fee || 0) + (b.il_natural || 0);
+            const pool = (b.lp_fees_earned || 0) + (b.beefy_perf_fee || 0) + (b.pool_dollar || 0);
             const hedge = b.hedge_pnl || 0;
             const net = b.net_pnl || 0;
             return { pool, hedge, net };
@@ -125,7 +127,7 @@ function dashboard() {
             const breakdown = [
                 { label: "LP fees recebidas", value: b.lp_fees_earned || 0 },
                 { label: "Beefy perf fee", value: b.beefy_perf_fee || 0 },
-                { label: "IL natural", value: b.il_natural || 0 },
+                { label: "Pool $", value: b.pool_dollar || 0 },
                 { label: "Hedge PnL", value: b.hedge_pnl || 0 },
                 { label: "Funding", value: b.funding || 0 },
                 { label: "Perp fees", value: b.perp_fees_paid || 0 },
@@ -421,6 +423,35 @@ function dashboard() {
                 if (resp.ok) this.history = await resp.json();
             } catch (e) {
                 console.error("Failed to load history:", e);
+            }
+        },
+
+        editBaseline() {
+            const cur = this.state.operation_pnl_breakdown?.baseline_deposit_usd;
+            this.baselineInput = (cur ?? "").toString();
+            this.baselineModal = true;
+        },
+
+        async saveBaseline() {
+            const op = this.state.current_operation;
+            if (!op || !op.id) return;
+            const value = parseFloat(this.baselineInput);
+            if (!(value > 0)) return;
+            try {
+                const resp = await fetch(`/operations/${op.id}/baseline`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ usd_value: value }),
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    this.baselineModal = false;
+                    this.baselineInput = "";
+                } else {
+                    alert(`Erro ao salvar baseline: ${data.error || resp.status}`);
+                }
+            } catch (e) {
+                alert(`Erro ao salvar baseline: ${e}`);
             }
         },
 
