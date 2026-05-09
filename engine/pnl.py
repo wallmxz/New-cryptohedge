@@ -58,9 +58,17 @@ def compute_operation_pnl(
         p0_now = current_eth_price
         p1_now = 1.0
 
-    # IL natural: LP USD value - HODL USD value at current prices.
-    hodl_value = op.baseline_amount0 * p0_now + op.baseline_amount1 * p1_now
-    il_natural = current_pool_value_usd - hodl_value
+    # Pool $ — primary metric. When the user has set a baseline_deposit_usd
+    # (via POST /operations/<id>/baseline), use it as the cost basis; the
+    # row in the panel reads "Pool $ = pool_now - what_user_invested".
+    # Otherwise fall back to the HODL divergence formula (legacy IL natural)
+    # so ops created before the user has clicked Editar still show
+    # something sensible — the panel labels this state explicitly.
+    if op.baseline_deposit_usd is not None and op.baseline_deposit_usd > 0:
+        pool_dollar = current_pool_value_usd - op.baseline_deposit_usd
+    else:
+        hodl_value = op.baseline_amount0 * p0_now + op.baseline_amount1 * p1_now
+        pool_dollar = current_pool_value_usd - hodl_value
 
     # Hedge PnL.
     if hedge_pnl_aggregate_override is not None:
@@ -121,7 +129,11 @@ def compute_operation_pnl(
     breakdown: dict = {
         "lp_fees_earned": op.lp_fees_earned,
         "beefy_perf_fee": beefy_perf,
-        "il_natural": round(il_natural, 4),
+        "pool_dollar": round(pool_dollar, 4),
+        "baseline_deposit_usd": op.baseline_deposit_usd,
+        # Alias for back-compat with any external consumer of the
+        # breakdown (analytics scripts, older test fixtures).
+        "il_natural": round(pool_dollar, 4),
         "hedge_pnl": hedge_pnl,
         "hedge_pnl_token0": hedge_pnl_t0,
         "hedge_pnl_token1": hedge_pnl_t1,
@@ -133,9 +145,13 @@ def compute_operation_pnl(
         "perp_fees_paid_token1": -perp_fees_t1,
         "bootstrap_slippage": -op.bootstrap_slippage,
     }
-    # net_pnl sums only the AGGREGATE fields (not per-leg, to avoid double-counting)
+    # net_pnl sums only the AGGREGATE fields (not per-leg, to avoid double-counting).
+    # Exclude pool_dollar (alias duplicate of il_natural) and baseline_deposit_usd
+    # (metadata string/None, not a P&L delta).
+    _excluded_from_net = {"pool_dollar", "baseline_deposit_usd"}
     breakdown["net_pnl"] = sum(
         v for k, v in breakdown.items()
         if not (k.endswith("_token0") or k.endswith("_token1"))
+        and k not in _excluded_from_net
     )
     return breakdown

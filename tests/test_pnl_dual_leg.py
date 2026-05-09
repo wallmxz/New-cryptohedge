@@ -131,3 +131,53 @@ def test_compute_operation_pnl_keeps_per_leg_when_no_override():
     assert out["hedge_pnl_token0"] == 2.5  # ARB realized + unrealized
     assert out["hedge_pnl_token1"] == 1.5  # ETH realized + unrealized
     assert out["hedge_pnl"] == 4.0
+
+
+def test_compute_operation_pnl_uses_baseline_deposit_usd_when_set():
+    """When op.baseline_deposit_usd > 0, pool_dollar = pool_now - baseline,
+    overriding the HODL formula. il_natural alias mirrors the same value."""
+    op = _op(baseline_deposit_usd=50.03)
+    bd = compute_operation_pnl(
+        op,
+        current_pool_value_usd=51.58,
+        current_token0_usd_price=1.75,
+        current_token1_usd_price=4200.0,
+        hedge_realized_per_symbol={},
+        hedge_unrealized_per_symbol={},
+    )
+    assert bd["pool_dollar"] == 1.55  # 51.58 - 50.03
+    assert bd["il_natural"] == 1.55  # alias = same
+    assert bd["baseline_deposit_usd"] == 50.03
+
+
+def test_compute_operation_pnl_falls_back_to_hodl_when_baseline_deposit_null():
+    """Without baseline set, pool_dollar uses the HODL formula (legacy)."""
+    op = _op(baseline_deposit_usd=None)
+    bd = compute_operation_pnl(
+        op,
+        current_pool_value_usd=326.20,
+        current_token0_usd_price=1.75,
+        current_token1_usd_price=4200.0,
+        hedge_realized_per_symbol={},
+        hedge_unrealized_per_symbol={},
+    )
+    # HODL: 100 * 1.75 + 0.0375 * 4200 = 175.0 + 157.5 = 332.5
+    # pool_dollar = 326.20 - 332.5 = -6.30
+    assert bd["pool_dollar"] == -6.3
+    assert bd["il_natural"] == -6.3
+    assert bd["baseline_deposit_usd"] is None
+
+
+def test_compute_operation_pnl_falls_back_to_hodl_when_baseline_deposit_zero():
+    """Defensive: 0 or negative values fall back to HODL too."""
+    op = _op(baseline_deposit_usd=0.0)
+    bd = compute_operation_pnl(
+        op,
+        current_pool_value_usd=326.20,
+        current_token0_usd_price=1.75,
+        current_token1_usd_price=4200.0,
+        hedge_realized_per_symbol={},
+        hedge_unrealized_per_symbol={},
+    )
+    # Same HODL fallback as the null case: -6.30
+    assert bd["pool_dollar"] == -6.3
