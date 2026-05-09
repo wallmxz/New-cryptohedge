@@ -433,12 +433,12 @@ function dashboard() {
         },
 
         async saveBaseline() {
-            const op = this.state.current_operation;
-            if (!op || !op.id) return;
+            const opId = this.state.current_operation_id;
+            if (!opId) return;
             const value = parseFloat(this.baselineInput);
             if (!(value > 0)) return;
             try {
-                const resp = await fetch(`/operations/${op.id}/baseline`, {
+                const resp = await fetch(`/operations/${opId}/baseline`, {
                     method: "POST",
                     headers: { "Content-Type": "application/json" },
                     body: JSON.stringify({ usd_value: value }),

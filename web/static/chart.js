@@ -58,7 +58,7 @@ function updateChart(state) {
 
     const now = state.last_update;
     const b = state.operation_pnl_breakdown || {};
-    const poolPnl = (b.lp_fees_earned || 0) + (b.beefy_perf_fee || 0) + (b.il_natural || 0);
+    const poolPnl = (b.lp_fees_earned || 0) + (b.beefy_perf_fee || 0) + (b.pool_dollar || 0);
     const hedgePnl = -(b.hedge_pnl || 0);
     const netPnl = b.net_pnl || 0;
 
