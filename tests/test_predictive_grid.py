@@ -9,7 +9,7 @@ import math
 import pytest
 
 from engine.predictive_grid import (
-    LevelGrid, find_level_idx, compute_deltas,
+    LevelGrid, find_level_idx, compute_deltas, build_grid,
 )
 
 
@@ -69,3 +69,58 @@ def test_compute_deltas_negative_direction():
     expected_d1 = (math.sqrt(1.5) - 1) - (math.sqrt(3) - 1)
     assert d0 == pytest.approx(expected_d0)
     assert d1 == pytest.approx(expected_d1)
+
+
+def test_build_grid_endpoints_are_p_a_and_p_b():
+    """First level == p_a, last level == p_b."""
+    grid = build_grid(
+        tick_lower=0, tick_upper=13863,
+        L=1.0, p0_usd=1.0, p1_usd=1.0,
+        min_leg_notional_usd=0.50,
+    )
+    assert grid.p_levels[0] == pytest.approx(1.0)
+    assert grid.p_levels[-1] == pytest.approx(math.exp(13863 * math.log(1.0001)))
+
+
+def test_build_grid_amounts_match_v3_formula_at_endpoints():
+    L = 1.0
+    grid = build_grid(
+        tick_lower=0, tick_upper=13863,
+        L=L, p0_usd=1.0, p1_usd=1.0,
+        min_leg_notional_usd=0.50,
+    )
+    p_a, p_b = grid.p_a, grid.p_b
+    expected_a0 = L * (1/math.sqrt(p_a) - 1/math.sqrt(p_b))
+    assert grid.amount0_at[0] == pytest.approx(expected_a0)
+    expected_b1 = L * (math.sqrt(p_b) - math.sqrt(p_a))
+    assert grid.amount1_at[-1] == pytest.approx(expected_b1)
+    assert grid.amount0_at[-1] == pytest.approx(0.0)
+    assert grid.amount1_at[0] == pytest.approx(0.0)
+
+
+def test_build_grid_levels_spaced_by_dollar_floor():
+    """Each adjacent level pair must produce ≥$0.50 notional in at least one leg."""
+    L = 100.0
+    p0_usd, p1_usd = 2300.0, 0.13
+    grid = build_grid(
+        tick_lower=-81121, tick_upper=-76012,
+        L=L, p0_usd=p0_usd, p1_usd=p1_usd,
+        min_leg_notional_usd=0.50,
+    )
+    for k in range(len(grid.p_levels) - 1):
+        d0 = grid.amount0_at[k+1] - grid.amount0_at[k]
+        d1 = grid.amount1_at[k+1] - grid.amount1_at[k]
+        notional = max(abs(d0) * p0_usd, abs(d1) * p1_usd)
+        assert notional >= 0.50, (
+            f"level {k}→{k+1}: notional={notional:.4f} below floor 0.50"
+        )
+
+
+def test_build_grid_tick_range_stored():
+    grid = build_grid(
+        tick_lower=-81121, tick_upper=-76012,
+        L=1.0, p0_usd=2300.0, p1_usd=0.13,
+        min_leg_notional_usd=0.50,
+    )
+    assert grid.tick_lower == -81121
+    assert grid.tick_upper == -76012

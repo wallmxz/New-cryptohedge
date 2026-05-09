@@ -12,6 +12,7 @@ Spec: docs/superpowers/specs/2026-05-08-predictive-curve-grid-hedge-design.md
 from __future__ import annotations
 
 import bisect
+import math
 from dataclasses import dataclass
 
 
@@ -62,4 +63,99 @@ def compute_deltas(
     return (
         grid.amount0_at[new_idx] - grid.amount0_at[old_idx],
         grid.amount1_at[new_idx] - grid.amount1_at[old_idx],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Grid builder
+# ---------------------------------------------------------------------------
+
+# Default level granularity: each adjacent level pair must move ≥$0.50
+# in at least one leg's notional. Adaptive: denser where one leg moves
+# slowly per Δp, sparser where it moves fast.
+MIN_LEG_NOTIONAL_USD = 0.50
+
+# Hard cap on level count — protect against pathological tick ranges
+# that would generate thousands of levels (RPC + memory waste). 500
+# is plenty for any reasonable Beefy CLM v2 range.
+MAX_LEVELS = 500
+
+
+def _amount0_at(L: float, p: float, p_b: float) -> float:
+    """V3 token0 amount. Clamped 0 above p_b (single-asset edge)."""
+    if p >= p_b:
+        return 0.0
+    return L * (1.0 / math.sqrt(p) - 1.0 / math.sqrt(p_b))
+
+
+def _amount1_at(L: float, p: float, p_a: float) -> float:
+    """V3 token1 amount. Clamped 0 below p_a."""
+    if p <= p_a:
+        return 0.0
+    return L * (math.sqrt(p) - math.sqrt(p_a))
+
+
+def build_grid(
+    *,
+    tick_lower: int,
+    tick_upper: int,
+    L: float,
+    p0_usd: float,
+    p1_usd: float,
+    min_leg_notional_usd: float = MIN_LEG_NOTIONAL_USD,
+) -> LevelGrid:
+    """Build a fresh LevelGrid for the given Beefy tick range and current
+    USD prices. Discretizes [p_a, p_b] adaptively: each adjacent level
+    pair must produce ≥`min_leg_notional_usd` in at least one leg.
+
+    Algorithm:
+      1. p_a, p_b from ticks via 1.0001^tick.
+      2. Walk forward from p_a in fine sub-steps; at each candidate p,
+         check |Δamount0|·p0_usd OR |Δamount1|·p1_usd ≥ floor; if yes,
+         emit the level and reset accumulator.
+      3. Always include p_b as the last level.
+
+    Capped at MAX_LEVELS to protect against pathological ranges.
+    """
+    p_a = math.pow(1.0001, tick_lower)
+    p_b = math.pow(1.0001, tick_upper)
+
+    if p_a >= p_b:
+        raise ValueError(
+            f"Invalid tick range: tick_lower={tick_lower} >= tick_upper={tick_upper}"
+        )
+
+    p_levels = [p_a]
+    amount0_at = [_amount0_at(L, p_a, p_b)]
+    amount1_at = [_amount1_at(L, p_a, p_a)]  # = 0 at p_a
+
+    sub_step = (p_b - p_a) / 10_000
+    p = p_a + sub_step
+    last_a0 = amount0_at[0]
+    last_a1 = amount1_at[0]
+
+    while p < p_b and len(p_levels) < MAX_LEVELS - 1:
+        a0 = _amount0_at(L, p, p_b)
+        a1 = _amount1_at(L, p, p_a)
+        d0_notional = abs(a0 - last_a0) * p0_usd
+        d1_notional = abs(a1 - last_a1) * p1_usd
+        if max(d0_notional, d1_notional) >= min_leg_notional_usd:
+            p_levels.append(p)
+            amount0_at.append(a0)
+            amount1_at.append(a1)
+            last_a0 = a0
+            last_a1 = a1
+        p += sub_step
+
+    p_levels.append(p_b)
+    amount0_at.append(_amount0_at(L, p_b, p_b))  # = 0
+    amount1_at.append(_amount1_at(L, p_b, p_a))
+
+    return LevelGrid(
+        p_a=p_a, p_b=p_b, L=L,
+        p_levels=p_levels,
+        amount0_at=amount0_at,
+        amount1_at=amount1_at,
+        tick_lower=tick_lower,
+        tick_upper=tick_upper,
     )
