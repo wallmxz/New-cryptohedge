@@ -1360,6 +1360,54 @@ class GridMakerEngine:
             f"(${leg_notional_usd:.2f})"
         )
 
+    async def _iterate_predictive(self) -> None:
+        """One predictive iter:
+        1. Read pool slot0 (raises PredictiveUnavailable on failure).
+        2. Map p_now → level idx via bisect.
+        3. If first iter post-rebuild (_last_level_idx None): snap, no fire.
+        4. If no level change: nothing to do.
+        5. Compute deltas with hedge_ratio applied; fire each leg
+           sequentially. Sequentially because Lighter's nonce manager
+           races on parallel signing.
+        Per spec § Per-iter logic.
+        """
+        from engine.predictive_grid import find_level_idx, compute_deltas
+
+        if self._grid is None:
+            raise PredictiveUnavailable("grid not built")
+
+        try:
+            sqrt_price_x96, _current_tick = await self._pool_reader.read_slot0()
+            p_now = (sqrt_price_x96 / 2**96) ** 2
+        except Exception as e:
+            raise PredictiveUnavailable(f"slot0 read failed: {e}")
+
+        new_idx = find_level_idx(self._grid, p_now)
+
+        if self._last_level_idx is None:
+            self._last_level_idx = new_idx
+            return  # warmup, no fire
+
+        if new_idx == self._last_level_idx:
+            return  # no level change
+
+        delta_t0, delta_t1 = compute_deltas(
+            self._grid, self._last_level_idx, new_idx,
+        )
+        delta_t0 *= self._hub.hedge_ratio
+        delta_t1 *= self._hub.hedge_ratio
+
+        # Fire sequentially: Lighter's nonce_manager races on parallel
+        # next_nonce() (server-side dedup window).
+        await self._fire_predictive_leg(
+            self._settings.dydx_symbol_token0, delta_t0,
+        )
+        await self._fire_predictive_leg(
+            self._settings.dydx_symbol_token1, delta_t1,
+        )
+
+        self._last_level_idx = new_idx
+
     async def _on_funding_payment(self, entry) -> None:
         """Handle one funding payment from the exchange.
 
