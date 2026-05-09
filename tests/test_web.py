@@ -68,3 +68,50 @@ def test_metrics_endpoint_no_auth(app):
     # The body should contain at least one of the registered metric names
     body = resp.text
     assert "bot_loop_duration_seconds" in body or "bot_margin_ratio" in body
+
+
+def test_post_baseline_updates_db(app, monkeypatch):
+    """Endpoint persists the value via db.update_operation_baseline_deposit."""
+    from unittest.mock import AsyncMock, MagicMock
+    fake_db = MagicMock()
+    fake_db.update_operation_baseline_deposit = AsyncMock(return_value=None)
+    app.state.db = fake_db
+    client = TestClient(app)
+    creds = base64.b64encode(b"admin:secret").decode()
+    resp = client.post(
+        "/operations/42/baseline",
+        json={"usd_value": 50.03},
+        headers={"Authorization": f"Basic {creds}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["success"] is True
+    assert body["baseline_deposit_usd"] == 50.03
+    fake_db.update_operation_baseline_deposit.assert_awaited_once_with(42, 50.03)
+
+
+def test_post_baseline_rejects_negative_value(app):
+    client = TestClient(app)
+    creds = base64.b64encode(b"admin:secret").decode()
+    resp = client.post(
+        "/operations/42/baseline",
+        json={"usd_value": -10.0},
+        headers={"Authorization": f"Basic {creds}"},
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["success"] is False
+    assert "positive" in body["error"].lower() or "value" in body["error"].lower()
+
+
+def test_post_baseline_rejects_missing_value(app):
+    client = TestClient(app)
+    creds = base64.b64encode(b"admin:secret").decode()
+    resp = client.post(
+        "/operations/42/baseline",
+        json={},
+        headers={"Authorization": f"Basic {creds}"},
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["success"] is False

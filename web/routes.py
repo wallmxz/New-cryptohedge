@@ -290,6 +290,60 @@ async def hedge_existing(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+async def update_operation_baseline(request: Request):
+    """POST /operations/<int:op_id>/baseline body {usd_value: float} →
+    set the cost-basis baseline used by the panel's Pool $ row. Per spec
+    2026-05-08-manual-deposit-baseline. Validates >0; persists via
+    db.update_operation_baseline_deposit (which guards on status='active').
+    """
+    if not hasattr(request.app.state, "db"):
+        return JSONResponse(
+            {"success": False, "error": "DB not available"}, status_code=503,
+        )
+    db = request.app.state.db
+    try:
+        op_id = int(request.path_params["op_id"])
+    except (KeyError, ValueError):
+        return JSONResponse(
+            {"success": False, "error": "invalid op_id"}, status_code=400,
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"success": False, "error": "Body must be JSON {usd_value: float}"},
+            status_code=400,
+        )
+    raw_value = body.get("usd_value")
+    if raw_value is None:
+        return JSONResponse(
+            {"success": False, "error": "missing usd_value"},
+            status_code=400,
+        )
+    try:
+        usd_value = float(raw_value)
+    except (TypeError, ValueError):
+        return JSONResponse(
+            {"success": False, "error": "usd_value must be a number"},
+            status_code=400,
+        )
+    if usd_value <= 0:
+        return JSONResponse(
+            {"success": False, "error": "usd_value must be positive"},
+            status_code=400,
+        )
+    try:
+        await db.update_operation_baseline_deposit(op_id, usd_value)
+    except Exception as e:
+        return JSONResponse(
+            {"success": False, "error": str(e)}, status_code=500,
+        )
+    return JSONResponse(
+        {"success": True, "baseline_deposit_usd": usd_value},
+        status_code=200,
+    )
+
+
 async def withdraw_partial(request: Request):
     """POST /operations/withdraw-partial {usd_amount?, fraction?} → burn
     proportional Beefy shares so the matching slice of the LP returns to

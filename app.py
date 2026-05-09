@@ -19,7 +19,7 @@ from web.routes import (
     dashboard, sse_state, sse_logs, update_settings, get_config,
     list_operations, get_current_operation, start_operation, stop_operation,
     preview_operation, metrics, cashout, recover_partial, withdraw_partial,
-    hedge_existing, wallet_balance, curve_preview,
+    hedge_existing, update_operation_baseline, wallet_balance, curve_preview,
     list_pairs, select_pair, refresh_pairs,
 )
 
@@ -187,6 +187,10 @@ def create_app(start_engine: bool = True) -> Starlette:
         Route("/operations/recover", recover_partial, methods=["POST"]),
         Route("/operations/withdraw-partial", withdraw_partial, methods=["POST"]),
         Route("/operations/hedge-existing", hedge_existing, methods=["POST"]),
+        Route(
+            "/operations/{op_id:int}/baseline",
+            update_operation_baseline, methods=["POST"],
+        ),
         Route("/curve", curve_preview, methods=["GET"]),
         Route("/pairs", list_pairs),
         Route("/pairs/select", select_pair, methods=["POST"]),
