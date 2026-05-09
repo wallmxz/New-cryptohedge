@@ -1087,22 +1087,20 @@ class GridMakerEngine:
             if is_dual_leg:
                 targets[symbols[1]] = my_amount1 * self._hub.hedge_ratio
 
-            # Predictive curve-grid path (spec 2026-05-08). Falls back to
-            # the reactive _maybe_rebalance_leg loop on any failure.
-            fallback_reason = None
-            try:
-                if self._grid is None or self._grid_stale():
-                    await self._refresh_grid()
-                if self._grid is not None:
-                    await self._iterate_predictive()
-                    self._hub.predictive_status = "active"
-                else:
-                    fallback_reason = "grid not built"
-            except PredictiveUnavailable as e:
-                fallback_reason = str(e)
-            except Exception as e:
-                logger.exception(f"Predictive failed unexpectedly: {e}")
-                fallback_reason = f"unexpected: {type(e).__name__}"
+            # Predictive curve-grid DISABLED (2026-05-09): the model
+            # derives L from total strategy balances via
+            # compute_l_from_value, but Beefy CLM v2 has TWO V3 positions
+            # (positionMain + positionAlt) plus idle balances + pending
+            # fees. Treating all of that as one positionMain inflates L
+            # ~3x → grid amounts at any level are completely wrong →
+            # recon fires in wrong direction (witnessed live: ETH BUY
+            # 0.0099 + ARB SELL 168 vs the actual needs).
+            #
+            # Reactive (_maybe_rebalance_leg) uses my_amount0/1 directly
+            # from beefy_pos with no L derivation — works correctly.
+            # Until predictive is redesigned to model positionAlt + idle
+            # balances explicitly, force fallback every iter.
+            fallback_reason = "predictive disabled (positionAlt unmodeled)"
 
             if fallback_reason is not None:
                 self._hub.predictive_status = f"fallback: {fallback_reason}"

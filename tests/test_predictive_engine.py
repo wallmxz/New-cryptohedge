@@ -255,6 +255,15 @@ async def test_iterate_falls_back_to_reactive_when_predictive_unavailable():
     assert eng._hub.predictive_status.startswith("fallback")
 
 
+@pytest.mark.skip(reason=(
+    "Predictive force-disabled 2026-05-09: model derives L from total "
+    "strategy balances but Beefy CLM v2 has positionMain + positionAlt "
+    "+ idle balances, so derived L is wrong by ~3x and grid amounts "
+    "are completely off. Test asserts predictive runs cleanly + sets "
+    "predictive_status='active', but engine now always falls back to "
+    "reactive. Re-enable when predictive is redesigned to model the "
+    "two-position structure."
+))
 @pytest.mark.asyncio
 async def test_iterate_does_not_double_fire_predictive_and_reactive():
     """Predictive succeeds → reactive must NOT run (hard guard)."""
