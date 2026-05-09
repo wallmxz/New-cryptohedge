@@ -90,6 +90,14 @@ class GridMakerEngine:
         # Default no-op on adapters that don't implement it.
         if self._exchange is not None:
             self._exchange.subscribe_funding(self._on_funding_payment)
+        # Predictive curve-grid (spec 2026-05-08). _grid is None until
+        # _refresh_grid() runs successfully. _last_level_idx is None
+        # immediately after a rebuild → next iter snaps without firing
+        # (warmup). _last_grid_check_at gates polling cadence.
+        self._grid = None  # type: "LevelGrid | None"
+        self._last_level_idx: int | None = None
+        self._last_grid_check_at: float = 0.0
+        self._GRID_CHECK_INTERVAL_S = 60.0
 
     def _ensure_reconciler(self):
         if self._reconciler is None and self._exchange is not None:
@@ -1105,6 +1113,95 @@ class GridMakerEngine:
             return await self._exchange.get_collateral()
         except Exception:
             return None
+
+    def _grid_stale(self) -> bool:
+        """True if it's time to re-poll Beefy strategy.positionMain() to
+        check for tick range change. Polling cadence
+        self._GRID_CHECK_INTERVAL_S (60 s by default).
+        """
+        return (
+            time.monotonic() - self._last_grid_check_at
+        ) > self._GRID_CHECK_INTERVAL_S
+
+    async def _refresh_grid(self) -> None:
+        """Polls Beefy + rebuilds grid if tick range changed.
+
+        Atomic on failure: keeps existing self._grid intact, just bumps
+        the check timestamp so we don't retry-storm. Resets
+        self._last_level_idx to None on a real rebuild → next iter snaps
+        (no spurious fire). Per spec § Re-grid.
+        """
+        from engine.predictive_grid import build_grid
+        from engine.curve import compute_l_from_value
+
+        try:
+            position_main = await (
+                self._beefy_reader._strategy.functions.positionMain().call()
+            )
+            new_lower = int(position_main[0][0])
+            new_upper = int(position_main[0][1])
+        except Exception as e:
+            logger.warning(f"_refresh_grid: positionMain() failed: {e}")
+            self._last_grid_check_at = time.monotonic()  # avoid retry storm
+            return
+
+        self._last_grid_check_at = time.monotonic()
+
+        if (self._grid is not None
+                and self._grid.tick_lower == new_lower
+                and self._grid.tick_upper == new_upper):
+            return  # cached grid is current
+
+        # Rebuild needed. Need L = compute_l_from_value(my_value_t1, p_a, p_b, p_now).
+        try:
+            beefy_pos = await self._beefy_reader.read_position()
+            my_amount0 = beefy_pos.amount0 * beefy_pos.share
+            my_amount1 = beefy_pos.amount1 * beefy_pos.share
+            sqrt_price_x96, _current_tick = await self._pool_reader.read_slot0()
+            p_now = (sqrt_price_x96 / 2**96) ** 2
+        except Exception as e:
+            logger.warning(f"_refresh_grid: chain read failed: {e}")
+            return
+
+        my_value_t1 = my_amount0 * p_now + my_amount1
+        if my_value_t1 <= 0:
+            logger.warning("_refresh_grid: my_value_t1 <= 0, skipping build")
+            return
+
+        import math
+        p_a = math.pow(1.0001, new_lower)
+        p_b = math.pow(1.0001, new_upper)
+        # L_user requires p inside [p_a, p_b]. If OOR, fall back to the
+        # closer boundary as p for the L solve.
+        p_for_l = max(p_a, min(p_b, p_now))
+        try:
+            L_user = compute_l_from_value(my_value_t1, p_a, p_b, p_for_l)
+        except Exception as e:
+            logger.warning(f"_refresh_grid: compute_l_from_value failed: {e}")
+            return
+
+        try:
+            new_grid = build_grid(
+                tick_lower=new_lower, tick_upper=new_upper,
+                L=L_user,
+                p0_usd=self._hub.token0_usd_price or 1.0,
+                p1_usd=self._hub.token1_usd_price or 1.0,
+                min_leg_notional_usd=self._settings.min_rebalance_notional_usd,
+            )
+        except Exception as e:
+            logger.exception(f"_refresh_grid: build_grid failed: {e}")
+            return
+
+        old_range = (
+            (self._grid.tick_lower, self._grid.tick_upper)
+            if self._grid else None
+        )
+        self._grid = new_grid
+        self._last_level_idx = None
+        logger.info(
+            f"Grid rebuilt: range {old_range} → ({new_lower}, {new_upper}), "
+            f"{len(new_grid.p_levels)} levels"
+        )
 
     async def resolve_market_ids_for_funding(self) -> None:
         """Resolve the market_index for token0 and token1 perp symbols.
