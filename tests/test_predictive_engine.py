@@ -183,3 +183,94 @@ async def test_iterate_predictive_raises_when_slot0_fails():
     eng._pool_reader.read_slot0 = AsyncMock(side_effect=RuntimeError("RPC down"))
     with pytest.raises(PredictiveUnavailable):
         await eng._iterate_predictive()
+
+
+@pytest.mark.asyncio
+async def test_iterate_falls_back_to_reactive_when_predictive_unavailable():
+    """When _iterate_predictive raises PredictiveUnavailable, _iterate runs
+    the reactive _maybe_rebalance_leg path."""
+    eng, exchange = _engine_with_book()
+    eng._grid = None  # forces _iterate_predictive to raise
+
+    # Use tick range that puts p_now=0.000375 in-range (same range as other
+    # predictive tests: -81121/-76012 yields p_a~3e-4, p_b~5e-4).
+    eng._pool_reader.read_price = AsyncMock(return_value=0.000375)
+    eng._beefy_reader.read_position = AsyncMock(return_value=MagicMock(
+        tick_lower=-81121, tick_upper=-76012,
+        amount0=0.01, amount1=10.0, share=1.0, raw_balance=10**18,
+    ))
+    exchange.get_collateral = AsyncMock(return_value=130.0)
+    exchange.get_position = AsyncMock(return_value=None)
+    exchange.get_market_meta = AsyncMock(return_value=MagicMock(min_notional=10.0))
+    exchange.get_oracle_prices = AsyncMock(return_value={"ETH-USD": 2300.0, "ARB-USD": 0.13})
+    exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+    eng._db.get_active_grid_orders = AsyncMock(return_value=[])
+    eng._db.get_operation = AsyncMock(return_value=None)
+    eng._db.add_to_operation_accumulator = AsyncMock()
+    # _refresh_grid would normally run; stub it so no rebuild attempts
+    eng._beefy_reader._strategy.functions.positionMain = MagicMock(
+        return_value=MagicMock(
+            call=AsyncMock(side_effect=RuntimeError("simulated")),
+        )
+    )
+
+    # Spy on reactive
+    rebalance_spy_called = []
+    original_rebalance = eng._maybe_rebalance_leg
+    async def spy(**kwargs):
+        rebalance_spy_called.append(kwargs.get("symbol"))
+        return await original_rebalance(**kwargs)
+    eng._maybe_rebalance_leg = spy
+
+    await eng._iterate()
+    # At least one symbol got a reactive rebalance check
+    assert len(rebalance_spy_called) >= 1
+    assert eng._hub.predictive_status.startswith("fallback")
+
+
+@pytest.mark.asyncio
+async def test_iterate_does_not_double_fire_predictive_and_reactive():
+    """Predictive succeeds → reactive must NOT run (hard guard)."""
+    from engine.predictive_grid import build_grid
+    eng, exchange = _engine_with_book()
+    eng._grid = build_grid(
+        tick_lower=-81121, tick_upper=-76012,
+        L=100.0, p0_usd=2300.0, p1_usd=0.13,
+        min_leg_notional_usd=0.50,
+    )
+    eng._last_level_idx = 5
+
+    # Pool returns p in same range → no level change → predictive runs cleanly
+    import math
+    sqrt_p_x96 = int(math.sqrt(eng._grid.p_levels[5]) * 2**96)
+    eng._pool_reader.read_slot0 = AsyncMock(return_value=(sqrt_p_x96, -78500))
+
+    # Skip refresh
+    eng._last_grid_check_at = __import__("time").monotonic()
+
+    # Setup reactive path stubs to detect calls
+    eng._beefy_reader.read_position = AsyncMock(return_value=MagicMock(
+        tick_lower=-81121, tick_upper=-76012,
+        amount0=0.01, amount1=100.0, share=1.0, raw_balance=10**18,
+    ))
+    eng._pool_reader.read_price = AsyncMock(return_value=0.000375)
+    exchange.get_collateral = AsyncMock(return_value=130.0)
+    exchange.get_position = AsyncMock(return_value=None)
+    exchange.get_market_meta = AsyncMock(return_value=MagicMock(min_notional=10.0))
+    exchange.get_oracle_prices = AsyncMock(return_value={"ETH-USD": 2300.0, "ARB-USD": 0.13})
+    exchange.get_open_orders_cloids = AsyncMock(return_value=[])
+    eng._db.get_active_grid_orders = AsyncMock(return_value=[])
+    eng._db.get_operation = AsyncMock(return_value=None)
+    eng._db.add_to_operation_accumulator = AsyncMock()
+
+    rebalance_spy_called = []
+    original_rebalance = eng._maybe_rebalance_leg
+    async def spy(**kwargs):
+        rebalance_spy_called.append(kwargs.get("symbol"))
+        return await original_rebalance(**kwargs)
+    eng._maybe_rebalance_leg = spy
+
+    await eng._iterate()
+    # Predictive ran cleanly → reactive must NOT have been called
+    assert rebalance_spy_called == []
+    assert eng._hub.predictive_status == "active"

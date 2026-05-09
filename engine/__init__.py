@@ -1087,18 +1087,37 @@ class GridMakerEngine:
             if is_dual_leg:
                 targets[symbols[1]] = my_amount1 * self._hub.hedge_ratio
 
-            # Fire rebalance per leg
-            for sym in symbols:
-                idx = symbols.index(sym)
-                current = abs(positions[idx].size) if positions[idx] else 0.0
-                ref_price = oracle_prices.get(sym, 0.0)
-                if ref_price <= 0:
-                    continue
-                await self._maybe_rebalance_leg(
-                    symbol=sym, target=targets[sym], current=current,
-                    min_notional=self._settings.min_rebalance_notional_usd,
-                    ref_price=ref_price,
-                )
+            # Predictive curve-grid path (spec 2026-05-08). Falls back to
+            # the reactive _maybe_rebalance_leg loop on any failure.
+            fallback_reason = None
+            try:
+                if self._grid is None or self._grid_stale():
+                    await self._refresh_grid()
+                if self._grid is not None:
+                    await self._iterate_predictive()
+                    self._hub.predictive_status = "active"
+                else:
+                    fallback_reason = "grid not built"
+            except PredictiveUnavailable as e:
+                fallback_reason = str(e)
+            except Exception as e:
+                logger.exception(f"Predictive failed unexpectedly: {e}")
+                fallback_reason = f"unexpected: {type(e).__name__}"
+
+            if fallback_reason is not None:
+                self._hub.predictive_status = f"fallback: {fallback_reason}"
+                # Fire rebalance per leg via reactive engine (legacy path)
+                for sym in symbols:
+                    idx = symbols.index(sym)
+                    current = abs(positions[idx].size) if positions[idx] else 0.0
+                    ref_price = oracle_prices.get(sym, 0.0)
+                    if ref_price <= 0:
+                        continue
+                    await self._maybe_rebalance_leg(
+                        symbol=sym, target=targets[sym], current=current,
+                        min_notional=self._settings.min_rebalance_notional_usd,
+                        ref_price=ref_price,
+                    )
         finally:
             timings["total"] = (time.monotonic() - iter_start) * 1000
             metrics.loop_duration.labels(step="total").observe(timings["total"] / 1000)
