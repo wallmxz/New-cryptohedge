@@ -24,7 +24,10 @@ echo [3/4] Aguardando boot (8s)...
 timeout /t 8 /nobreak >nul
 
 echo [4/4] Abrindo dashboard no browser...
-start "" "http://admin:Wallace1@127.0.0.1:8000/"
+REM URL sem creds embedded — browsers modernos bloqueiam fetch() de
+REM URLs com username:password (causa TypeError no /curve da UI).
+REM Browser vai pedir login: admin / Wallace1
+start "" "http://127.0.0.1:8000/"
 
 echo.
 echo ========================================================

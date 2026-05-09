@@ -1387,11 +1387,13 @@ class GridMakerEngine:
         1. Read pool slot0 (raises PredictiveUnavailable on failure).
         2. Map p_now → level idx via bisect.
         3. If first iter post-rebuild (_last_level_idx None): snap, no fire.
-        4. If no level change: nothing to do.
-        5. Compute deltas with hedge_ratio applied; fire each leg
-           sequentially. Sequentially because Lighter's nonce manager
-           races on parallel signing.
-        Per spec § Per-iter logic.
+        4. On level change: fire incremental delta per leg.
+        5. ALWAYS: reconcile against absolute target (catches warmup
+           baseline mismatch, residuals from reactive fires, manual
+           interference, missed fires). Recon delta uses the same
+           per-leg fire path → same $0.50 floor in
+           _fire_predictive_leg, so sub-floor drifts skip silently.
+        Per spec § Per-iter logic + reconciliation patch (2026-05-09).
         """
         from engine.predictive_grid import find_level_idx, compute_deltas
 
@@ -1408,27 +1410,52 @@ class GridMakerEngine:
 
         if self._last_level_idx is None:
             self._last_level_idx = new_idx
-            return  # warmup, no fire
+            return  # warmup, no fire — recon ALSO skipped this iter
 
-        if new_idx == self._last_level_idx:
-            return  # no level change
+        sym_t0 = self._settings.dydx_symbol_token0
+        sym_t1 = self._settings.dydx_symbol_token1
 
-        delta_t0, delta_t1 = compute_deltas(
-            self._grid, self._last_level_idx, new_idx,
-        )
-        delta_t0 *= self._hub.hedge_ratio
-        delta_t1 *= self._hub.hedge_ratio
+        # ---- Per-level incremental fires (only on level change) ----
+        if new_idx != self._last_level_idx:
+            delta_t0, delta_t1 = compute_deltas(
+                self._grid, self._last_level_idx, new_idx,
+            )
+            delta_t0 *= self._hub.hedge_ratio
+            delta_t1 *= self._hub.hedge_ratio
+            # Sequential — Lighter nonce_manager races on parallel.
+            await self._fire_predictive_leg(sym_t0, delta_t0)
+            await self._fire_predictive_leg(sym_t1, delta_t1)
+            self._last_level_idx = new_idx
 
-        # Fire sequentially: Lighter's nonce_manager races on parallel
-        # next_nonce() (server-side dedup window).
-        await self._fire_predictive_leg(
-            self._settings.dydx_symbol_token0, delta_t0,
-        )
-        await self._fire_predictive_leg(
-            self._settings.dydx_symbol_token1, delta_t1,
-        )
-
-        self._last_level_idx = new_idx
+        # ---- Absolute reconciliation (every iter) ----
+        # The per-level deltas above only track INCREMENTAL changes. If
+        # the bot's actual short doesn't match what the grid expects at
+        # the current level (because of warmup baseline mismatch, prior
+        # reactive fallback fires, manual close/open by the user, or
+        # partial fills), the offset persists indefinitely without this.
+        # Recon compares amount_at_level × hedge_ratio (the absolute
+        # target) to the actual short and fires the diff. _fire_predictive_leg's
+        # internal $0.50 floor (settings.min_rebalance_notional_usd)
+        # gates whether the recon fire actually goes — sub-floor drift
+        # accumulates until the next level crossing absorbs it.
+        target_t0 = self._grid.amount0_at[new_idx] * self._hub.hedge_ratio
+        target_t1 = self._grid.amount1_at[new_idx] * self._hub.hedge_ratio
+        pos_t0 = await self._safe_get_position(sym_t0)
+        pos_t1 = await self._safe_get_position(sym_t1)
+        current_t0 = abs(pos_t0.size) if pos_t0 else 0.0
+        current_t1 = abs(pos_t1.size) if pos_t1 else 0.0
+        recon_delta_t0 = target_t0 - current_t0
+        recon_delta_t1 = target_t1 - current_t1
+        try:
+            await self._fire_predictive_leg(sym_t0, recon_delta_t0)
+            await self._fire_predictive_leg(sym_t1, recon_delta_t1)
+        except PredictiveUnavailable:
+            # Book empty during recon — let reactive fallback take over
+            # next iter. Don't raise here because per-level fires above
+            # may have already succeeded; raising would trigger the
+            # _iterate try/except and run reactive on top of predictive's
+            # per-level fires (double-hedge). Silent recovery instead.
+            logger.debug("Recon: book empty, skipping this iter")
 
     async def _on_funding_payment(self, entry) -> None:
         """Handle one funding payment from the exchange.
