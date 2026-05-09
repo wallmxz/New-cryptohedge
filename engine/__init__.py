@@ -1309,6 +1309,57 @@ class GridMakerEngine:
             (self._cloid_seq & 0xFF)
         )
 
+    async def _fire_predictive_leg(
+        self, symbol: str, delta: float,
+    ) -> None:
+        """Place a taker order at the current bid (sell) or ask (buy) for
+        a per-leg `delta`. Skips silently if leg notional < $0.50.
+        Raises PredictiveUnavailable if the book has no entry for this
+        market. Per spec § Per-leg fire.
+        """
+        if abs(delta) < 1e-12:
+            return
+
+        side = "sell" if delta > 0 else "buy"
+        size = abs(delta)
+
+        # Reuse market_id resolved by the funding-handler wiring (a571603).
+        if symbol == self._settings.dydx_symbol_token0:
+            market_id = self._token0_mid
+        elif symbol == self._settings.dydx_symbol_token1:
+            market_id = self._token1_mid
+        else:
+            market_id = None
+        if market_id is None:
+            raise PredictiveUnavailable(
+                f"market_id unresolved for {symbol}"
+            )
+
+        book = getattr(self._exchange, "_ws_book_top", {}).get(market_id)
+        if not book or not book.get("best_bid") or not book.get("best_ask"):
+            raise PredictiveUnavailable(
+                f"book empty for {symbol} (mid={market_id})"
+            )
+
+        price = book["best_bid"] if side == "sell" else book["best_ask"]
+        leg_notional_usd = size * price
+        if leg_notional_usd < self._settings.min_rebalance_notional_usd:
+            logger.debug(
+                f"Predictive: skip {symbol} leg, "
+                f"${leg_notional_usd:.4f} < ${self._settings.min_rebalance_notional_usd:.2f}"
+            )
+            return
+
+        cloid = self._next_cloid_for_leg(symbol)
+        await self._exchange.place_long_term_order(
+            symbol=symbol, side=side, size=size, price=price,
+            cloid_int=cloid, ttl_seconds=60,
+        )
+        logger.info(
+            f"Predictive fire [{symbol}]: {side} {size:.6f} @ {price:.6f} "
+            f"(${leg_notional_usd:.2f})"
+        )
+
     async def _on_funding_payment(self, entry) -> None:
         """Handle one funding payment from the exchange.
 
