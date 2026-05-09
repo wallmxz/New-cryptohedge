@@ -22,6 +22,8 @@ function dashboard() {
             operation_pnl_breakdown: {},
             baselineModal: false,
             baselineInput: "",
+            pnlWindowModal: false,
+            pnlWindowInput: "",
             last_iter_timings: {},
             wallet_eth_balance: 0,
             weth_balance: 0,
@@ -452,6 +454,71 @@ function dashboard() {
                 }
             } catch (e) {
                 alert(`Erro ao salvar baseline: ${e}`);
+            }
+        },
+
+        editPnlWindow() {
+            // Pre-fill with current value (or empty if not set).
+            // datetime-local format: "YYYY-MM-DDTHH:mm" (no seconds, no TZ).
+            const cur = this.state.operation_pnl_breakdown?.pnl_window_since_ts;
+            if (cur) {
+                const d = new Date(cur * 1000);
+                // Convert to local datetime-local format
+                const pad = n => String(n).padStart(2, "0");
+                this.pnlWindowInput =
+                    `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}` +
+                    `T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+            } else {
+                this.pnlWindowInput = "";
+            }
+            this.pnlWindowModal = true;
+        },
+
+        async savePnlWindow() {
+            const opId = this.state.current_operation_id;
+            if (!opId || !this.pnlWindowInput) return;
+            // datetime-local string is interpreted as LOCAL time by Date()
+            const ts = new Date(this.pnlWindowInput).getTime() / 1000;
+            if (!(ts > 0)) {
+                alert("Data inválida");
+                return;
+            }
+            try {
+                const resp = await fetch(`/operations/${opId}/pnl-window`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ since_ts: ts }),
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    this.pnlWindowModal = false;
+                    this.pnlWindowInput = "";
+                } else {
+                    alert(`Erro ao salvar janela: ${data.error || resp.status}`);
+                }
+            } catch (e) {
+                alert(`Erro ao salvar janela: ${e}`);
+            }
+        },
+
+        async clearPnlWindow() {
+            const opId = this.state.current_operation_id;
+            if (!opId) return;
+            try {
+                const resp = await fetch(`/operations/${opId}/pnl-window`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ since_ts: null }),
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    this.pnlWindowModal = false;
+                    this.pnlWindowInput = "";
+                } else {
+                    alert(`Erro ao limpar janela: ${data.error || resp.status}`);
+                }
+            } catch (e) {
+                alert(`Erro ao limpar janela: ${e}`);
             }
         },
 

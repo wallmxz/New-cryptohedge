@@ -131,6 +131,9 @@ def compute_operation_pnl(
         "beefy_perf_fee": beefy_perf,
         "pool_dollar": round(pool_dollar, 4),
         "baseline_deposit_usd": op.baseline_deposit_usd,
+        # User-selected Hedge PnL window (2026-05-09). None → engine
+        # uses op.started_at as the since_ts for get_trade_pnl_since.
+        "pnl_window_since_ts": op.pnl_window_since_ts,
         # Alias for back-compat with any external consumer of the
         # breakdown (analytics scripts, older test fixtures).
         "il_natural": round(pool_dollar, 4),
@@ -146,9 +149,11 @@ def compute_operation_pnl(
         "bootstrap_slippage": -op.bootstrap_slippage,
     }
     # net_pnl sums only the AGGREGATE fields (not per-leg, to avoid double-counting).
-    # Exclude pool_dollar (alias duplicate of il_natural) and baseline_deposit_usd
-    # (metadata string/None, not a P&L delta).
-    _excluded_from_net = {"pool_dollar", "baseline_deposit_usd"}
+    # Exclude pool_dollar (alias duplicate of il_natural), baseline_deposit_usd
+    # and pnl_window_since_ts (both metadata, can be None — not P&L deltas).
+    _excluded_from_net = {
+        "pool_dollar", "baseline_deposit_usd", "pnl_window_since_ts",
+    }
     breakdown["net_pnl"] = sum(
         v for k, v in breakdown.items()
         if not (k.endswith("_token0") or k.endswith("_token1"))

@@ -197,6 +197,19 @@ class Database:
         except aiosqlite.OperationalError:
             pass  # already added
 
+        # User-selectable Hedge PnL window (2026-05-09).
+        # NULL → engine uses op.started_at (legacy). When set,
+        # get_trade_pnl_since uses this timestamp instead, so the user
+        # can measure perp PnL "since I clicked Aplicar" rather than
+        # "since op start".
+        try:
+            await self._conn.execute(
+                "ALTER TABLE operations ADD COLUMN pnl_window_since_ts REAL"
+            )
+            await self._conn.commit()
+        except aiosqlite.OperationalError:
+            pass
+
         try:
             await self._conn.execute(
                 "ALTER TABLE beefy_pairs_cache ADD COLUMN dydx_perp_token1 TEXT"
@@ -522,6 +535,23 @@ class Database:
             "UPDATE operations SET baseline_deposit_usd = ? "
             "WHERE id = ? AND status = 'active'",
             (usd_value, op_id),
+        )
+        await self._conn.commit()
+
+    async def update_pnl_window_since_ts(
+        self, op_id: int, since_ts: float | None,
+    ) -> None:
+        """Persist the user-selected window start for Hedge PnL on an
+        ACTIVE operation. NULL clears (engine falls back to op.started_at).
+
+        Per spec 2026-05-09: lets user say 'measure Hedge PnL from this
+        moment forward' instead of always using op.started_at. Used by
+        POST /operations/<id>/pnl-window.
+        """
+        await self._conn.execute(
+            "UPDATE operations SET pnl_window_since_ts = ? "
+            "WHERE id = ? AND status = 'active'",
+            (since_ts, op_id),
         )
         await self._conn.commit()
 

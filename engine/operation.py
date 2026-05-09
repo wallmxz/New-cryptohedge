@@ -60,6 +60,10 @@ class Operation:
     # Manual deposit baseline (2026-05-08): user-set USD cost basis.
     # When None, panel falls back to HODL formula (legacy behavior).
     baseline_deposit_usd: float | None = None
+    # User-selectable Hedge PnL window (2026-05-09): unix timestamp.
+    # When set, get_trade_pnl_since uses this instead of started_at.
+    # Lets user say "measure my hedge from this moment forward".
+    pnl_window_since_ts: float | None = None
 
     def is_active(self) -> bool:
         return self.state in (
@@ -97,4 +101,5 @@ class Operation:
             funding_paid_token0=row.get("funding_paid_token0", 0.0) or 0.0,
             funding_paid_token1=row.get("funding_paid_token1", 0.0) or 0.0,
             baseline_deposit_usd=row.get("baseline_deposit_usd"),
+            pnl_window_since_ts=row.get("pnl_window_since_ts"),
         )

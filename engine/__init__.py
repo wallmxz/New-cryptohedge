@@ -1015,13 +1015,23 @@ class GridMakerEngine:
                         op = Operation.from_db_row(op_row)
 
                         # Authoritative venue-side hedge_pnl since op.started_at
-                        # (overrides in-memory accumulator that resets on uvicorn
-                        # restart). None = fall back.
+                        # (or user-selected pnl_window_since_ts if set, see
+                        # spec 2026-05-09). Overrides in-memory accumulator
+                        # that resets on uvicorn restart. None = fall back.
                         hedge_pnl_override = None
                         try:
                             op_started_at = float(op_row.get("started_at") or 0)
                         except Exception:
                             op_started_at = 0.0
+                        # User-selectable window: if set, use it instead of
+                        # op.started_at. Lets user pick "since 14:00" rather
+                        # than always since op start.
+                        try:
+                            window_since = op_row.get("pnl_window_since_ts")
+                            if window_since is not None and float(window_since) > 0:
+                                op_started_at = float(window_since)
+                        except Exception:
+                            pass
                         if op_started_at > 0:
                             try:
                                 getter = getattr(

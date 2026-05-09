@@ -65,6 +65,21 @@
                 ✏️ Editar
             </button>
         </div>
+        <div class="mt-2 flex items-center gap-2 text-xs text-slate-500">
+            <span x-show="state.operation_pnl_breakdown?.pnl_window_since_ts">
+                Hedge PnL desde:
+                <span class="font-mono"
+                      x-text="new Date((state.operation_pnl_breakdown.pnl_window_since_ts || 0) * 1000).toLocaleString('pt-BR')"></span>
+            </span>
+            <span x-show="!state.operation_pnl_breakdown?.pnl_window_since_ts"
+                  class="italic">
+                Hedge PnL: desde início da operação
+            </span>
+            <button @click="editPnlWindow()"
+                    class="ml-auto text-xs px-2 py-1 rounded bg-slate-100 hover:bg-slate-200">
+                🕒 Janela
+            </button>
+        </div>
     </div>
 
     <div class="flex justify-end mt-3 gap-2">
@@ -110,6 +125,41 @@
       </button>
       <button @click="saveBaseline()"
               :disabled="!baselineInput || parseFloat(baselineInput) <= 0"
+              class="text-xs px-3 py-1 rounded bg-emerald-600 text-white disabled:opacity-50">
+        Aplicar
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Janela do Hedge PnL (datetime picker) -->
+<div x-show="pnlWindowModal"
+     x-cloak
+     class="fixed inset-0 z-50 flex items-center justify-center bg-black/30">
+  <div class="bg-white rounded-lg shadow-lg p-4 w-96">
+    <h3 class="font-semibold mb-2">Janela do Hedge PnL</h3>
+    <p class="text-xs text-slate-500 mb-2">
+      Selecione a partir de quando medir o Hedge PnL (consulta a Lighter
+      account.pnl). Deixe vazio para usar o início da operação.
+      <br/><span class="italic">Atual:</span>
+      <span x-text="state.operation_pnl_breakdown?.pnl_window_since_ts
+                    ? new Date(state.operation_pnl_breakdown.pnl_window_since_ts * 1000).toLocaleString('pt-BR')
+                    : 'desde início da operação'"></span>
+    </p>
+    <input type="datetime-local"
+           class="w-full border rounded px-2 py-1 text-sm"
+           x-model="pnlWindowInput" />
+    <div class="flex justify-end gap-2 mt-3">
+      <button @click="pnlWindowModal = false"
+              class="text-xs px-3 py-1 rounded bg-slate-100">
+        Cancelar
+      </button>
+      <button @click="clearPnlWindow()"
+              class="text-xs px-3 py-1 rounded bg-amber-100 text-amber-700">
+        Limpar (usar op start)
+      </button>
+      <button @click="savePnlWindow()"
+              :disabled="!pnlWindowInput"
               class="text-xs px-3 py-1 rounded bg-emerald-600 text-white disabled:opacity-50">
         Aplicar
       </button>

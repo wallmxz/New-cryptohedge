@@ -344,6 +344,63 @@ async def update_operation_baseline(request: Request):
     )
 
 
+async def update_pnl_window(request: Request):
+    """POST /operations/<int:op_id>/pnl-window body {since_ts: float|null} →
+    set the user-selected window start for Hedge PnL. Per spec 2026-05-09:
+    when set, get_trade_pnl_since uses this timestamp instead of
+    op.started_at. Pass null to clear (revert to op.started_at).
+    """
+    if not hasattr(request.app.state, "db"):
+        return JSONResponse(
+            {"success": False, "error": "DB not available"}, status_code=503,
+        )
+    db = request.app.state.db
+    try:
+        op_id = int(request.path_params["op_id"])
+    except (KeyError, ValueError):
+        return JSONResponse(
+            {"success": False, "error": "invalid op_id"}, status_code=400,
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"success": False, "error": "Body must be JSON {since_ts: float|null}"},
+            status_code=400,
+        )
+    raw_value = body.get("since_ts", "_missing_")
+    if raw_value == "_missing_":
+        return JSONResponse(
+            {"success": False, "error": "missing since_ts (use null to clear)"},
+            status_code=400,
+        )
+    if raw_value is None:
+        since_ts = None
+    else:
+        try:
+            since_ts = float(raw_value)
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"success": False, "error": "since_ts must be a number or null"},
+                status_code=400,
+            )
+        if since_ts <= 0:
+            return JSONResponse(
+                {"success": False, "error": "since_ts must be positive"},
+                status_code=400,
+            )
+    try:
+        await db.update_pnl_window_since_ts(op_id, since_ts)
+    except Exception as e:
+        return JSONResponse(
+            {"success": False, "error": str(e)}, status_code=500,
+        )
+    return JSONResponse(
+        {"success": True, "pnl_window_since_ts": since_ts},
+        status_code=200,
+    )
+
+
 async def withdraw_partial(request: Request):
     """POST /operations/withdraw-partial {usd_amount?, fraction?} → burn
     proportional Beefy shares so the matching slice of the LP returns to

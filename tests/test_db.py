@@ -235,3 +235,55 @@ async def test_update_operation_baseline_deposit_only_writes_when_active(db):
     await db.update_operation_baseline_deposit(op_id, 99.99)
     op = await db.get_operation(op_id)
     assert op["baseline_deposit_usd"] is None
+
+
+async def test_update_pnl_window_since_ts_persists(db):
+    op_id = await db.insert_operation(
+        started_at=1700000000.0,
+        status="pending",
+        baseline_eth_price=2000.0,
+        baseline_pool_value_usd=50.0,
+        baseline_amount0=0.01,
+        baseline_amount1=100.0,
+        baseline_collateral=100.0,
+    )
+    await db.update_operation_status(op_id, "active")
+    await db.update_pnl_window_since_ts(op_id, 1700001234.5)
+    op = await db.get_operation(op_id)
+    assert op["pnl_window_since_ts"] == 1700001234.5
+
+
+async def test_update_pnl_window_since_ts_clears_with_none(db):
+    op_id = await db.insert_operation(
+        started_at=1700000000.0,
+        status="pending",
+        baseline_eth_price=2000.0,
+        baseline_pool_value_usd=50.0,
+        baseline_amount0=0.01,
+        baseline_amount1=100.0,
+        baseline_collateral=100.0,
+    )
+    await db.update_operation_status(op_id, "active")
+    await db.update_pnl_window_since_ts(op_id, 1700001234.5)
+    await db.update_pnl_window_since_ts(op_id, None)
+    op = await db.get_operation(op_id)
+    assert op["pnl_window_since_ts"] is None
+
+
+async def test_update_pnl_window_since_ts_only_writes_when_active(db):
+    op_id = await db.insert_operation(
+        started_at=1700000000.0,
+        status="pending",
+        baseline_eth_price=2000.0,
+        baseline_pool_value_usd=50.0,
+        baseline_amount0=0.01,
+        baseline_amount1=100.0,
+        baseline_collateral=100.0,
+    )
+    await db.close_operation(
+        op_id, ended_at=1700001000.0, final_net_pnl=0.0, close_reason="test",
+    )
+    await db.update_pnl_window_since_ts(op_id, 1700001234.5)
+    op = await db.get_operation(op_id)
+    assert op["pnl_window_since_ts"] is None  # closed → no-op
+
