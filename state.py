@@ -69,6 +69,12 @@ class StateHub:
     #         "fallback: <reason>". Surfaces in dashboard.
     predictive_status: str = "idle"
 
+    # Hedge model status (predictive hedge model spec 2026-05-10).
+    # Values: "warming_up", "active", "verify_diverging:<pct>%".
+    # Surfaces in dashboard. Forward-compat field added in T5; T6
+    # formalizes alongside removal of predictive_status.
+    hedge_model_status: str = "warming_up"
+
     # Live USD prices for the active pair's tokens (from exchange oracle —
     # WS midpoint on Lighter). The dashboard uses these to USD-format
     # the wallet residual balance, the LP curve preview, etc. Without

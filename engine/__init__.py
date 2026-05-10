@@ -1112,35 +1112,51 @@ class GridMakerEngine:
             if is_dual_leg:
                 targets[symbols[1]] = my_amount1 * self._hub.hedge_ratio
 
-            # Predictive curve-grid DISABLED (2026-05-09): the model
-            # derives L from total strategy balances via
-            # compute_l_from_value, but Beefy CLM v2 has TWO V3 positions
-            # (positionMain + positionAlt) plus idle balances + pending
-            # fees. Treating all of that as one positionMain inflates L
-            # ~3x → grid amounts at any level are completely wrong →
-            # recon fires in wrong direction (witnessed live: ETH BUY
-            # 0.0099 + ARB SELL 168 vs the actual needs).
-            #
-            # Reactive (_maybe_rebalance_leg) uses my_amount0/1 directly
-            # from beefy_pos with no L derivation — works correctly.
-            # Until predictive is redesigned to model positionAlt + idle
-            # balances explicitly, force fallback every iter.
-            fallback_reason = "predictive disabled (positionAlt unmodeled)"
+            # Predictive hedge model (spec 2026-05-10). Compute predicted
+            # target via V3 formula with cached L_main + L_alt. Verify
+            # vs Beefy actual; use ACTUAL as the authoritative target
+            # (predicted is informational + drives status field).
+            predicted = None
+            if self._hedge_model is not None:
+                # Trigger async refresh if cache stale or pending — does
+                # NOT await, so iter is never blocked by RPC.
+                if self._hedge_model.should_refresh():
+                    asyncio.create_task(self._hedge_model.refresh_cache())
+                # Predict (returns None if cache cold)
+                predicted = self._hedge_model.predict(
+                    p_now,
+                    decimals0=self._decimals0,
+                    decimals1=self._decimals1,
+                )
 
-            if fallback_reason is not None:
-                self._hub.predictive_status = f"fallback: {fallback_reason}"
-                # Fire rebalance per leg via reactive engine (legacy path)
-                for sym in symbols:
-                    idx = symbols.index(sym)
-                    current = abs(positions[idx].size) if positions[idx] else 0.0
-                    ref_price = oracle_prices.get(sym, 0.0)
-                    if ref_price <= 0:
-                        continue
-                    await self._maybe_rebalance_leg(
-                        symbol=sym, target=targets[sym], current=current,
-                        min_notional=self._settings.min_rebalance_notional_usd,
-                        ref_price=ref_price,
-                    )
+            # Verify (informational; sets _refresh_pending if diverging)
+            if predicted is not None:
+                actual_total = (beefy_pos.amount0, beefy_pos.amount1)
+                div = self._hedge_model.verify(
+                    predicted=predicted, actual=actual_total,
+                )
+                self._hub.hedge_model_status = (
+                    "active" if div <= 0.01
+                    else f"verify_diverging:{div * 100:.1f}%"
+                )
+            else:
+                self._hub.hedge_model_status = "warming_up"
+
+            # Always fire per leg via _maybe_rebalance_leg (reactive path).
+            # Target = actual × share × hedge_ratio (computed above into
+            # `targets`). predicted is informational only (drives
+            # hedge_model_status field).
+            for sym in symbols:
+                idx = symbols.index(sym)
+                current = abs(positions[idx].size) if positions[idx] else 0.0
+                ref_price = oracle_prices.get(sym, 0.0)
+                if ref_price <= 0:
+                    continue
+                await self._maybe_rebalance_leg(
+                    symbol=sym, target=targets[sym], current=current,
+                    min_notional=self._settings.min_rebalance_notional_usd,
+                    ref_price=ref_price,
+                )
         finally:
             timings["total"] = (time.monotonic() - iter_start) * 1000
             metrics.loop_duration.labels(step="total").observe(timings["total"] / 1000)
