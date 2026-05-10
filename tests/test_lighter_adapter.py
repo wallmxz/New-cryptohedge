@@ -1,0 +1,1227 @@
+"""Unit tests for LighterAdapter.
+
+The lighter SDK is mocked at sys.modules level so these run in any
+environment without needing the real package. The conftest.py already
+has a similar pattern for dydx_v4_client.
+"""
+from __future__ import annotations
+import asyncio
+import sys
+import time
+import types
+import pytest
+from unittest.mock import AsyncMock, MagicMock
+
+
+def _install_lighter_stub() -> None:
+    """Inject minimal lighter SDK stubs so `from lighter import ...` works."""
+    if "lighter" in sys.modules:
+        return  # real SDK present (CI/Linux); leave it alone
+    pkg = types.ModuleType("lighter")
+
+    class _SignerClient:
+        ORDER_TYPE_LIMIT = 0
+        ORDER_TYPE_MARKET = 1
+        ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL = 0
+        ORDER_TIME_IN_FORCE_GOOD_TILL_TIME = 1
+        ORDER_TIME_IN_FORCE_POST_ONLY = 2
+        DEFAULT_IOC_EXPIRY = 0
+        DEFAULT_28_DAY_ORDER_EXPIRY = -1
+        DEFAULT_10_MIN_AUTH_EXPIRY = 600
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            # Mimic the real SDK's nonce_manager: production code allocates
+            # (api_key_index, nonce) before each create_order to work around
+            # a missing decorator in lighter SDK 1.x.
+            self.nonce_manager = MagicMock()
+            self.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
+            self.nonce_manager.acknowledge_failure = MagicMock(return_value=None)
+            self.nonce_manager.hard_refresh_nonce = MagicMock(return_value=None)
+
+        async def get_best_price(self, market_index, is_ask, ob_orders=None):
+            return 100  # placeholder; tests will mock this
+
+        async def create_order(self, **kwargs):
+            return None, None, None
+
+        async def cancel_order(self, **kwargs):
+            return None, None, None
+
+        async def close(self):
+            pass
+
+    class _ApiClient:
+        def __init__(self, configuration=None):
+            self.configuration = configuration
+
+        async def close(self):
+            pass
+
+    class _Configuration:
+        def __init__(self, host=None):
+            self.host = host
+
+    class _OrderApi:
+        def __init__(self, api_client):
+            self.api_client = api_client
+
+        async def order_book_details(self, market_id=None):
+            return MagicMock(order_book_details=[])
+
+        async def account_active_orders(self, **kw):
+            return MagicMock(orders=[])
+
+        async def account_inactive_orders(self, **kw):
+            return MagicMock(orders=[])
+
+    class _AccountApi:
+        def __init__(self, api_client):
+            self.api_client = api_client
+
+        async def account(self, **kw):
+            return MagicMock(accounts=[])
+
+    pkg.SignerClient = _SignerClient
+    pkg.ApiClient = _ApiClient
+    pkg.Configuration = _Configuration
+    pkg.OrderApi = _OrderApi
+    pkg.AccountApi = _AccountApi
+    sys.modules["lighter"] = pkg
+
+
+_install_lighter_stub()
+
+
+from exchanges.lighter import LighterAdapter, _MarketMeta
+
+
+def _meta(symbol_user="ETH-USD", **kw):
+    """Helper to build a market metadata fixture."""
+    return _MarketMeta(
+        symbol_user=symbol_user,
+        symbol_lighter=symbol_user.split("-")[0],
+        market_index=kw.get("market_index", 0),
+        price_decimals=kw.get("price_decimals", 2),
+        size_decimals=kw.get("size_decimals", 4),
+        tick_size=kw.get("tick_size", 0.01),
+        step_size=kw.get("step_size", 0.0001),
+        min_base_amount=kw.get("min_base_amount", 0.005),
+        min_quote_amount=kw.get("min_quote_amount", 10.0),
+    )
+
+
+def _make_adapter():
+    a = LighterAdapter(
+        url="https://stub",
+        account_index=42,
+        api_private_key="0x" + "1" * 64,
+        api_key_index=1,
+    )
+    return a
+
+
+def _seed_book(a, market_index: int, bid: float, ask: float) -> None:
+    """Seed the WS top-of-book cache the way the real WS pump would after
+    a `subscribed/order_book` snapshot. Production reads from this cache
+    in `_place_long_term_order_unlocked` (no HTTP get_best_price calls).
+    Bid and ask are display-units floats (e.g., 2399.5)."""
+    import time as _t
+    a._ws_book_top[market_index] = {
+        "best_bid": bid, "best_ask": ask, "ts": _t.time(),
+    }
+
+
+def _seed_position(a, market_index: int, *, sign: int, size: float,
+                   avg_entry: float, unrealized: float = 0.0) -> None:
+    """Seed the adapter's observed-short-size + metadata caches."""
+    a._observed_short_size[market_index] = size if sign == -1 else 0.0
+    a._observed_position_meta[market_index] = {
+        "sign": sign,
+        "position": size,
+        "avg_entry_price": avg_entry,
+        "unrealized_pnl": unrealized,
+    }
+
+
+@pytest.mark.asyncio
+async def test_size_to_int_uses_market_decimals():
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta(size_decimals=4)
+    assert a._size_to_int(0.0050, a._markets["ETH-USD"]) == 50
+    assert a._size_to_int(1.2345, a._markets["ETH-USD"]) == 12345
+
+
+@pytest.mark.asyncio
+async def test_int_to_price_uses_market_decimals():
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta(price_decimals=2)
+    # 237824 → $2378.24
+    assert a._int_to_price(237824, a._markets["ETH-USD"]) == 2378.24
+
+
+@pytest.mark.asyncio
+async def test_unknown_symbol_raises():
+    a = _make_adapter()
+    with pytest.raises(KeyError, match="not in Lighter"):
+        a._market_meta_or_raise("FAKE-USD")
+
+
+@pytest.mark.asyncio
+async def test_place_order_reads_bid_for_sell_and_ask_for_buy(monkeypatch):
+    """The constraint: never use the engine's `price` arg as slippage hint —
+    always read bid (for sell) or ask (for buy) from the WS book cache."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta()
+    # Seed WS cache: bid $2399, ask $2400. price_decimals=2 in _meta().
+    _seed_book(a, 0, bid=2399.0, ask=2400.0)
+
+    # Stub signer with recording mocks
+    a._signer = MagicMock()
+    # nonce_manager.next_nonce() must return (api_key_index, nonce) tuple
+    # — production code allocates one before each create_order to work
+    # around a missing decorator in lighter SDK 1.x.
+    a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
+    a._signer.create_order = AsyncMock(return_value=(None, MagicMock(tx_hash="0xabc"), None))
+
+    # Stub _verify_fill to claim full fill
+    async def fake_verify(meta, cloid_int, expected_size):
+        return expected_size, 2399.0
+    a._verify_fill = fake_verify  # type: ignore
+
+    # SELL → should hit bid from cache
+    order = await a.place_long_term_order(
+        symbol="ETH-USD", side="sell", size=0.01,
+        price=2350.0,  # garbage hint, must be ignored
+        cloid_int=12345,
+    )
+    assert order.status == "filled"
+    # Verify the price sent to create_order is the cached bid (ticks:
+    # bid=2399 * 10^2 = 239900) — exact, no buffer. The user requires
+    # zero slippage by construction; on book-tick moves during flight
+    # the IOC will simply auto-cancel and the engine's per-leg cooldown
+    # (30s) governs when to re-fire.
+    create_kwargs = a._signer.create_order.call_args.kwargs
+    assert create_kwargs["price"] == 239900
+    assert create_kwargs["is_ask"] is True  # selling
+
+    # BUY → should hit ask, exact (no buffer above).
+    a._signer.create_order.reset_mock()
+    order = await a.place_long_term_order(
+        symbol="ETH-USD", side="buy", size=0.01,
+        price=99999.0,  # garbage
+        cloid_int=12346,
+    )
+    create_kwargs = a._signer.create_order.call_args.kwargs
+    assert create_kwargs["price"] == 240000
+    assert create_kwargs["is_ask"] is False  # buying
+
+
+@pytest.mark.asyncio
+async def test_place_order_uses_ioc_limit():
+    """Constraint: order_type=LIMIT, time_in_force=IOC. Never market order."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta()
+    _seed_book(a, 0, bid=2399.0, ask=2400.0)
+    a._signer = MagicMock()
+    a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
+    a._signer.create_order = AsyncMock(return_value=(None, MagicMock(), None))
+
+    async def fake_verify(meta, cloid_int, expected_size):
+        return expected_size, 2400.0
+    a._verify_fill = fake_verify  # type: ignore
+
+    await a.place_long_term_order(
+        symbol="ETH-USD", side="buy", size=0.01, price=0,
+        cloid_int=999,
+    )
+    kw = a._signer.create_order.call_args.kwargs
+    # SignerClient.ORDER_TYPE_LIMIT == 0, ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL == 0
+    assert kw["order_type"] == 0
+    assert kw["time_in_force"] == 0
+
+
+@pytest.mark.asyncio
+async def test_place_order_no_retry_after_server_accept():
+    """REGRESSION: when create_order returns success (err=None) but
+    _verify_fill comes back 0, the adapter must NOT retry. Retrying
+    after a server-accept means a SECOND order on the same side, which
+    is what produced the 0.9 ETH over-hedge in the 2026-05-06 session.
+    """
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta()
+    _seed_book(a, 0, bid=2399.0, ask=2400.0)
+    a._signer = MagicMock()
+    a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
+    a._signer.create_order = AsyncMock(return_value=(None, MagicMock(), None))
+    # _verify_fill always returns 0 (book moved or stale lookup)
+    async def fake_verify(meta, cloid_int, expected_size):
+        return 0.0, 0.0
+    a._verify_fill = fake_verify  # type: ignore
+    # Position unchanged across the call — fallback inference also says
+    # "didn't fill". Adapter must return cancelled with size=0, NOT retry.
+    a.get_position = AsyncMock(return_value=None)
+
+    order = await a.place_long_term_order(
+        symbol="ETH-USD", side="buy", size=0.01, price=0,
+        cloid_int=999,
+    )
+    assert order.size == 0.0
+    assert order.status == "cancelled"
+    # Critical: only ONE create_order call, even though verify_fill=0.
+    assert a._signer.create_order.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_place_order_infers_fill_from_position_change():
+    """When verify_fill misses but get_position shows the short grew by
+    the requested size, treat as filled (don't retry, don't pretend
+    cancelled — that would make the engine fire ANOTHER order).
+    """
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta()
+    _seed_book(a, 0, bid=2399.0, ask=2400.0)
+    a._signer = MagicMock()
+    a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
+    a._signer.create_order = AsyncMock(return_value=(None, MagicMock(), None))
+    async def fake_verify(meta, cloid_int, expected_size):
+        return 0.0, 0.0  # missed
+    a._verify_fill = fake_verify  # type: ignore
+    # Pre: no position. Post: short of 0.01 ETH. Delta = 0.01 = requested.
+    pre_pos = None
+    post_pos = MagicMock(side="short", size=0.01)
+    a.get_position = AsyncMock(side_effect=[pre_pos, post_pos])
+
+    order = await a.place_long_term_order(
+        symbol="ETH-USD", side="sell", size=0.01, price=0,
+        cloid_int=999,
+    )
+    assert order.size == 0.01
+    assert order.status == "filled"
+    assert a._signer.create_order.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_size_below_step_raises():
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta(size_decimals=4, step_size=0.0001)
+    with pytest.raises(ValueError, match="below market step"):
+        await a.place_long_term_order(
+            symbol="ETH-USD", side="buy", size=1e-9, price=0, cloid_int=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_adapter_inits_expected_state_dicts():
+    """The position-truth redesign requires `_expected_short_size` and
+    `_last_fire_at` to start empty on a freshly constructed adapter.
+    Subsequent tasks stamp them on `place_long_term_order` success."""
+    a = _make_adapter()
+    assert a._expected_short_size == {}
+    assert a._last_fire_at == {}
+
+
+@pytest.mark.asyncio
+async def test_place_order_stamps_expected_on_server_accept():
+    """When create_order returns err=None, _expected_short_size must be
+    stamped with the order size — even if _verify_fill returns 0. This
+    is the regression test for the 2026-05-07 over-hedge incidents.
+    Sell increments; buy decrements (clamp at 0)."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta()
+    _seed_book(a, 0, bid=2399.0, ask=2400.0)
+    a._signer = MagicMock()
+    a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
+    a._signer.create_order = AsyncMock(
+        return_value=(None, MagicMock(tx_hash="0xabc"), None)
+    )
+    # Force _verify_fill to LIE: return 0 (no fill confirmed) — this is
+    # the exact failure mode that produced over-hedge today. Stamping
+    # must happen anyway because err is None.
+    async def fake_verify(meta, cloid_int, expected_size):
+        return 0.0, 0.0
+    a._verify_fill = fake_verify  # type: ignore
+    a.get_position = AsyncMock(return_value=None)
+
+    await a.place_long_term_order(
+        symbol="ETH-USD", side="sell", size=0.0148, price=0,
+        cloid_int=42,
+    )
+    # Stamped despite verify_fill=0:
+    assert a._expected_short_size[0] == 0.0148
+    # Timestamp is set:
+    assert 0 in a._last_fire_at
+
+    # A subsequent BUY 0.005 (covering the short) decrements:
+    await a.place_long_term_order(
+        symbol="ETH-USD", side="buy", size=0.005, price=0,
+        cloid_int=43,
+    )
+    assert abs(a._expected_short_size[0] - (0.0148 - 0.005)) < 1e-9
+
+    # A BUY larger than the current expected clamps at 0 (can't go below).
+    await a.place_long_term_order(
+        symbol="ETH-USD", side="buy", size=1.0, price=0,
+        cloid_int=44,
+    )
+    assert a._expected_short_size[0] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_place_order_consecutive_sells_accumulate():
+    """Two successive sells must accumulate in `_expected_short_size`.
+    Each successful create_order is a separate physical order on the
+    exchange — engine fires deltas, adapter accumulates them. The
+    over-hedge incidents of 2026-05-07 happened because the engine kept
+    refiring deltas while position read as 0; the redesign assumes the
+    engine fires intentional deltas, so double-stamp is correct here."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta()
+    _seed_book(a, 0, bid=2399.0, ask=2400.0)
+    a._signer = MagicMock()
+    a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
+    a._signer.create_order = AsyncMock(
+        return_value=(None, MagicMock(tx_hash="0xabc"), None)
+    )
+    async def fake_verify(meta, cloid_int, expected_size):
+        return 0.0, 0.0
+    a._verify_fill = fake_verify  # type: ignore
+    a.get_position = AsyncMock(return_value=None)
+
+    await a.place_long_term_order(
+        symbol="ETH-USD", side="sell", size=0.005, price=0,
+        cloid_int=100,
+    )
+    await a.place_long_term_order(
+        symbol="ETH-USD", side="sell", size=0.005, price=0,
+        cloid_int=101,
+    )
+    # Sells accumulate.
+    assert abs(a._expected_short_size[0] - 0.010) < 1e-12
+
+
+@pytest.mark.asyncio
+async def test_place_order_buy_decrement_handles_fp_residue():
+    """Chained buys whose deltas sum exactly to the current expected
+    must clamp to exactly 0.0, not leak a denormal positive residue.
+    `0.0148 - 0.005 - 0.005 - 0.0048` is `8.67e-19` in float arithmetic;
+    the clamp must zero this out."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta()  # step_size=0.0001 from helper
+    _seed_book(a, 0, bid=2399.0, ask=2400.0)
+    a._signer = MagicMock()
+    a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
+    a._signer.create_order = AsyncMock(
+        return_value=(None, MagicMock(tx_hash="0xabc"), None)
+    )
+    async def fake_verify(meta, cloid_int, expected_size):
+        return 0.0, 0.0
+    a._verify_fill = fake_verify  # type: ignore
+    a.get_position = AsyncMock(return_value=None)
+
+    await a.place_long_term_order(
+        symbol="ETH-USD", side="sell", size=0.0148, price=0, cloid_int=200,
+    )
+    # Three buys whose sizes sum to exactly 0.0148.
+    for size, cloid in [(0.005, 201), (0.005, 202), (0.0048, 203)]:
+        await a.place_long_term_order(
+            symbol="ETH-USD", side="buy", size=size, price=0, cloid_int=cloid,
+        )
+    # Must be EXACTLY 0.0, not 8.67e-19.
+    assert a._expected_short_size[0] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_get_position_reads_from_ws_cache():
+    """get_position must NOT call /account — it reads the WS-cached
+    position. Sustained 1Hz HTTP polling triggered the CloudFront WAF
+    in the 2026-05-07 session."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta()
+    # Seed a SHORT position of 0.05 ETH @ $2390 entry, $1.20 unrealized.
+    _seed_position(
+        a, market_index=0, sign=-1, size=0.05,
+        avg_entry=2390.0, unrealized=1.20,
+    )
+    pos = await a.get_position("ETH-USD")
+    assert pos is not None
+    assert pos.side == "short"
+    assert pos.size == 0.05
+    assert pos.entry_price == 2390.0
+    assert pos.unrealized_pnl == 1.20
+    # Empty cache → None (closed position or pre-snapshot).
+    a._observed_short_size = {}
+    a._observed_position_meta = {}
+    assert await a.get_position("ETH-USD") is None
+
+
+@pytest.mark.asyncio
+async def test_get_collateral_reads_from_ws_cache():
+    a = _make_adapter()
+    a._ws_collateral = 137.42
+    assert await a.get_collateral() == 137.42
+    # Pre-snapshot: returns 0.0 (engine treats 0 as "unknown").
+    a._ws_collateral = None
+    assert await a.get_collateral() == 0.0
+
+
+@pytest.mark.asyncio
+async def test_get_oracle_prices_uses_cached_book_midpoint():
+    """Midpoint of cached top-of-book is the new oracle. Previously this
+    was last_trade_price from /orderBookDetails (HTTP), which doubled
+    the polling rate."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta()
+    a._markets["ARB-USD"] = _meta(symbol_user="ARB-USD", market_index=1)
+    _seed_book(a, 0, bid=2399.0, ask=2401.0)
+    _seed_book(a, 1, bid=0.1265, ask=0.1267)
+    prices = await a.get_oracle_prices(["ETH-USD", "ARB-USD"])
+    assert prices["ETH-USD"] == 2400.0  # midpoint
+    assert prices["ARB-USD"] == 0.1266
+    # Empty cache: returns 0.0 per symbol so callers can detect "unknown".
+    a._ws_book_top = {}
+    prices = await a.get_oracle_prices(["ETH-USD"])
+    assert prices["ETH-USD"] == 0.0
+
+
+def test_on_book_update_extracts_best_bid_and_ask():
+    """The WS callback must turn a multi-level book into best_bid/best_ask.
+    Lighter sends prices as strings."""
+    a = _make_adapter()
+    a._on_book_update(
+        market_id=7,
+        state={
+            "asks": [
+                {"price": "100.50", "size": "1"},
+                {"price": "100.10", "size": "5"},
+                {"price": "100.20", "size": "2"},
+            ],
+            "bids": [
+                {"price": "99.80", "size": "3"},
+                {"price": "99.95", "size": "1"},
+                {"price": "99.90", "size": "2"},
+            ],
+        },
+    )
+    top = a._ws_book_top[7]
+    assert top["best_ask"] == 100.10  # lowest ask
+    assert top["best_bid"] == 99.95   # highest bid
+    assert a._ws_first_snapshot.is_set()
+
+
+def test_on_account_update_extracts_positions_and_collateral():
+    """REGRESSION: the WS account_all spec — per
+    apidocs.lighter.xyz/docs/websocket-reference — has TOP-LEVEL fields:
+
+      - `account` is the integer account_id (NOT a nested object!)
+      - `available_balance`, `collateral`, `positions` (DICT keyed by
+        market_id), `assets`, `funding_histories` are all top-level.
+
+    Earlier version of this parser drilled into `state["account"]` as a
+    dict and treated `positions` as a LIST. Both wrong: parse silently
+    failed, cache was empty, engine kept firing hedges thinking
+    `position == 0` after each successful fill → over-hedge stack.
+    """
+    a = _make_adapter()
+    a._on_account_update(
+        account_id=42,
+        state={
+            "type": "subscribed/account_all",
+            "channel": "account_all:42",
+            "timestamp": 1700000000000,
+            "account": 42,  # integer account_id at top level
+            "available_balance": "150.75",
+            "collateral": "200.00",
+            "assets": {
+                "1": {"symbol": "USDC", "asset_id": 1, "balance": "150.75",
+                      "locked_balance": "0"},
+            },
+            "positions": {
+                # Dict keyed by market_id string — NOT a list!
+                "0": {
+                    "market_id": 0, "symbol": "ETH-USD", "sign": -1,
+                    "position": "0.05", "avg_entry_price": "2390.0",
+                    "unrealized_pnl": "1.20",
+                    "position_value": "119.5", "realized_pnl": "0",
+                },
+                "50": {
+                    "market_id": 50, "symbol": "ARB-USD", "sign": 1,
+                    "position": "100.0", "avg_entry_price": "0.13",
+                    "unrealized_pnl": "-0.50",
+                    "position_value": "13", "realized_pnl": "0",
+                },
+            },
+        },
+    )
+    assert a._ws_collateral == 150.75
+    # Magnitude (engine-facing): only shorts (sign=-1) carry magnitude.
+    # Longs are tracked as 0 in this dict so the engine's drift math
+    # doesn't try to hedge against an operator-opened long; the long
+    # is still surfaced through the diagnostic metadata dict.
+    assert a._observed_short_size[0] == 0.05  # ETH short
+    assert a._observed_short_size[50] == 0.0  # ARB long → 0 magnitude
+    # Metadata (diagnostic-facing):
+    assert a._observed_position_meta[0]["sign"] == -1
+    assert a._observed_position_meta[0]["avg_entry_price"] == 2390.0
+    assert a._observed_position_meta[50]["sign"] == 1
+    assert a._observed_position_meta[50]["position"] == 100.0
+
+    # Live-account variant: top-level `available_balance` is null and
+    # the real collateral lives inside `assets[asset_id].margin_balance`.
+    # Probed empirically against the user's mainnet account (issue
+    # 2026-05-07). The parser must fall back to summing assets.
+    a2 = _make_adapter()
+    a2._on_account_update(
+        account_id=42,
+        state={
+            "type": "subscribed/account_all",
+            "account": 42,
+            "available_balance": None,
+            "assets": {
+                "3": {
+                    "symbol": "USDC", "asset_id": 3,
+                    "balance": "0.000000", "locked_balance": "0",
+                    "margin_balance": "197.851681701356",
+                },
+            },
+            "positions": {},
+        },
+    )
+    assert abs(a2._ws_collateral - 197.85168170) < 1e-6
+
+    # Update where ETH disappears from the snapshot: with the defensive
+    # merge (2026-05-08 fix), a missing-from-message mid that was
+    # previously non-zero is PRESERVED until the reconciler confirms
+    # the close via HTTP. This protects against transient empty
+    # snapshots from Lighter's match engine that were over-hedging
+    # the engine on every WS wobble.
+    a._on_account_update(
+        account_id=42,
+        state={
+            "type": "update/account_all",
+            "channel": "account_all:42",
+            "account": 42,
+            "available_balance": "100.0",
+            "positions": {
+                "50": {
+                    "market_id": 50, "sign": 1, "position": "100.0",
+                    "avg_entry_price": "0.13", "unrealized_pnl": "-0.30",
+                },
+            },
+        },
+    )
+    # ETH was non-zero before → preserved. ARB long → 0 magnitude.
+    assert 0 in a._observed_short_size
+    assert a._observed_short_size[0] > 0  # preserved old value
+    assert a._observed_short_size[50] == 0.0
+    assert a._observed_position_meta[50]["position"] == 100.0
+    assert a._ws_collateral == 100.0
+
+    # Empty positions dict (transient snapshot or all-closed): all
+    # previously non-zero mids stay preserved. Reconciler will verify.
+    a._on_account_update(
+        account_id=42,
+        state={"account": 42, "available_balance": "200.0", "positions": {}},
+    )
+    # ETH (was non-zero) preserved. ARB (was 0) cleared since the
+    # defensive merge only preserves NON-ZERO previous values.
+    assert 0 in a._observed_short_size
+    assert 50 not in a._observed_short_size
+    assert a._ws_collateral == 200.0
+
+
+def test_on_account_update_defensive_merge_against_ws_wobble():
+    """REGRESSION: 2026-05-08 — over-hedge on op #28.
+
+    Lighter's WS occasionally pushes a transient `update/account_all`
+    snapshot that drops a still-open position (probably an
+    intermediate match-engine state during a fill). Wholesale-replace
+    of `_observed_short_size` made the engine read current=0 while the
+    real position was open; combined with `_expected_short_size` only
+    accumulating fire-deltas (not the full position), the engine fired
+    a SECOND full-target hedge on top, doubling positions.
+
+    Fix: when a snapshot is missing a mid that was previously non-zero,
+    keep the old value pending reconciler HTTP verification. The
+    reconciler runs every 5 s and confirms-or-clears within
+    RECONCILE_TIMEOUT_S, so a genuine close still propagates — just
+    deferred by a few seconds.
+
+    This test wires the exact scenario from the production log:
+      1. Real position ETH=0.0148 short, ARB=128 short (sign=-1)
+      2. WS pushes transient snapshot with positions={} (empty)
+      3. Engine reads observed → must NOT see 0/empty
+    """
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta(market_index=0, size_decimals=4)
+    a._markets["ARB-USD"] = _meta(market_index=50, size_decimals=1)
+
+    # Step 1: WS pushes correct initial snapshot.
+    a._on_account_update(
+        account_id=42,
+        state={
+            "type": "subscribed/account_all", "account": 42,
+            "available_balance": "100.0",
+            "positions": {
+                "0": {
+                    "market_id": 0, "sign": -1, "position": "0.0148",
+                    "avg_entry_price": "2280", "unrealized_pnl": "0",
+                },
+                "50": {
+                    "market_id": 50, "sign": -1, "position": "128.0",
+                    "avg_entry_price": "0.128", "unrealized_pnl": "0",
+                },
+            },
+        },
+    )
+    assert a._observed_short_size[0] == 0.0148
+    assert a._observed_short_size[50] == 128.0
+
+    # Step 2: WS pushes TRANSIENT EMPTY snapshot — the wobble.
+    a._on_account_update(
+        account_id=42,
+        state={
+            "type": "update/account_all", "account": 42,
+            "available_balance": "100.0",
+            "positions": {},  # ← the wobble
+        },
+    )
+    # CRITICAL: observed must NOT have been wiped. If it was, the
+    # engine would read current=0, compute drift=full_target, and
+    # OPEN the entire hedge a second time — over-hedge regression.
+    assert a._observed_short_size[0] == 0.0148, (
+        "WS wobble wiped ETH observed — engine would over-hedge"
+    )
+    assert a._observed_short_size[50] == 128.0, (
+        "WS wobble wiped ARB observed — engine would over-hedge"
+    )
+
+    # Step 3: WS recovers, real snapshot returns. New values accepted.
+    a._on_account_update(
+        account_id=42,
+        state={
+            "type": "update/account_all", "account": 42,
+            "available_balance": "100.0",
+            "positions": {
+                "0": {
+                    "market_id": 0, "sign": -1, "position": "0.0148",
+                    "avg_entry_price": "2280", "unrealized_pnl": "0",
+                },
+                "50": {
+                    "market_id": 50, "sign": -1, "position": "128.0",
+                    "avg_entry_price": "0.128", "unrealized_pnl": "0",
+                },
+            },
+        },
+    )
+    assert a._observed_short_size[0] == 0.0148
+    assert a._observed_short_size[50] == 128.0
+
+
+@pytest.mark.asyncio
+async def test_get_effective_position_uses_max_of_observed_and_expected():
+    """`get_effective_position(symbol)` must return a Position whose
+    size is max(observed, expected). This is what the engine reads as
+    `current_short_size` — covering both the WS-observed-only case
+    (steady state) and the just-stamped-not-yet-WS-confirmed case
+    (immediately after fire, before WS catch-up)."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta()
+
+    # Case 1: both empty → None.
+    assert await a.get_effective_position("ETH-USD") is None
+
+    # Case 2: only observed populated (WS pushed; we never fired).
+    _seed_position(
+        a, market_index=0, sign=-1, size=0.05,
+        avg_entry=2390.0, unrealized=1.20,
+    )
+    pos = await a.get_effective_position("ETH-USD")
+    assert pos is not None
+    assert pos.size == 0.05
+    assert pos.side == "short"
+
+    # Case 3: only expected populated (just fired, WS hasn't caught up).
+    a._observed_short_size = {}
+    a._observed_position_meta = {}
+    a._expected_short_size = {0: 0.0148}
+    pos = await a.get_effective_position("ETH-USD")
+    assert pos is not None
+    assert pos.size == 0.0148
+    assert pos.side == "short"
+
+    # Case 4: both populated, expected is larger (just fired delta on
+    # top of an existing short — engine sees the LARGER value to
+    # avoid re-firing).
+    _seed_position(
+        a, market_index=0, sign=-1, size=0.0148,
+        avg_entry=2390.0,
+    )
+    a._expected_short_size = {0: 0.020}
+    pos = await a.get_effective_position("ETH-USD")
+    assert pos.size == 0.020
+
+
+@pytest.mark.asyncio
+async def test_fetch_short_size_via_http_returns_short_magnitude():
+    """`_fetch_short_size_via_http(market_index)` must call /account,
+    find the position for the given market_id, and return:
+      - the unsigned magnitude if it's a short (sign=-1),
+      - 0.0 if flat or long,
+      - None on error (so the caller skips reconciliation that scan)."""
+    a = _make_adapter()
+    a._account_index = 724201
+
+    # Stub: /account returns a short of 0.05 ETH on market_id=0.
+    a._account_api = MagicMock()
+    a._account_api.account = AsyncMock(return_value=MagicMock(
+        accounts=[MagicMock(positions=[
+            MagicMock(market_id=0, sign=-1, position="0.05"),
+            MagicMock(market_id=50, sign=1, position="100.0"),  # long
+        ])]
+    ))
+    assert await a._fetch_short_size_via_http(0) == 0.05
+    assert await a._fetch_short_size_via_http(50) == 0.0  # long → 0
+    assert await a._fetch_short_size_via_http(99) == 0.0  # not in list → 0
+
+    # Stub: HTTP raises (network blip) → return None.
+    a._account_api.account = AsyncMock(side_effect=RuntimeError("net err"))
+    assert await a._fetch_short_size_via_http(0) is None
+
+
+@pytest.mark.asyncio
+async def test_parallel_orders_serialize_with_min_gap(monkeypatch):
+    """Two place_long_term_order calls in parallel must NOT race the
+    nonce_manager — the adapter's internal lock + 600ms min-gap should
+    serialize them. Without this, Lighter rejects the second with
+    code=21120 invalid signature (the loser of the next_nonce race
+    signs a stale nonce). Regression test for the ARB/WETH dual-leg
+    failure on 2026-05-07.
+    """
+    import asyncio
+    a = _make_adapter()
+    # Shorten the gap so the test doesn't take ages but still verifies
+    # the lock + gap mechanism is wired up.
+    a._MIN_GAP_S = 0.05
+    a._markets["ETH-USD"] = _meta()
+    a._markets["ARB-USD"] = _meta(market_index=1)
+    # Both markets need book cache seeded — production adapter reads
+    # them from the WS pump, here we seed directly.
+    _seed_book(a, 0, bid=99.95, ask=100.05)
+    _seed_book(a, 1, bid=99.95, ask=100.05)
+
+    # Record the order in which create_order calls actually hit the signer.
+    call_log: list[tuple[float, str]] = []
+    a._signer = MagicMock()
+    a._signer.nonce_manager.next_nonce = MagicMock(return_value=(0, 1))
+    a._signer.nonce_manager.acknowledge_failure = MagicMock(return_value=None)
+
+    async def fake_create_order(**kw):
+        # Simulate ~10ms of server work
+        call_log.append((asyncio.get_event_loop().time(), str(kw.get("market_index"))))
+        await asyncio.sleep(0.01)
+        return MagicMock(tx_hash="0x" + "a" * 64), MagicMock(code=0), None
+
+    a._signer.create_order = fake_create_order
+    a.get_position = AsyncMock(return_value=None)
+    a._verify_fill = AsyncMock(return_value=(0.001, 100.0))
+
+    # Fire both legs in parallel — exactly what the previous lifecycle
+    # did via asyncio.gather. The lock must serialize them.
+    await asyncio.gather(
+        a.place_long_term_order(
+            symbol="ETH-USD", side="sell", size=0.001, price=100, cloid_int=1,
+        ),
+        a.place_long_term_order(
+            symbol="ARB-USD", side="sell", size=0.001, price=100, cloid_int=2,
+        ),
+    )
+
+    # Both must have hit the signer, but the gap between them must be
+    # ≥ _MIN_GAP_S (= 50ms here) — proving serialization, not parallel.
+    assert len(call_log) == 2, f"Expected 2 calls, got {len(call_log)}"
+    gap_ms = (call_log[1][0] - call_log[0][0]) * 1000
+    assert gap_ms >= 45, (
+        f"Calls were too close ({gap_ms:.1f}ms apart), lock/gap not "
+        f"working — would race the nonce_manager on real Lighter."
+    )
+
+
+@pytest.mark.asyncio
+async def test_reconcile_once_clears_expected_when_observed_catches_up():
+    """If WS catch-up makes observed match expected within step_size,
+    the reconciler pins expected to observed (no HTTP query)."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta(market_index=0, size_decimals=4)  # step=0.0001
+    a._expected_short_size[0] = 0.0148
+    a._observed_short_size[0] = 0.0148
+    a._last_fire_at[0] = time.monotonic()
+    a._account_api = MagicMock()
+    a._account_api.account = AsyncMock(side_effect=AssertionError(
+        "HTTP must NOT be called when observed already caught up"
+    ))
+    await a._reconcile_once()
+    # Expected pinned to observed (effectively a no-op here since
+    # they were already equal — the assertion is that no HTTP fired).
+
+
+@pytest.mark.asyncio
+async def test_reconcile_once_http_query_on_timeout_confirms_fill():
+    """If divergence persists past RECONCILE_TIMEOUT_S since the last
+    fire, query HTTP. When HTTP confirms the expected size, both
+    observed and expected pin to that truth."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta(market_index=0, size_decimals=4)
+    a._expected_short_size[0] = 0.0148
+    a._observed_short_size[0] = 0.0  # WS lagging
+    a._last_fire_at[0] = time.monotonic() - 31.0  # past timeout
+    a._account_api = MagicMock()
+    a._account_api.account = AsyncMock(return_value=MagicMock(
+        accounts=[MagicMock(positions=[
+            MagicMock(market_id=0, sign=-1, position="0.0148"),
+        ])]
+    ))
+    await a._reconcile_once()
+    assert a._observed_short_size[0] == 0.0148
+    assert a._expected_short_size[0] == 0.0148
+
+
+@pytest.mark.asyncio
+async def test_reconcile_once_http_zero_means_real_failure():
+    """If divergence persists and HTTP returns 0 (the order genuinely
+    didn't fill — IOC auto-cancel), reset BOTH layers to 0. The engine
+    will see drift again on the next iter and fire once more."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta(market_index=0, size_decimals=4)
+    a._expected_short_size[0] = 0.0148
+    a._observed_short_size[0] = 0.0
+    a._last_fire_at[0] = time.monotonic() - 31.0
+    a._account_api = MagicMock()
+    a._account_api.account = AsyncMock(return_value=MagicMock(
+        accounts=[MagicMock(positions=[])]  # no position on this market
+    ))
+    await a._reconcile_once()
+    assert a._observed_short_size[0] == 0.0
+    assert a._expected_short_size[0] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_once_aborts_on_concurrent_fire():
+    """If a new place_long_term_order stamps `_last_fire_at` mid-await,
+    the reconciler must NOT overwrite the new (higher) expected with
+    stale HTTP truth. Race protection from spec § Reconciliation logic."""
+    a = _make_adapter()
+    a._markets["ETH-USD"] = _meta(market_index=0, size_decimals=4)
+    a._expected_short_size[0] = 0.0148
+    a._observed_short_size[0] = 0.0
+    initial_fire_at = time.monotonic() - 31.0
+    a._last_fire_at[0] = initial_fire_at
+
+    async def fake_account(**kw):
+        # Simulate a new fire happening DURING the HTTP await.
+        a._last_fire_at[0] = time.monotonic()
+        a._expected_short_size[0] = 0.030  # stamped by hypothetical concurrent place_order
+        return MagicMock(
+            accounts=[MagicMock(positions=[
+                MagicMock(market_id=0, sign=-1, position="0.0148"),
+            ])]
+        )
+    a._account_api = MagicMock()
+    a._account_api.account = AsyncMock(side_effect=fake_account)
+
+    await a._reconcile_once()
+    # Expected stayed at 0.030 (the new stamp), NOT 0.0148 (stale truth).
+    assert a._expected_short_size[0] == 0.030
+    # Observed unchanged — reconciler aborted the write.
+    assert a._observed_short_size[0] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_reconciler_loop_invokes_reconcile_once_periodically():
+    """The background loop must invoke `_reconcile_once` repeatedly,
+    sleeping between iterations. Test by patching the method to count
+    invocations and the sleep to no-op."""
+    import asyncio
+    a = _make_adapter()
+    invocations = []
+
+    async def fake_reconcile_once():
+        invocations.append(time.monotonic())
+        if len(invocations) >= 3:
+            a._ws_closing = True  # exit the loop
+
+    a._reconcile_once = fake_reconcile_once  # type: ignore
+
+    # Patch sleep to a noop so the test doesn't take 15 s.
+    real_sleep = asyncio.sleep
+    async def fast_sleep(s):
+        await real_sleep(0)
+    import unittest.mock as mock
+    with mock.patch("asyncio.sleep", fast_sleep):
+        await a._reconciler_loop()
+    assert len(invocations) >= 3
+
+
+def test_subscribe_funding_is_callable_on_base_adapter():
+    """Default no-op satisfies the ABC and accepts a coroutine callback."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    called = []
+    async def cb(entry):
+        called.append(entry)
+    # Should not raise even before connect/poller is wired.
+    a.subscribe_funding(cb)
+    assert callable(getattr(a, "subscribe_funding"))
+
+
+def test_subscribe_funding_stores_callback_on_lighter():
+    """LighterAdapter override persists the callback for the poller."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    async def cb(entry): pass
+    a.subscribe_funding(cb)
+    assert a._funding_callback is cb
+
+
+@pytest.mark.asyncio
+async def test_fetch_position_funding_returns_entries():
+    """_fetch_position_funding wraps account_api.position_funding and
+    returns the entries list (or empty on error)."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    # Mock SDK response
+    a._account_api = MagicMock()
+    fake_entries = [
+        MagicMock(funding_id=1, market_id=0, timestamp=1700000000,
+                  change="0.10", rate="0.0001", position_size="0.0148",
+                  position_side="short"),
+        MagicMock(funding_id=2, market_id=50, timestamp=1700000005,
+                  change="-0.05", rate="-0.0001", position_size="100.0",
+                  position_side="short"),
+    ]
+    a._account_api.position_funding = AsyncMock(return_value=MagicMock(
+        position_fundings=fake_entries,
+        next_cursor=None,
+    ))
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("TOKEN", None))
+    entries = await a._fetch_position_funding(limit=100)
+    assert len(entries) == 2
+    assert entries[0].funding_id == 1
+    assert entries[1].market_id == 50
+
+@pytest.mark.asyncio
+async def test_fetch_position_funding_returns_empty_on_error():
+    """HTTP errors must not crash the poller — return empty list."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._account_api = MagicMock()
+    a._account_api.position_funding = AsyncMock(side_effect=RuntimeError("boom"))
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("TOKEN", None))
+    entries = await a._fetch_position_funding(limit=100)
+    assert entries == []
+
+@pytest.mark.asyncio
+async def test_funding_poller_iteration_fires_callback_per_entry():
+    """One poller iteration fetches entries and fires the callback per
+    entry. Dedup happens engine-side, so adapter emits everything."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._account_api = MagicMock()
+    e1 = MagicMock(funding_id=1, market_id=0, timestamp=1700000000,
+                   change="0.10", rate="0.0001", position_size="0.0148",
+                   position_side="short")
+    e2 = MagicMock(funding_id=2, market_id=50, timestamp=1700000005,
+                   change="-0.05", rate="-0.0001", position_size="100.0",
+                   position_side="short")
+    a._account_api.position_funding = AsyncMock(return_value=MagicMock(
+        position_fundings=[e1, e2], next_cursor=None,
+    ))
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("TOKEN", None))
+    received: list = []
+    async def cb(entry): received.append(entry)
+    a._funding_callback = cb
+    await a._funding_poller_iteration()
+    assert received == [e1, e2]
+
+@pytest.mark.asyncio
+async def test_funding_poller_iteration_noop_when_no_callback():
+    """If subscribe_funding hasn't been called yet, iteration still
+    fetches but doesn't crash."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._account_api = MagicMock()
+    a._account_api.position_funding = AsyncMock(return_value=MagicMock(
+        position_fundings=[MagicMock()], next_cursor=None,
+    ))
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("TOKEN", None))
+    a._funding_callback = None
+    await a._funding_poller_iteration()  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_funding_poller_loop_runs_iteration_then_sleeps():
+    """The loop body calls _funding_poller_iteration once, then awaits
+    the sleep — patched to fire CancelledError so we exit deterministically."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    iters = 0
+    async def fake_iteration():
+        nonlocal iters
+        iters += 1
+    a._funding_poller_iteration = fake_iteration
+    # Patch sleep to short-circuit and exit after first iter
+    a._ws_closing = False
+    sleep_calls = 0
+    real_sleep = asyncio.sleep
+    async def fake_sleep(d):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls == 1:
+            a._ws_closing = True  # exit loop on next while check
+        await real_sleep(0)
+    import asyncio as _aio
+    orig = _aio.sleep
+    _aio.sleep = fake_sleep
+    try:
+        await a._funding_poller_loop()
+    finally:
+        _aio.sleep = orig
+    assert iters >= 1
+    assert sleep_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_fetch_position_funding_passes_auth_token():
+    """Per spec 2026-05-08-pnl-fixes-A-B: Lighter rejects position_funding
+    without an auth token. _fetch_position_funding must generate one via
+    signer.create_auth_token_with_expiry and pass it as `auth=`."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._account_api = MagicMock()
+    a._account_api.position_funding = AsyncMock(return_value=MagicMock(
+        position_fundings=[], next_cursor=None,
+    ))
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("TOKEN", None))
+    await a._fetch_position_funding(limit=100)
+    call_kwargs = a._account_api.position_funding.await_args.kwargs
+    assert call_kwargs.get("auth") == "TOKEN"
+
+
+@pytest.mark.asyncio
+async def test_fetch_position_funding_returns_empty_on_token_error():
+    """If signer returns an error, return empty list and DO NOT call the API."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._account_api = MagicMock()
+    a._account_api.position_funding = AsyncMock(return_value=MagicMock(
+        position_fundings=[], next_cursor=None,
+    ))
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(
+        return_value=("", "auth fail")
+    )
+    out = await a._fetch_position_funding(limit=100)
+    assert out == []
+    a._account_api.position_funding.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_get_trade_pnl_since_default_returns_none_on_base():
+    """Default impl on ExchangeAdapter returns None — adapters that
+    don't expose a cumulative-pnl endpoint inherit the disabled state."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    from exchanges.base import ExchangeAdapter
+    assert hasattr(ExchangeAdapter, "get_trade_pnl_since")
+    class _Dummy(ExchangeAdapter):
+        name = "dummy"
+        async def connect(self): pass
+        async def disconnect(self): pass
+        async def subscribe_orderbook(self, s, c): pass
+        async def subscribe_fills(self, s, c): pass
+        async def get_position(self, s): return None
+        async def get_oracle_prices(self, syms): return {}
+        async def get_fills(self, s, since=None): return []
+        def get_tick_size(self, s): return 0.01
+        def get_min_notional(self, s): return 0.01
+    d = _Dummy()
+    assert await d.get_trade_pnl_since(0.0, 1.0) is None
+
+
+@pytest.mark.asyncio
+async def test_get_trade_pnl_since_returns_baseline_and_latest():
+    """Mock pnl response with 3 hourly buckets: ts=1000,2000,3000 with
+    trade_pnl=-1.0,-2.0,-3.0 (cumulative). Request start_ts=1500
+    -> baseline = -1.0 (entry at 1000 has ts<=1500), latest = -3.0."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(
+        return_value=("TOKEN", None)
+    )
+    a._account_api = MagicMock()
+    a._account_api.pnl = AsyncMock(return_value=MagicMock(
+        pnl=[
+            MagicMock(timestamp=1000, trade_pnl=-1.0),
+            MagicMock(timestamp=2000, trade_pnl=-2.0),
+            MagicMock(timestamp=3000, trade_pnl=-3.0),
+        ],
+    ))
+    out = await a.get_trade_pnl_since(start_ts=1500.0, end_ts=3500.0)
+    assert out == (-1.0, -3.0)
+
+
+@pytest.mark.asyncio
+async def test_get_trade_pnl_since_caches_for_30s():
+    """Two calls within 30 s share the cached result; pnl HTTP called once.
+    Bucket at ts=400 (<=start_ts=500) → baseline=-5.0; latest=-5.0."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("TOKEN", None))
+    a._account_api = MagicMock()
+    a._account_api.pnl = AsyncMock(return_value=MagicMock(
+        pnl=[MagicMock(timestamp=400, trade_pnl=-5.0)],
+    ))
+    r1 = await a.get_trade_pnl_since(start_ts=500.0, end_ts=2000.0)
+    r2 = await a.get_trade_pnl_since(start_ts=500.0, end_ts=2000.0)
+    assert r1 == r2 == (-5.0, -5.0)
+    assert a._account_api.pnl.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_get_trade_pnl_since_returns_none_on_error():
+    """HTTP failure -> None; doesn't crash."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("TOKEN", None))
+    a._account_api = MagicMock()
+    a._account_api.pnl = AsyncMock(side_effect=RuntimeError("boom"))
+    out = await a.get_trade_pnl_since(start_ts=100.0, end_ts=200.0)
+    assert out is None
+
+
+@pytest.mark.asyncio
+async def test_get_trade_pnl_since_returns_zero_baseline_when_no_history_before_start():
+    """If all returned buckets are AFTER start_ts, baseline = 0.0
+    (account had no prior cumulative pnl to subtract)."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("TOKEN", None))
+    a._account_api = MagicMock()
+    a._account_api.pnl = AsyncMock(return_value=MagicMock(
+        pnl=[
+            MagicMock(timestamp=2000, trade_pnl=-2.0),
+            MagicMock(timestamp=3000, trade_pnl=-3.0),
+        ],
+    ))
+    out = await a.get_trade_pnl_since(start_ts=1500.0, end_ts=3500.0)
+    assert out == (0.0, -3.0)

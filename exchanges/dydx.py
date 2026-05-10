@@ -129,6 +129,30 @@ class DydxAdapter(ExchangeAdapter):
         self._market_metas[symbol] = meta
         return meta
 
+    async def get_oracle_prices(self, symbols: list[str]) -> dict[str, float]:
+        """Returns {symbol: oracle_price_usd} for each requested symbol.
+
+        Single round-trip to /v4/perpetualMarkets (returns all markets); we
+        filter to the requested set. Symbols absent from the indexer response
+        are silently dropped — caller should treat missing keys as transient
+        failures and re-try on the next iteration.
+        """
+        response = await self._indexer.markets.get_perpetual_markets()
+        markets = response.get("markets", {})
+        result: dict[str, float] = {}
+        for sym in symbols:
+            m = markets.get(sym)
+            if m is None:
+                continue
+            oracle = m.get("oraclePrice")
+            if oracle is None:
+                continue
+            try:
+                result[sym] = float(oracle)
+            except (ValueError, TypeError):
+                continue
+        return result
+
     # The remaining methods on ExchangeAdapter ABC are placeholder stubs.
     # They will be implemented in Tasks 10-13.
 
@@ -174,13 +198,6 @@ class DydxAdapter(ExchangeAdapter):
             status="open",
         )
 
-    async def place_limit_order(self, symbol, side, size, price):
-        """ABC-required compat. Delegates to place_long_term_order with auto-generated cloid."""
-        cloid = int(time.time() * 1000) % (2**31)
-        return await self.place_long_term_order(
-            symbol=symbol, side=side, size=size, price=price, cloid_int=cloid,
-        )
-
     async def cancel_long_term_order(self, *, symbol: str, cloid_int: int) -> None:
         """Cancel a long-term order by its client_id."""
         market_data = await self._indexer.markets.get_perpetual_markets(symbol)
@@ -196,10 +213,6 @@ class DydxAdapter(ExchangeAdapter):
         )
         if hasattr(self._wallet, "sequence"):
             self._wallet.sequence += 1
-
-    async def cancel_order(self, order_id: str) -> None:
-        """Generic cancel by string id (assumes default symbol)."""
-        raise NotImplementedError("Use cancel_long_term_order for long-term orders")
 
     async def batch_place(self, orders: list[dict]) -> list[Order]:
         """Place multiple orders sequentially with small delay to avoid rate limits.

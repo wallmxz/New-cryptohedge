@@ -50,6 +50,20 @@ class Operation:
     bootstrap_deposit_tx_hash: str | None = None
     teardown_withdraw_tx_hash: str | None = None
     teardown_swap_tx_hash: str | None = None
+    # Cross-pair dual-leg fields (Task 6)
+    baseline_token0_usd_price: float | None = None
+    baseline_token1_usd_price: float | None = None
+    perp_fees_paid_token0: float = 0.0
+    perp_fees_paid_token1: float = 0.0
+    funding_paid_token0: float = 0.0
+    funding_paid_token1: float = 0.0
+    # Manual deposit baseline (2026-05-08): user-set USD cost basis.
+    # When None, panel falls back to HODL formula (legacy behavior).
+    baseline_deposit_usd: float | None = None
+    # User-selectable Hedge PnL window (2026-05-09): unix timestamp.
+    # When set, get_trade_pnl_since uses this instead of started_at.
+    # Lets user say "measure my hedge from this moment forward".
+    pnl_window_since_ts: float | None = None
 
     def is_active(self) -> bool:
         return self.state in (
@@ -80,4 +94,12 @@ class Operation:
             bootstrap_deposit_tx_hash=row.get("bootstrap_deposit_tx_hash"),
             teardown_withdraw_tx_hash=row.get("teardown_withdraw_tx_hash"),
             teardown_swap_tx_hash=row.get("teardown_swap_tx_hash"),
+            baseline_token0_usd_price=row.get("baseline_token0_usd_price"),
+            baseline_token1_usd_price=row.get("baseline_token1_usd_price"),
+            perp_fees_paid_token0=row.get("perp_fees_paid_token0", 0.0) or 0.0,
+            perp_fees_paid_token1=row.get("perp_fees_paid_token1", 0.0) or 0.0,
+            funding_paid_token0=row.get("funding_paid_token0", 0.0) or 0.0,
+            funding_paid_token1=row.get("funding_paid_token1", 0.0) or 0.0,
+            baseline_deposit_usd=row.get("baseline_deposit_usd"),
+            pnl_window_since_ts=row.get("pnl_window_since_ts"),
         )

@@ -1,10 +1,20 @@
 [
   {
     "inputs": [],
-    "name": "range",
+    "name": "positionMain",
     "outputs": [
-      {"internalType": "int24", "name": "lowerTick", "type": "int24"},
-      {"internalType": "int24", "name": "upperTick", "type": "int24"}
+      {"internalType": "int24", "name": "tickLower", "type": "int24"},
+      {"internalType": "int24", "name": "tickUpper", "type": "int24"}
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "positionAlt",
+    "outputs": [
+      {"internalType": "int24", "name": "tickLower", "type": "int24"},
+      {"internalType": "int24", "name": "tickUpper", "type": "int24"}
     ],
     "stateMutability": "view",
     "type": "function"
@@ -21,21 +31,7 @@
   },
   {
     "inputs": [],
-    "name": "totalSupply",
-    "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-    "stateMutability": "view",
-    "type": "function"
-  },
-  {
-    "inputs": [{"internalType": "address", "name": "account", "type": "address"}],
-    "name": "balanceOf",
-    "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-    "stateMutability": "view",
-    "type": "function"
-  },
-  {
-    "inputs": [],
-    "name": "want",
+    "name": "vault",
     "outputs": [{"internalType": "address", "name": "", "type": "address"}],
     "stateMutability": "view",
     "type": "function"
@@ -44,6 +40,34 @@
     "inputs": [],
     "name": "pool",
     "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "lpToken0",
+    "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "lpToken1",
+    "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "paused",
+    "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "twapInterval",
+    "outputs": [{"internalType": "uint32", "name": "", "type": "uint32"}],
     "stateMutability": "view",
     "type": "function"
   }

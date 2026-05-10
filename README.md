@@ -26,9 +26,12 @@ Ver `docs/grid-engine-runbook.md` para detalhes de operação.
 
 - ✅ Phase 1.1 — Grid Maker Engine (tag `fase-1.1-completa`)
 - ✅ Phase 1.2 — Operation Lifecycle (tag `fase-1.2-completa`)
-- 🔜 Phase 1.3 — Refinamentos (adaptive spacing + observability)
+- ✅ Phase 1.3 — Observability + Cleanup (tag `fase-1.3-completa`)
+- ✅ Phase 1.4 — Backtesting Framework (tag `fase-1.4-completa`)
+- ✅ Phase 2.0 — On-chain Execution Automatica (tag `fase-2.0-completa`)
+- ✅ Pair Picker (tag `fase-pair-picker-completa`)
 
-Ver `docs/STATUS.md` para detalhes.
+Ver `CLAUDE.md` (autoridade) e `docs/STATUS.md` para detalhes.
 
 ## Documentação
 
@@ -44,7 +47,9 @@ Ver `docs/STATUS.md` para detalhes.
 python -m pytest tests/ -v
 ```
 
-97 testes passando na Phase 1.1.
+190 testes verdes (após cleanup pass; pre-cleanup eram 203 incluindo 13 do `test_orderbook.py` que foi deletado junto com `engine/orderbook.py`, módulo do design pre-grid).
+
+Em Windows sem MSVC Build Tools, `dydx-v4-client` não compila — `tests/conftest.py` mocka o SDK em `sys.modules` pra a suite rodar mesmo assim. Em Linux/Fly.io o SDK instala normal e o stub não kicka.
 
 ## Deploy
 

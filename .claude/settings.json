@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -Command \"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; & 'C:\\Users\\Wallace\\Desktop\\NewHedgeBot\\scripts\\session_brief.ps1'\""
+          }
+        ]
+      }
+    ]
+  }
+}

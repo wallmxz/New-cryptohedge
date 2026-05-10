@@ -103,6 +103,16 @@ Stack: Python 3.14, asyncio, Starlette + Alpine.js, web3.py, dydx-v4-client, aio
 
 - ✅ **Engine `_aggressive_correct` cooldown** (`9016741`): adicionado cooldown in-memory de 30s pra prevenir re-fire de takers de correção quando o anterior ainda não filled. Antes, em latência alta ou no simulator, o mesmo correction fired toda iteration → stack de takers que blow up no próximo cross. Fix: `engine/__init__.py` checa `_last_aggressive_correction_at` antes de chamar `_aggressive_correct`. 3 tests novos (`tests/test_engine_grid.py`).
 
+- ✅ **Cleanup pass** (branch `cleanup/code-review-pass`, 2 commits): code review com 3 agents paralelos (reuse / quality / efficiency). Mudanças:
+  - **Dead code removido**: `engine/orderbook.py` (substituído pelo grid maker), `chains/base.py` (`ChainReader` ABC sem implementações), alias `Engine = GridMakerEngine`, `place_limit_order` + `cancel_order` da `ExchangeAdapter` ABC + impls (engine só usa `*_long_term_*`), `Settings.pool_token1_is_stable` + `pool_token1_usd_price` (substituídos por `stables.is_stable` + `is_usd_pair` do pair-picker), `StateHub.cow_balance/cow_total_supply/vault_balances/my_order_depth` (sem writers/readers).
+  - **Hot path engine** (`engine/__init__.py`): cadência 1Hz estável (`sleep(max(0, 1.0 - elapsed))`), `read_position` + `read_price` em `asyncio.gather`, `get_collateral` + `get_position` hoisted pra 1x/iter via `_safe_get_collateral` / `_safe_get_position`, `_handle_out_of_range_*` colapsados em `_cancel_active_grid` (corpos eram idênticos, params do `_lower` não eram usados), `OperationState.ACTIVE.value` no lugar de string literal `"active"`.
+  - **Lifecycle** (`engine/lifecycle.py`): `_read_wallet_balance` agora gather de 3 RPCs paralelos (era 1 + 2). `cashout_residual()` novo método consolidando o swap WETH→USDC residual que `web/routes.py::cashout` inlineava via privates. Stripped narrative `Step N` comments.
+  - **Bug fix** (`web/routes.py::cashout`): hardcodava `fee=500` no swap residual → mis-routing pra fee tiers ≠ default; agora delega pra `lifecycle.cashout_residual` que usa `settings.uniswap_v3_pool_fee`. Também não acessa mais `engine._lifecycle._uniswap` privates.
+  - **Bug fix** (`backtest/data.py`): `datetime.utcfromtimestamp()` deprecated em 3.13 → `datetime.fromtimestamp(ts, tz=timezone.utc)`. Também fix latente no parser de funding cursor (strptime naive + `.timestamp()` usava local time; agora taga UTC explicitamente).
+  - **lp_math dedupe**: `compute_optimal_split` agora chama `engine.curve.compute_l_from_value` + `compute_x` + `compute_y` em vez de duplicar a denom V3.
+  - **Conftest stub**: `tests/conftest.py` injeta `dydx_v4_client` em `sys.modules` pra rodar testes em plataformas onde o SDK nativo não compila (Windows sem MSVC). Linux/Fly.io usa o SDK real (stub não kicka).
+  - 190 tests verdes (era 203 antes; -13 do orderbook deletado).
+
 ## Decisões já tomadas (não revisitar sem motivo)
 
 - **Exchange:** dYdX v4 (não Hyperliquid) — min notional $1 vs $3, maker fee 33% mais barato
@@ -123,7 +133,7 @@ Stack: Python 3.14, asyncio, Starlette + Alpine.js, web3.py, dydx-v4-client, aio
 - Cada feature em branch própria, merge-back ao master ao concluir
 - Cada Phase tem seu spec → plan → execução → tag
 - Tasks executadas via `superpowers:subagent-driven-development` (subagent fresco por task + reviews)
-- Imports legacy (`engine/hedge.py`, `chains/evm.py`, `exchanges/hyperliquid.py`) — agendados pra deletion na Phase 1.2 Task 14
+- Imports legacy (`engine/hedge.py`, `chains/evm.py`, `exchanges/hyperliquid.py`, `engine/orderbook.py`, `chains/base.py`) — todos deletados (Phase 1.2 Task 14 + cleanup pass)
 
 ## Como retomar trabalho de onde parou
 
@@ -159,14 +169,33 @@ Stack: Python 3.14, asyncio, Starlette + Alpine.js, web3.py, dydx-v4-client, aio
 - **Preview server:** `python -m uvicorn app:app --host 127.0.0.1 --port 8000`
 - **Auth:** admin / Wallace1 (basic auth — URL: `http://admin:Wallace1@127.0.0.1:8000/`)
 - **Engine:** desligado por default (`START_ENGINE=false`). Pra ligar, setar `START_ENGINE=true` no `.env` antes de subir uvicorn
-- **Tests:** `python -m pytest tests/ -v` (111 verdes após Phase 1.2 — rodar em batches no Windows pra evitar hang)
+- **Tests:** `python -m pytest tests/ -v` — 190 verdes (cleanup pass; pre-cleanup eram 203 mas 13 eram do orderbook morto)
 - **Caveat Windows:** rodar `pytest | tail` direto pode travar (pipe buffering). Use `pytest -v 2>&1 | tail -10` ou rode subsets
+
+### Setup em PC novo / pós-format
+
+Se Python não estiver instalado, o caminho mais rápido (testado em Windows 11 sem winget):
+
+1. **Python 3.13 embeddable** (zip, sem MSI):
+   ```
+   curl -L https://www.python.org/ftp/python/3.13.1/python-3.13.1-embed-amd64.zip -o py.zip
+   ```
+   Descompactar em `C:\Users\Wallace\Python313\`. Editar `python313._pth` adicionando linhas `Lib\site-packages` e `import site` (descomentado).
+2. **Bootstrap pip**: `python.exe get-pip.py` (baixar de bootstrap.pypa.io).
+3. **Instalar deps** (skip dydx-v4-client — falha em Windows sem MSVC build tools):
+   ```
+   python.exe -m pip install -r requirements.txt
+   # ou os pacotes core sem dydx-v4-client:
+   python.exe -m pip install starlette "uvicorn[standard]" jinja2 sse-starlette httpx websockets web3 aiosqlite python-dotenv eth-account prometheus-client python-json-logger pytest pytest-asyncio
+   ```
+4. **Tests**: `tests/conftest.py` mocka `dydx_v4_client` em `sys.modules`, então a suite roda completa sem o SDK real. Em Linux/Fly.io o SDK instala normal e o stub não kicka.
 
 ## Limitações conhecidas
 
 - **Sem dados reais ainda:** `.env` tem placeholders fake (wallet 0x0001 etc). Pra rodar mainnet precisa preencher com dados verdadeiros (wallet Arbitrum + mnemonic dYdX + endereços do vault Beefy CLM)
-- **Hyperliquid SDK install no Windows:** pode falhar em `ed25519-blake2b` se não tiver MSVC Build Tools. Workaround: tests mockam o SDK; execução real funciona na Linux (Fly.io)
+- **dydx-v4-client install no Windows:** suas deps (`ed25519-blake2b`, `coincurve`, `grpcio==1.65.4`) não têm wheels prebuilt pra Python 3.13; falha sem MSVC Build Tools. Workaround: `tests/conftest.py` injeta stub em `sys.modules`. Execução real é Linux/Fly.io (deps instalam clean).
 - **dydx-v4-client versão:** PyPI max é 1.1.6 (nosso requirements diz `>=1.1,<2.0`)
 - **LP fees attribution:** Phase 1.2 NÃO implementa listener de Beefy `Harvest` — `lp_fees_earned` fica em 0 até a gente adicionar isso (ficou como gap conhecido)
-- **Engine config legacy:** `Settings` ainda tem campos `hyperliquid_api_key/secret/symbol` mesmo após o cleanup do adapter; nenhum código usa, mas pode-se tirar num cleanup pass futuro
-- **Tests da suite completa às vezes hangam no Windows** quando rodada inteira; rodar em batches funciona
+- **Funding attribution (Lighter):** `funding_paid_token0/1` populated via background poller (60 s) introduced 2026-05-08 — see spec `docs/superpowers/specs/2026-05-08-pnl-funding-accumulator-design.md`. Restart uvicorn to pick up the poller after pulling the change.
+- **Hyperliquid Settings já removidos** (cleanup pass) — não há mais `hyperliquid_api_key/secret/symbol` no `Settings`
+- **Stale UI partials:** `web/templates/partials/book.html` e `pnl.html` referenciam `state.best_bid/best_ask/my_order/total_fees_earned` que o engine nunca escreve (sempre rendem zero). São restos do design inicial que precedeu o grid maker. Cleanup pass deixou os campos no `StateHub` pra evitar quebrar template, mas o ideal é uma limpeza UI dedicada que reescreva os partials pro modelo de grid.

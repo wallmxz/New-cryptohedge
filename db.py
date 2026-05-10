@@ -173,6 +173,96 @@ class Database:
             )"""
         )
         await self._conn.commit()
+        # Cross-pair dual-leg fields
+        for col_def in (
+            "ADD COLUMN baseline_token0_usd_price REAL",
+            "ADD COLUMN baseline_token1_usd_price REAL",
+            "ADD COLUMN perp_fees_paid_token0 REAL DEFAULT 0",
+            "ADD COLUMN perp_fees_paid_token1 REAL DEFAULT 0",
+            "ADD COLUMN funding_paid_token0 REAL DEFAULT 0",
+            "ADD COLUMN funding_paid_token1 REAL DEFAULT 0",
+        ):
+            try:
+                await self._conn.execute(f"ALTER TABLE operations {col_def}")
+                await self._conn.commit()
+            except aiosqlite.OperationalError:
+                pass
+
+        # Manual deposit baseline (Pool $ feature, 2026-05-08)
+        try:
+            await self._conn.execute(
+                "ALTER TABLE operations ADD COLUMN baseline_deposit_usd REAL"
+            )
+            await self._conn.commit()
+        except aiosqlite.OperationalError:
+            pass  # already added
+
+        # User-selectable Hedge PnL window (2026-05-09).
+        # NULL → engine uses op.started_at (legacy). When set,
+        # get_trade_pnl_since uses this timestamp instead, so the user
+        # can measure perp PnL "since I clicked Aplicar" rather than
+        # "since op start".
+        try:
+            await self._conn.execute(
+                "ALTER TABLE operations ADD COLUMN pnl_window_since_ts REAL"
+            )
+            await self._conn.commit()
+        except aiosqlite.OperationalError:
+            pass
+
+        try:
+            await self._conn.execute(
+                "ALTER TABLE beefy_pairs_cache ADD COLUMN dydx_perp_token1 TEXT"
+            )
+            await self._conn.commit()
+        except aiosqlite.OperationalError:
+            pass
+
+        # Beefy CLM v2 splits read state across two contracts: the EARN
+        # contract (vault_id, holds totalSupply/balanceOf) and the STRATEGY
+        # contract (holds positionMain/balances). Older cache entries only
+        # had vault_id; the strategy_address column was added so the reader
+        # can target the strategy directly.
+        try:
+            await self._conn.execute(
+                "ALTER TABLE beefy_pairs_cache ADD COLUMN strategy_address TEXT"
+            )
+            await self._conn.commit()
+        except aiosqlite.OperationalError:
+            pass
+
+        # ERC20 (symbol, decimals) metadata cache. Filled on-demand from on-chain
+        # reads when the Beefy fetcher encounters new token addresses; rows are
+        # immutable per address (ERC20 metadata never changes for a given
+        # contract), so no eviction is needed.
+        await self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS token_metadata_cache (
+                address TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                decimals INTEGER NOT NULL,
+                fetched_at REAL NOT NULL
+            )"""
+        )
+        await self._conn.commit()
+
+    async def get_token_metadata(self, address: str) -> dict | None:
+        """Returns {symbol, decimals} for an address, or None if not cached."""
+        cursor = await self._conn.execute(
+            "SELECT symbol, decimals FROM token_metadata_cache WHERE address = ?",
+            (address.lower(),),
+        )
+        row = await cursor.fetchone()
+        return {"symbol": row["symbol"], "decimals": int(row["decimals"])} if row else None
+
+    async def upsert_token_metadata(
+        self, *, address: str, symbol: str, decimals: int,
+    ) -> None:
+        await self._conn.execute(
+            """INSERT OR REPLACE INTO token_metadata_cache
+               (address, symbol, decimals, fetched_at) VALUES (?, ?, ?, ?)""",
+            (address.lower(), symbol, int(decimals), time.time()),
+        )
+        await self._conn.commit()
 
     async def close(self) -> None:
         if self._conn:
@@ -415,13 +505,53 @@ class Database:
 
     async def add_to_operation_accumulator(self, op_id: int, field: str, delta: float) -> None:
         """Atomically add `delta` to one of: perp_fees_paid, funding_paid,
-        lp_fees_earned, bootstrap_slippage."""
-        allowed = {"perp_fees_paid", "funding_paid", "lp_fees_earned", "bootstrap_slippage"}
+        lp_fees_earned, bootstrap_slippage, or per-leg variants
+        perp_fees_paid_token0/1, funding_paid_token0/1."""
+        allowed = {
+            "perp_fees_paid", "funding_paid", "lp_fees_earned", "bootstrap_slippage",
+            "perp_fees_paid_token0", "perp_fees_paid_token1",
+            "funding_paid_token0", "funding_paid_token1",
+        }
         if field not in allowed:
             raise ValueError(f"field must be one of {allowed}, got {field}")
         await self._conn.execute(
             f"UPDATE operations SET {field} = {field} + ? WHERE id = ?",
             (delta, op_id),
+        )
+        await self._conn.commit()
+
+    async def update_operation_baseline_deposit(
+        self, op_id: int, usd_value: float,
+    ) -> None:
+        """Persist the user-set baseline_deposit_usd on an ACTIVE operation.
+        Used by POST /operations/<id>/baseline so the panel's Pool $ row
+        reflects the user's actual cost basis (versus the HODL fallback
+        for ops without it set).
+
+        WHERE status='active' guard prevents accidental writes against
+        closed ops during a teardown race or stale UI session.
+        """
+        await self._conn.execute(
+            "UPDATE operations SET baseline_deposit_usd = ? "
+            "WHERE id = ? AND status = 'active'",
+            (usd_value, op_id),
+        )
+        await self._conn.commit()
+
+    async def update_pnl_window_since_ts(
+        self, op_id: int, since_ts: float | None,
+    ) -> None:
+        """Persist the user-selected window start for Hedge PnL on an
+        ACTIVE operation. NULL clears (engine falls back to op.started_at).
+
+        Per spec 2026-05-09: lets user say 'measure Hedge PnL from this
+        moment forward' instead of always using op.started_at. Used by
+        POST /operations/<id>/pnl-window.
+        """
+        await self._conn.execute(
+            "UPDATE operations SET pnl_window_since_ts = ? "
+            "WHERE id = ? AND status = 'active'",
+            (since_ts, op_id),
         )
         await self._conn.commit()
 
@@ -489,8 +619,9 @@ class Database:
                 token1_address, token1_symbol, token1_decimals,
                 pool_fee, manager, tick_lower, tick_upper,
                 tvl_usd, apy_30d, is_usd_pair, dydx_perp,
-                token0_logo_url, token1_logo_url, fetched_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                token0_logo_url, token1_logo_url, fetched_at,
+                dydx_perp_token1, strategy_address
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 pair["vault_id"], pair["chain"], pair["pool_address"],
                 pair["token0_address"], pair["token0_symbol"], pair["token0_decimals"],
@@ -501,6 +632,8 @@ class Database:
                 int(bool(pair["is_usd_pair"])), pair.get("dydx_perp"),
                 pair.get("token0_logo_url"), pair.get("token1_logo_url"),
                 pair["fetched_at"],
+                pair.get("dydx_perp_token1"),
+                pair.get("strategy_address"),
             ),
         )
         await self._conn.commit()

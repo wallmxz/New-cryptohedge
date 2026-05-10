@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 import httpx
 from backtest.cache import Cache
 
@@ -25,16 +25,15 @@ class DataFetcher:
         self._cache = cache
         self._fallback_apr = fallback_apr
 
-    async def fetch_eth_prices(
-        self, *, start: float, end: float, interval: int = 300,
-        product_id: str = "ETH-USD",
+    async def fetch_token_prices(
+        self, *, symbol: str, start: float, end: float, interval: int = 300,
     ) -> list[tuple[float, float]]:
-        """Fetch ETH/USD candles between start..end (unix seconds). Returns sorted (ts, close_price).
+        """Fetch <symbol> candles between start..end (unix seconds). Returns sorted (ts, close_price).
 
         Coinbase Exchange caps responses at 300 candles per request, so we paginate
         backward from `end` until we cross `start` or the API runs out of data.
         """
-        cache_key = f"eth_prices:{int(start)}:{int(end)}:{interval}"
+        cache_key = f"prices:{symbol}:{int(start)}:{int(end)}:{interval}"
         cached = await self._cache.get(cache_key)
         if cached is not None:
             data = json.loads(cached)
@@ -43,7 +42,7 @@ class DataFetcher:
         # Coinbase Exchange API: /products/<id>/candles
         # Returns: [[time, low, high, open, close, volume], ...] (descending by time)
         # granularity in seconds: 60, 300, 900, 3600, 21600, 86400
-        url = f"{COINBASE_BASE}/products/{product_id}/candles"
+        url = f"{COINBASE_BASE}/products/{symbol}/candles"
 
         seen: set[float] = set()
         records: list[tuple[float, float]] = []
@@ -52,7 +51,10 @@ class DataFetcher:
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             while cur_end > int(start):
-                params = {"start": int(start), "end": cur_end, "granularity": interval}
+                # Coinbase rejects ranges containing >300 candles per request,
+                # so cap each page's start to (cur_end - 300 * interval).
+                page_start = max(int(start), cur_end - COINBASE_MAX_CANDLES_PER_PAGE * interval)
+                params = {"start": page_start, "end": cur_end, "granularity": interval}
                 resp = await client.get(url, params=params)
                 resp.raise_for_status()
                 candles = resp.json()
@@ -96,6 +98,15 @@ class DataFetcher:
         await self._cache.set(cache_key, json.dumps(records))
         return records
 
+    async def fetch_eth_prices(
+        self, *, start: float, end: float, interval: int = 300,
+        product_id: str = "ETH-USD",
+    ) -> list[tuple[float, float]]:
+        """Legacy wrapper. Use fetch_token_prices(symbol=...) for new code."""
+        return await self.fetch_token_prices(
+            symbol=product_id, start=start, end=end, interval=interval,
+        )
+
     async def fetch_dydx_funding(
         self, *, symbol: str, start: float, end: float,
     ) -> list[tuple[float, float]]:
@@ -114,7 +125,7 @@ class DataFetcher:
         # Indexer paginates with effectiveBeforeOrAt; loop until covered
         records: list[tuple[float, float]] = []
         seen: set[float] = set()
-        cursor_iso = datetime.utcfromtimestamp(end).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        cursor_iso = datetime.fromtimestamp(end, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             while True:
@@ -127,9 +138,10 @@ class DataFetcher:
                     break
                 new_in_page = 0
                 for item in page:
-                    ts = datetime.strptime(
-                        item["effectiveAt"].replace("Z", ""), "%Y-%m-%dT%H:%M:%S"
-                    ).timestamp()
+                    # dYdX may return fractional seconds (e.g. "...:00.338Z");
+                    # fromisoformat handles both with and without fractions.
+                    iso = item["effectiveAt"].replace("Z", "+00:00")
+                    ts = datetime.fromisoformat(iso).timestamp()
                     if ts < start:
                         break
                     if ts in seen:
@@ -143,7 +155,7 @@ class DataFetcher:
                 last_ts = min(seen)
                 if last_ts <= start:
                     break
-                cursor_iso = datetime.utcfromtimestamp(last_ts - 1).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+                cursor_iso = datetime.fromtimestamp(last_ts - 1, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
         records.sort(key=lambda r: r[0])
         await self._cache.set(cache_key, json.dumps(records))

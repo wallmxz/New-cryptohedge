@@ -18,7 +18,9 @@ from web.logging_config import setup_logging
 from web.routes import (
     dashboard, sse_state, sse_logs, update_settings, get_config,
     list_operations, get_current_operation, start_operation, stop_operation,
-    metrics, cashout, wallet_balance,
+    preview_operation, metrics, cashout, recover_partial, withdraw_partial,
+    hedge_existing, update_operation_baseline, update_pnl_window,
+    wallet_balance, curve_preview,
     list_pairs, select_pair, refresh_pairs,
 )
 
@@ -59,9 +61,13 @@ def create_app(start_engine: bool = True) -> Starlette:
             from chains.beefy_executor import BeefyExecutor
             from chains.uniswap import UniswapV3PoolReader
             from chains.beefy import BeefyClmReader
-            from exchanges.dydx import DydxAdapter
             from web3 import AsyncWeb3, AsyncHTTPProvider
             from eth_account import Account
+            # Defer importing the dYdX adapter — its native deps
+            # (`ed25519-blake2b`, `coincurve`, `grpcio`) lack prebuilt
+            # wheels on Windows + Python 3.13, so users running
+            # ACTIVE_EXCHANGE=lighter shouldn't be forced to install
+            # MSVC build tools just to boot the bot.
 
             w3 = AsyncWeb3(AsyncHTTPProvider(settings.arbitrum_rpc_url))
             # Lazy account: only create if private key looks plausible (real 0x-prefixed
@@ -78,17 +84,47 @@ def create_app(start_engine: bool = True) -> Starlette:
             pool_reader = UniswapV3PoolReader(
                 w3, settings.clm_pool_address, 18, 6,
             )
+            # Legacy startup fallback. CLM v2 reader needs both strategy +
+            # earn addresses; without pair-picker metadata we only have one.
+            # Pass the same address twice — first real read will fail with a
+            # clear error if a real (non-placeholder) address is configured
+            # without the picker.
             beefy_reader = BeefyClmReader(
-                w3, settings.clm_vault_address, settings.wallet_address, 18, 6,
+                w3, settings.clm_vault_address, settings.clm_vault_address,
+                settings.wallet_address, 18, 6,
             )
 
-            exchange = DydxAdapter(
-                mnemonic=settings.dydx_mnemonic,
-                wallet_address=settings.dydx_address,
-                network=settings.dydx_network,
-                subaccount=settings.dydx_subaccount,
-            )
-            await exchange.connect()
+            # Choose perp exchange based on settings.active_exchange.
+            # "lighter" = Lighter v1 (zero-fee ZK rollup). Anything else
+            # (default "dydx") = dYdX v4. The engine treats both the same.
+            if settings.active_exchange == "lighter":
+                from exchanges.lighter import LighterAdapter
+                exchange = LighterAdapter(
+                    url=settings.lighter_url,
+                    account_index=settings.lighter_account_index,
+                    api_private_key=settings.lighter_api_private_key,
+                    api_key_index=settings.lighter_api_key_index,
+                )
+            else:
+                from exchanges.dydx import DydxAdapter
+                exchange = DydxAdapter(
+                    mnemonic=settings.dydx_mnemonic,
+                    wallet_address=settings.dydx_address,
+                    network=settings.dydx_network,
+                    subaccount=settings.dydx_subaccount,
+                )
+            # Best-effort: when the venue's edge is rejecting requests
+            # (CloudFront WAF, captcha, regional blocks) we still want the
+            # rest of the system (chain, recovery endpoint, dashboard) to
+            # boot. The engine + start_operation will retry connect()
+            # later when the exchange becomes reachable.
+            try:
+                await exchange.connect()
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    f"Exchange connect failed at startup ({e!r}); "
+                    f"engine will run with exchange offline."
+                )
 
             lifecycle = None
             if account is not None:
@@ -120,6 +156,15 @@ def create_app(start_engine: bool = True) -> Starlette:
                 lifecycle=lifecycle,
                 **factory_kwargs,
             )
+            # Resolve token0/token1 market_ids for funding handler.
+            # Adapter metadata is populated by connect() — this is when
+            # we can ask for market_index per symbol.
+            try:
+                await engine.resolve_market_ids_for_funding()
+            except Exception as e:
+                logging.getLogger(__name__).warning(
+                    f"resolve_market_ids_for_funding skipped: {e}"
+                )
             await engine.start()
             app.state.engine = engine
         yield
@@ -136,9 +181,22 @@ def create_app(start_engine: bool = True) -> Starlette:
         Route("/settings", update_settings, methods=["POST"]),
         Route("/operations", list_operations),
         Route("/operations/current", get_current_operation),
+        Route("/operations/preview", preview_operation, methods=["POST"]),
         Route("/operations/start", start_operation, methods=["POST"]),
         Route("/operations/stop", stop_operation, methods=["POST"]),
         Route("/operations/cashout", cashout, methods=["POST"]),
+        Route("/operations/recover", recover_partial, methods=["POST"]),
+        Route("/operations/withdraw-partial", withdraw_partial, methods=["POST"]),
+        Route("/operations/hedge-existing", hedge_existing, methods=["POST"]),
+        Route(
+            "/operations/{op_id:int}/baseline",
+            update_operation_baseline, methods=["POST"],
+        ),
+        Route(
+            "/operations/{op_id:int}/pnl-window",
+            update_pnl_window, methods=["POST"],
+        ),
+        Route("/curve", curve_preview, methods=["GET"]),
         Route("/pairs", list_pairs),
         Route("/pairs/select", select_pair, methods=["POST"]),
         Route("/pairs/refresh", refresh_pairs, methods=["POST"]),

@@ -23,9 +23,9 @@ def test_statehub_exposure_calculation():
 def test_statehub_snapshot():
     s = StateHub()
     s.pool_value_usd = 204.0
-    s.hedge_unrealized_pnl = -3.80
-    s.hedge_realized_pnl = 0.0
-    s.funding_total = 0.15
+    s.hedge_unrealized_pnls["ETH-USD"] = -3.80
+    s.hedge_realized_pnls["ETH-USD"] = 0.0
+    s.funding_totals["ETH-USD"] = 0.15
     s.total_fees_paid = 0.30
     s.best_bid = 1.06
     s.best_ask = 1.0601

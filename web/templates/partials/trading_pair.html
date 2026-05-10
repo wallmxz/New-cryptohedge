@@ -1,0 +1,37 @@
+<!-- web/templates/partials/trading_pair.html -->
+<!-- Trading Pair selector banner. Lives on the Painel tab home so the user
+     doesn't have to dig through Settings to choose/swap an LP pair. -->
+<div class="card">
+    <div class="flex items-center justify-between gap-4 flex-wrap">
+        <div class="flex items-center gap-3 min-w-0">
+            <div class="w-10 h-10 rounded-full bg-indigo-50 flex items-center justify-center flex-shrink-0">
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#6366f1" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="12" cy="12" r="10"></circle>
+                    <path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+                </svg>
+            </div>
+            <div class="min-w-0">
+                <p class="text-xs text-slate-400 uppercase tracking-wider">Trading Pair</p>
+                <p class="text-base font-semibold text-slate-800 truncate"
+                   x-show="pairsData.selected_vault_id"
+                   x-text="selectedPairLabel || '...'"></p>
+                <p class="text-sm text-slate-400 italic"
+                   x-show="!pairsData.selected_vault_id">
+                    Nenhum par selecionado &mdash; escolha pra come&ccedil;ar
+                </p>
+            </div>
+        </div>
+        <div class="flex items-center gap-2">
+            <button type="button" @click="openPairPicker()"
+                    class="px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-sm font-medium transition"
+                    x-show="!pairsData.selected_vault_id">
+                Escolher Par
+            </button>
+            <button type="button" @click="openPairPicker()"
+                    class="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded text-sm transition"
+                    x-show="pairsData.selected_vault_id">
+                Trocar
+            </button>
+        </div>
+    </div>
+</div>

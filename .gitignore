@@ -1,7 +1,15 @@
 __pycache__/
 *.pyc
 .env
+.env.backup-*
 *.db
 .pytest_cache/
 dist/
 *.egg-info/
+
+# Runtime / per-machine
+uvicorn.log
+scripts/lighter_diagnose.log
+.claude/scheduled_tasks.lock
+.claude/settings.local.json
+.superpowers/

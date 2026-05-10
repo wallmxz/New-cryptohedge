@@ -6,13 +6,21 @@
             <span class="metric-value" x-text="'$' + state.pool_value_usd.toFixed(2)">$0.00</span>
         </div>
         <div class="divider"></div>
-        <div class="metric-row">
-            <span class="metric-label">ARB</span>
-            <span class="metric-value" x-text="(state.pool_tokens.ARB || 0).toFixed(2)">0</span>
-        </div>
-        <div class="metric-row">
-            <span class="metric-label">WETH</span>
-            <span class="metric-value" x-text="(state.pool_tokens.WETH || 0).toFixed(4)">0</span>
+        <!-- Iterate pool_tokens dynamically — keys are the active pair's
+             symbols (e.g. WETH/ARB cross-pair) so labels follow whatever
+             pair the engine is tracking. Decimals scale: tokens worth
+             $100+ display 2 dp, sub-dollar tokens display 6 dp. -->
+        <template x-for="[symbol, amount] in Object.entries(state.pool_tokens || {})" :key="symbol">
+            <div class="metric-row">
+                <span class="metric-label" x-text="symbol"></span>
+                <span class="metric-value font-mono"
+                      x-text="(amount || 0).toFixed(amount > 100 ? 2 : (amount > 1 ? 4 : 6))">0</span>
+            </div>
+        </template>
+        <div x-show="!state.pool_tokens || Object.keys(state.pool_tokens).length === 0" x-cloak>
+            <div class="metric-row text-slate-400 italic">
+                <span class="text-xs">Aguardando dados on-chain...</span>
+            </div>
         </div>
     </div>
 </div>

@@ -1,0 +1,276 @@
+<!-- LP Curve V3: continuous exposure curve + grid orders anchored on it.
+     X axis: price. Y axis: token0 exposure of the LP at that price (=
+     `x(p) = L * (1/sqrt(p) - 1/sqrt(p_b))`). The line is the V3 curve;
+     each point is a grid order placed at the price level where the bot
+     reposts its short. -->
+<div class="bg-white rounded-lg shadow p-4 mb-5"
+     x-data="{
+        curve: null,
+        loading: false,
+        lastError: null,
+        chart: null,
+        async load() {
+            this.loading = true;
+            try {
+                const r = await fetch('/curve');
+                const data = await r.json();
+                if (data.error) {
+                    this.lastError = data.error === 'no_pair_selected'
+                        ? 'Selecione um par primeiro pra ver a curva.'
+                        : data.error;
+                    this.curve = null;
+                } else {
+                    this.curve = data;
+                    this.lastError = null;
+                    this.$nextTick(() => this.render());
+                }
+            } catch (e) {
+                this.lastError = String(e);
+            } finally { this.loading = false; }
+        },
+        render() {
+            if (!this.curve || !window.Chart) return;
+            const c = this.curve;
+            // Continuous V3 exposure curve (line)
+            const curveLine = c.curve_samples.map(s => ({x: s.price, y: s.x_token0}));
+            // Grid orders anchored on the curve
+            const buys  = c.grid.filter(g => g.side === 'buy')
+                             .map(g => ({x: g.price, y: g.x_token0}));
+            const sells = c.grid.filter(g => g.side === 'sell')
+                             .map(g => ({x: g.price, y: g.x_token0}));
+            // Current position dot
+            const nowPoint = (c.position.x_token0_now > 0)
+                ? [{x: c.pool.p_now, y: c.position.x_token0_now}]
+                : [];
+
+            const datasets = [
+                {
+                    label: 'Curva LP V3 (exposição em ' + c.pool.token0_symbol + ')',
+                    data: curveLine,
+                    borderColor: 'rgb(99, 102, 241)',
+                    backgroundColor: 'rgba(99, 102, 241, 0.08)',
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    fill: true,
+                    tension: 0.3,
+                    type: 'line',
+                    order: 3,
+                },
+                {
+                    label: 'Triggers de buy-back (fecha short conforme preço sobe)',
+                    data: buys,
+                    backgroundColor: 'rgba(16, 185, 129, 0.9)',
+                    borderColor: 'rgb(5, 122, 85)',
+                    pointRadius: 4,
+                    pointHoverRadius: 7,
+                    showLine: false,
+                    type: 'scatter',
+                    order: 2,
+                },
+                {
+                    label: 'Triggers de sell (abre short conforme preço cai)',
+                    data: sells,
+                    backgroundColor: 'rgba(239, 68, 68, 0.9)',
+                    borderColor: 'rgb(185, 28, 28)',
+                    pointRadius: 4,
+                    pointHoverRadius: 7,
+                    showLine: false,
+                    type: 'scatter',
+                    order: 1,
+                },
+                {
+                    label: 'Posição atual',
+                    data: nowPoint,
+                    backgroundColor: 'rgb(99, 102, 241)',
+                    borderColor: '#fff',
+                    borderWidth: 2,
+                    pointRadius: 7,
+                    pointHoverRadius: 10,
+                    showLine: false,
+                    type: 'scatter',
+                    order: 0,
+                },
+            ];
+
+            const cfg = {
+                type: 'scatter',
+                data: { datasets },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    interaction: { mode: 'nearest', intersect: false },
+                    scales: {
+                        x: {
+                            type: 'linear',
+                            title: { display: true, text:
+                                'Preço ' + c.pool.token0_symbol + '/' + c.pool.token1_symbol },
+                            min: c.pool.p_a * 0.998,
+                            max: c.pool.p_b * 1.002,
+                        },
+                        y: {
+                            title: { display: true, text:
+                                'Exposição da LP em ' + c.pool.token0_symbol +
+                                ' (= short ideal pra hedge)' },
+                            beginAtZero: true,
+                        },
+                    },
+                    plugins: {
+                        legend: { position: 'top', labels: { boxWidth: 12 } },
+                        tooltip: {
+                            callbacks: {
+                                label: function(ctx) {
+                                    const lbl = ctx.dataset.label || '';
+                                    return lbl + ': ' + ctx.parsed.y.toFixed(6) +
+                                        ' ' + c.pool.token0_symbol +
+                                        ' @ ' + ctx.parsed.x.toFixed(6);
+                                },
+                            },
+                        },
+                        annotation: {
+                            annotations: {
+                                pNow: {
+                                    type: 'line',
+                                    xMin: c.pool.p_now, xMax: c.pool.p_now,
+                                    borderColor: 'rgba(99, 102, 241, 0.7)',
+                                    borderWidth: 2,
+                                    borderDash: [5,5],
+                                    label: {
+                                        content: 'preço atual',
+                                        display: true,
+                                        position: 'start',
+                                        backgroundColor: 'rgba(99, 102, 241, 0.85)',
+                                        color: '#fff',
+                                        font: {size: 10},
+                                        padding: 3,
+                                    },
+                                },
+                                pA: {
+                                    type: 'line',
+                                    xMin: c.pool.p_a, xMax: c.pool.p_a,
+                                    borderColor: 'rgba(100,116,139,0.6)',
+                                    borderWidth: 1,
+                                    label: {
+                                        content: 'p_a',
+                                        display: true,
+                                        position: 'end',
+                                        backgroundColor: 'rgba(100,116,139,0.85)',
+                                        color: '#fff',
+                                        font: {size: 10},
+                                        padding: 2,
+                                    },
+                                },
+                                pB: {
+                                    type: 'line',
+                                    xMin: c.pool.p_b, xMax: c.pool.p_b,
+                                    borderColor: 'rgba(100,116,139,0.6)',
+                                    borderWidth: 1,
+                                    label: {
+                                        content: 'p_b',
+                                        display: true,
+                                        position: 'end',
+                                        backgroundColor: 'rgba(100,116,139,0.85)',
+                                        color: '#fff',
+                                        font: {size: 10},
+                                        padding: 2,
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            };
+            const canvas = document.getElementById('lp-curve-chart');
+            if (this.chart) this.chart.destroy();
+            this.chart = new Chart(canvas, cfg);
+        },
+     }"
+     x-init="load(); setInterval(() => load(), 5000)">
+
+    <div class="flex items-center justify-between mb-2">
+        <h2 class="text-lg font-bold">Curva LP V3 & Grid de ordens</h2>
+        <button @click="load()" :disabled="loading"
+                class="text-xs px-3 py-1 rounded bg-slate-100 hover:bg-slate-200 disabled:opacity-50">
+            <span x-show="!loading">🔄 Atualizar</span>
+            <span x-show="loading">Carregando...</span>
+        </button>
+    </div>
+
+    <template x-if="lastError">
+        <div class="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded p-3"
+             x-text="lastError"></div>
+    </template>
+
+    <template x-if="curve && !lastError">
+        <div>
+            <!-- Summary line -->
+            <div class="text-xs text-slate-600 mb-2 flex flex-wrap gap-3">
+                <span>
+                    Pool <span class="font-semibold"
+                                x-text="curve.pool.token0_symbol + '/' + curve.pool.token1_symbol"></span>
+                    fee <span class="font-mono" x-text="(curve.pool.fee_pct * 100).toFixed(2) + '%'"></span>
+                </span>
+                <span>
+                    Faixa
+                    <span class="font-mono" x-text="curve.pool.p_a.toFixed(6)"></span>
+                    –
+                    <span class="font-mono" x-text="curve.pool.p_b.toFixed(6)"></span>
+                </span>
+                <span :class="curve.pool.in_range ? 'text-emerald-700' : 'text-red-600 font-semibold'">
+                    <span x-text="curve.pool.in_range ? '✓ in-range' : '✗ OUT OF RANGE'"></span>
+                </span>
+                <span>
+                    Preço atual:
+                    <span class="font-mono" x-text="curve.pool.p_now.toFixed(6)"></span>
+                </span>
+                <span class="ml-auto text-slate-500"
+                      x-text="curve.source === 'active' ? 'usando posição real' : 'simulação com saldo da wallet'"></span>
+            </div>
+
+            <!-- Chart -->
+            <div class="relative" style="height: 320px;">
+                <canvas id="lp-curve-chart"></canvas>
+            </div>
+
+            <!-- Stats -->
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mt-3 text-xs">
+                <div class="bg-slate-50 rounded p-2">
+                    <div class="text-slate-500">Posição (token0)</div>
+                    <div class="font-mono font-semibold"
+                         x-text="curve.position.my_amount0.toFixed(6) + ' ' + curve.pool.token0_symbol"></div>
+                </div>
+                <div class="bg-slate-50 rounded p-2">
+                    <div class="text-slate-500">Posição (token1)</div>
+                    <div class="font-mono font-semibold"
+                         x-text="curve.position.my_amount1.toFixed(6) + ' ' + curve.pool.token1_symbol"></div>
+                </div>
+                <div class="bg-slate-50 rounded p-2">
+                    <div class="text-slate-500">Valor total</div>
+                    <div class="font-mono font-semibold"
+                         x-text="'$' + curve.position.pool_value_usd.toFixed(2)"></div>
+                </div>
+                <div class="bg-slate-50 rounded p-2">
+                    <div class="text-slate-500">Ordens no grid</div>
+                    <div class="font-mono font-semibold">
+                        <span class="text-emerald-700"
+                              x-text="curve.grid.filter(g => g.side === 'buy').length + ' buy'"></span>
+                        ·
+                        <span class="text-red-600"
+                              x-text="curve.grid.filter(g => g.side === 'sell').length + ' sell'"></span>
+                    </div>
+                </div>
+            </div>
+
+            <p class="text-[11px] text-slate-500 italic mt-2">
+                A linha é a <strong>exposição da LP em <span x-text="curve.pool.token0_symbol"></span></strong>
+                conforme o preço varia: em <span class="font-mono" x-text="curve.pool.p_a.toFixed(2)"></span> a
+                LP é 100% <span x-text="curve.pool.token0_symbol"></span>; em
+                <span class="font-mono" x-text="curve.pool.p_b.toFixed(2)"></span> a LP é 100%
+                <span x-text="curve.pool.token1_symbol"></span>. Cada ponto marca um
+                <strong>preço-trigger</strong> onde, se o preço chegar lá, o engine
+                dispara um taker IOC pra ajustar o short (não são ordens maker
+                postadas no order book). Tamanho típico do ajuste ≈
+                $<span x-text="curve.min_notional_usd.toFixed(2)"></span> de notional.
+            </p>
+        </div>
+    </template>
+</div>

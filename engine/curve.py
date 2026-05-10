@@ -60,8 +60,10 @@ class GridLevel:
     price: float           # USD price of token0 at this level
     size: float            # base units of token0 (e.g., WETH amount)
     side: Literal["buy", "sell"]  # "buy" (close short) or "sell" (open short)
-    target_short: float    # cumulative target short (base units). Used by engine
-                           # for accounting/fills, not by GridManager.diff.
+    # Cumulative target short (base units). Engine uses this for
+    # accounting on fills; GridManager.diff ignores it. Default 0 lets
+    # callers reconstructing a level from a DB row omit it.
+    target_short: float = 0.0
 
 
 def inverse_x_to_p(L: float, x: float, p_b: float) -> float:

@@ -8,6 +8,9 @@ from engine.lifecycle import OperationLifecycle
 def mock_settings():
     s = MagicMock()
     s.dydx_symbol = "ETH-USD"
+    s.dydx_symbol_token0 = "ETH-USD"
+    # Empty -> single-leg path (token1 is a stable, no second perp).
+    s.dydx_symbol_token1 = ""
     s.uniswap_v3_router_address = "0xRouter"
     s.token0_address = "0xWETH"
     s.token1_address = "0xUSDC"

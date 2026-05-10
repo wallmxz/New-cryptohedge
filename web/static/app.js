@@ -20,6 +20,10 @@ function dashboard() {
             current_operation_id: null,
             operation_state: "none",
             operation_pnl_breakdown: {},
+            baselineModal: false,
+            baselineInput: "",
+            pnlWindowModal: false,
+            pnlWindowInput: "",
             last_iter_timings: {},
             wallet_eth_balance: 0,
             weth_balance: 0,
@@ -52,6 +56,29 @@ function dashboard() {
         showStartModal: false,
         startBudget: 300.0,
         startBudgetMax: 0.0,
+
+        // "Importar operação existente" modal — adopts a Beefy position
+        // already deposited in the wallet (e.g. user did manual deposit
+        // or a previous bootstrap died after deposit but before shorts).
+        showImportModal: false,
+        importLoading: false,
+        importLoadingMsg: '',
+        importPreview: null,    // { position, shorts_planned }
+        importError: '',
+        // Two-stage start flow: 'budget' (input) -> 'preview' (review plan)
+        startStage: 'budget',
+        startPreview: null,
+        startPreviewAt: null,  // human-readable timestamp of last preview fetch
+        startLoading: false,
+        // Wallet snapshot fetched on modal open (USDC + token0/1 balances +
+        // oracle prices + total USD). Used to render the budget ceiling
+        // breakdown on stage 'budget'.
+        startWallet: null,
+        // Per-leg swap strategy chosen by the user in stage 'preview'.
+        // Values: 'use_existing' | 'full_swap' | 'swap_diff'.
+        // Server-recommended defaults seeded from startPreview.strategies once
+        // the preview returns (see loadStartPreview).
+        startSwapStrategy: { token0: 'swap_diff', token1: 'swap_diff' },
 
         showPairPicker: false,
         pairsData: { usd_pairs: [], cross_pairs: [], selected_vault_id: null, last_refresh_ts: 0 },
@@ -90,7 +117,7 @@ function dashboard() {
 
         get pnl() {
             const b = this.state.operation_pnl_breakdown || {};
-            const pool = (b.lp_fees_earned || 0) + (b.beefy_perf_fee || 0) + (b.il_natural || 0);
+            const pool = (b.lp_fees_earned || 0) + (b.beefy_perf_fee || 0) + (b.pool_dollar || 0);
             const hedge = b.hedge_pnl || 0;
             const net = b.net_pnl || 0;
             return { pool, hedge, net };
@@ -102,7 +129,7 @@ function dashboard() {
             const breakdown = [
                 { label: "LP fees recebidas", value: b.lp_fees_earned || 0 },
                 { label: "Beefy perf fee", value: b.beefy_perf_fee || 0 },
-                { label: "IL natural", value: b.il_natural || 0 },
+                { label: "Pool $", value: b.pool_dollar || 0 },
                 { label: "Hedge PnL", value: b.hedge_pnl || 0 },
                 { label: "Funding", value: b.funding || 0 },
                 { label: "Perp fees", value: b.perp_fees_paid || 0 },
@@ -170,11 +197,21 @@ function dashboard() {
         },
 
         async openStartModal() {
+            // Reset two-stage state every open
+            this.startStage = 'budget';
+            this.startPreview = null;
+            this.startLoading = false;
+            this.startWallet = null;
             try {
                 const resp = await fetch("/wallet");
                 if (resp.ok) {
                     const data = await resp.json();
-                    this.startBudgetMax = data.usdc_balance || 0;
+                    this.startWallet = data;
+                    // Use total wallet value priced in USD (USDC + token0 in
+                    // USD + token1 in USD) as the budget ceiling — not just
+                    // native USDC. The bot will use existing token0/token1
+                    // and only swap USDC for the gap.
+                    this.startBudgetMax = data.total_usd || data.usdc_balance || 0;
                     if (this.startBudgetMax > 0) {
                         this.startBudget = Math.floor(this.startBudgetMax);
                     }
@@ -183,21 +220,94 @@ function dashboard() {
             this.showStartModal = true;
         },
 
-        async confirmStart() {
+        closeStartModal() {
+            this.showStartModal = false;
+            this.startStage = 'budget';
+            this.startPreview = null;
+            this.startLoading = false;
+        },
+
+        // Stage 1 → Stage 2: fetch the plan, no on-chain action.
+        async loadStartPreview() {
+            this.startLoading = true;
             try {
-                const resp = await fetch("/operations/start", {
+                const resp = await fetch("/operations/preview", {
                     method: "POST",
                     headers: {"Content-Type": "application/json"},
                     body: JSON.stringify({usdc_budget: this.startBudget}),
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    alert("Erro ao calcular plano: " + (data.error || resp.status));
+                    return;
+                }
+                // Default wallet snapshot to zeros so the template renders
+                // numeric values even if a stale backend skips the field.
+                if (!data.wallet) {
+                    data.wallet = {
+                        token0_balance: 0, token1_balance: 0, eth_balance: 0,
+                    };
+                }
+                this.startPreview = data;
+                this.startPreviewAt = new Date().toLocaleTimeString();
+                // Seed strategy per leg.
+                //   token0: 'full_swap' if no balance, else server hint
+                //   (use_existing | swap_diff).
+                //   token1 (single-swap dual-leg model):
+                //     wallet has t1>0 → 'consolidate' (swap → token0 pre-deposit).
+                //     wallet has t1≈0 → 'consolidate' as no-op (vault zaps).
+                const t0Bal = data.wallet.token0_balance || 0;
+                const t1Bal = data.wallet.token1_balance || 0;
+                const eps = 1e-9;
+                this.startSwapStrategy = {
+                    token0: t0Bal <= eps
+                        ? 'full_swap'
+                        : ((data.strategies && data.strategies.token0) || 'swap_diff'),
+                    token1: t1Bal <= eps
+                        ? 'keep'
+                        : ((data.strategies && data.strategies.token1) || 'keep'),
+                };
+                this.startStage = 'preview';
+            } catch (e) {
+                alert("Erro: " + e);
+            } finally {
+                this.startLoading = false;
+            }
+        },
+
+        // Stage 2 → execute: send transactions on-chain.
+        async confirmStart() {
+            this.startLoading = true;
+            try {
+                const payload = { usdc_budget: this.startBudget };
+                // Only forward strategies in dual-leg (cross-pair). Single-leg
+                // path ignores the field server-side, but no point sending it.
+                if (this.startPreview && this.startPreview.is_dual_leg) {
+                    // token0: how to acquire WETH (use_existing/swap_diff/full_swap)
+                    // token1: only meaningful if wallet has token1 — then
+                    //   user picks "consolidate" (swap to token0 pre-deposit)
+                    //   or "keep" (leave stranded). When wallet token1 is
+                    //   zero the value is ignored server-side.
+                    payload.swap_strategies = {
+                        token0: this.startSwapStrategy.token0,
+                        token1: this.startSwapStrategy.token1,
+                    };
+                }
+                const resp = await fetch("/operations/start", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify(payload),
                 });
                 if (!resp.ok) {
                     const err = await resp.json();
                     alert("Erro ao iniciar: " + (err.error || resp.status));
                     return;
                 }
-                this.showStartModal = false;
+                this.closeStartModal();
             } catch (e) {
                 alert("Erro: " + e);
+            } finally {
+                this.startLoading = false;
             }
         },
 
@@ -213,12 +323,202 @@ function dashboard() {
             }
         },
 
+        // ----- Importar operação existente -----
+
+        async openImportModal() {
+            this.importPreview = null;
+            this.importError = '';
+            this.importLoading = true;
+            this.importLoadingMsg = 'Lendo posição na Beefy...';
+            this.showImportModal = true;
+            try {
+                // /curve gives us the on-chain Beefy position; /wallet gives
+                // us oracle USD prices for sizing the planned shorts.
+                const [curveResp, walletResp] = await Promise.all([
+                    fetch("/curve"),
+                    fetch("/wallet"),
+                ]);
+                const curve = await curveResp.json();
+                const wallet = await walletResp.json();
+                if (!curveResp.ok || curve.error) {
+                    this.importError = curve.error === 'no_pair_selected'
+                        ? 'Nenhum par selecionado. Escolha um par antes de importar.'
+                        : (curve.error || 'Falha ao ler curva.');
+                    return;
+                }
+                const my0 = (curve.position && curve.position.my_amount0) || 0;
+                const my1 = (curve.position && curve.position.my_amount1) || 0;
+                const poolUsd = (curve.position && curve.position.pool_value_usd) || 0;
+                if (my0 <= 0 && my1 <= 0) {
+                    this.importError = 'Nenhuma posição encontrada na Beefy. Faça um depósito primeiro (manual ou via "Iniciar operação").';
+                    return;
+                }
+                const isDual = !!curve.is_dual_leg;
+                const ratio = curve.hedge_ratio || (this.state.hedge_ratio || 1);
+                const t0Sym = (curve.pool && curve.pool.token0_symbol) || '';
+                const t1Sym = (curve.pool && curve.pool.token1_symbol) || '';
+                const p0 = wallet.token0_usd_price || 0;
+                const p1 = wallet.token1_usd_price || 0;
+                // Server adapts symbols to the active exchange's perp ticker
+                // (e.g. "ETH-USD" or just "ETH"). Display the underlying token
+                // symbol — server will compute the actual perp ticker.
+                const planned = [
+                    {
+                        symbol: t0Sym, size: my0 * ratio, ref_price_usd: p0,
+                    },
+                ];
+                if (isDual && my1 > 0) {
+                    planned.push({
+                        symbol: t1Sym, size: my1 * ratio, ref_price_usd: p1,
+                    });
+                }
+                this.importPreview = {
+                    position: {
+                        token0: my0, token1: my1,
+                        token0_symbol: t0Sym, token1_symbol: t1Sym,
+                        pool_value_usd: poolUsd,
+                    },
+                    shorts_planned: planned.filter(s => s.size > 0),
+                };
+            } catch (e) {
+                this.importError = 'Erro lendo posição: ' + e;
+            } finally {
+                this.importLoading = false;
+                this.importLoadingMsg = '';
+            }
+        },
+
+        closeImportModal() {
+            this.showImportModal = false;
+            this.importPreview = null;
+            this.importError = '';
+            this.importLoading = false;
+        },
+
+        async confirmImport() {
+            this.importLoading = true;
+            this.importLoadingMsg = 'Abrindo shorts...';
+            try {
+                const resp = await fetch("/operations/hedge-existing", {
+                    method: "POST",
+                });
+                const data = await resp.json();
+                if (!resp.ok) {
+                    this.importError = data.error || ('HTTP ' + resp.status);
+                    return;
+                }
+                // Success — operation now ACTIVE. Engine main loop will pick
+                // it up on next iter (1Hz). Close modal so the operation
+                // card takes over.
+                this.closeImportModal();
+            } catch (e) {
+                this.importError = 'Erro ao abrir shorts: ' + e;
+            } finally {
+                this.importLoading = false;
+                this.importLoadingMsg = '';
+            }
+        },
+
         async loadHistory() {
             try {
                 const resp = await fetch("/operations?limit=50");
                 if (resp.ok) this.history = await resp.json();
             } catch (e) {
                 console.error("Failed to load history:", e);
+            }
+        },
+
+        editBaseline() {
+            const cur = this.state.operation_pnl_breakdown?.baseline_deposit_usd;
+            this.baselineInput = (cur ?? "").toString();
+            this.baselineModal = true;
+        },
+
+        async saveBaseline() {
+            const opId = this.state.current_operation_id;
+            if (!opId) return;
+            const value = parseFloat(this.baselineInput);
+            if (!(value > 0)) return;
+            try {
+                const resp = await fetch(`/operations/${opId}/baseline`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ usd_value: value }),
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    this.baselineModal = false;
+                    this.baselineInput = "";
+                } else {
+                    alert(`Erro ao salvar baseline: ${data.error || resp.status}`);
+                }
+            } catch (e) {
+                alert(`Erro ao salvar baseline: ${e}`);
+            }
+        },
+
+        editPnlWindow() {
+            // Pre-fill with current value (or empty if not set).
+            // datetime-local format: "YYYY-MM-DDTHH:mm" (no seconds, no TZ).
+            const cur = this.state.operation_pnl_breakdown?.pnl_window_since_ts;
+            if (cur) {
+                const d = new Date(cur * 1000);
+                // Convert to local datetime-local format
+                const pad = n => String(n).padStart(2, "0");
+                this.pnlWindowInput =
+                    `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}` +
+                    `T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+            } else {
+                this.pnlWindowInput = "";
+            }
+            this.pnlWindowModal = true;
+        },
+
+        async savePnlWindow() {
+            const opId = this.state.current_operation_id;
+            if (!opId || !this.pnlWindowInput) return;
+            // datetime-local string is interpreted as LOCAL time by Date()
+            const ts = new Date(this.pnlWindowInput).getTime() / 1000;
+            if (!(ts > 0)) {
+                alert("Data inválida");
+                return;
+            }
+            try {
+                const resp = await fetch(`/operations/${opId}/pnl-window`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ since_ts: ts }),
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    this.pnlWindowModal = false;
+                    this.pnlWindowInput = "";
+                } else {
+                    alert(`Erro ao salvar janela: ${data.error || resp.status}`);
+                }
+            } catch (e) {
+                alert(`Erro ao salvar janela: ${e}`);
+            }
+        },
+
+        async clearPnlWindow() {
+            const opId = this.state.current_operation_id;
+            if (!opId) return;
+            try {
+                const resp = await fetch(`/operations/${opId}/pnl-window`, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ since_ts: null }),
+                });
+                const data = await resp.json();
+                if (data.success) {
+                    this.pnlWindowModal = false;
+                    this.pnlWindowInput = "";
+                } else {
+                    alert(`Erro ao limpar janela: ${data.error || resp.status}`);
+                }
+            } catch (e) {
+                alert(`Erro ao limpar janela: ${e}`);
             }
         },
 

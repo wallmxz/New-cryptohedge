@@ -50,9 +50,45 @@
             <span class="font-mono" :class="op.netPnl >= 0 ? 'text-emerald-600' : 'text-red-500'"
                   x-text="(op.netPnl >= 0 ? '+$' : '-$') + Math.abs(op.netPnl).toFixed(2)"></span>
         </div>
+        <div class="mt-3 flex items-center gap-2 text-xs text-slate-500">
+            <span x-show="state.operation_pnl_breakdown?.baseline_deposit_usd">
+                Baseline (depósito):
+                <span class="font-mono"
+                      x-text="'$' + (state.operation_pnl_breakdown.baseline_deposit_usd || 0).toFixed(2)"></span>
+            </span>
+            <span x-show="!state.operation_pnl_breakdown?.baseline_deposit_usd"
+                  class="italic">
+                Baseline: snapshot de import (HODL fallback)
+            </span>
+            <button @click="editBaseline()"
+                    class="ml-auto text-xs px-2 py-1 rounded bg-slate-100 hover:bg-slate-200">
+                ✏️ Editar
+            </button>
+        </div>
+        <div class="mt-2 flex items-center gap-2 text-xs text-slate-500">
+            <span x-show="state.operation_pnl_breakdown?.pnl_window_since_ts">
+                Hedge PnL desde:
+                <span class="font-mono"
+                      x-text="new Date((state.operation_pnl_breakdown.pnl_window_since_ts || 0) * 1000).toLocaleString('pt-BR')"></span>
+            </span>
+            <span x-show="!state.operation_pnl_breakdown?.pnl_window_since_ts"
+                  class="italic">
+                Hedge PnL: desde início da operação
+            </span>
+            <button @click="editPnlWindow()"
+                    class="ml-auto text-xs px-2 py-1 rounded bg-slate-100 hover:bg-slate-200">
+                🕒 Janela
+            </button>
+        </div>
     </div>
 
     <div class="flex justify-end mt-3 gap-2">
+        <button x-show="state.operation_state === 'none'"
+                @click="openImportModal()"
+                title="Detecta posição existente na Beefy e abre os shorts pra hedgear (sem swap, sem novo deposit)"
+                class="px-4 py-1.5 text-sm bg-slate-100 text-slate-700 rounded-lg hover:bg-slate-200 border border-slate-300">
+            Importar operação existente
+        </button>
         <button x-show="state.operation_state === 'none'"
                 @click="openStartModal()"
                 class="px-4 py-1.5 text-sm bg-emerald-600 text-white rounded-lg hover:bg-emerald-700">
@@ -63,5 +99,141 @@
                 class="px-4 py-1.5 text-sm bg-red-500 text-white rounded-lg hover:bg-red-600">
             Encerrar operação
         </button>
+    </div>
+</div>
+
+<!-- Modal: Atualizar baseline (depósito USD) -->
+<div x-show="baselineModal"
+     x-cloak
+     class="fixed inset-0 z-50 flex items-center justify-center bg-black/30">
+  <div class="bg-white rounded-lg shadow-lg p-4 w-80">
+    <h3 class="font-semibold mb-2">Atualizar baseline (depósito USD)</h3>
+    <p class="text-xs text-slate-500 mb-2">
+      Atual:
+      $<span x-text="(state.operation_pnl_breakdown?.baseline_deposit_usd ?? 0).toFixed(2)"></span>.
+      Insira o total que você investiu nesta operação (após qualquer
+      depósito ou retirada).
+    </p>
+    <input type="number" step="0.01" min="0.01"
+           class="w-full border rounded px-2 py-1 text-sm"
+           x-model="baselineInput"
+           placeholder="50.03" />
+    <div class="flex justify-end gap-2 mt-3">
+      <button @click="baselineModal = false"
+              class="text-xs px-3 py-1 rounded bg-slate-100">
+        Cancelar
+      </button>
+      <button @click="saveBaseline()"
+              :disabled="!baselineInput || parseFloat(baselineInput) <= 0"
+              class="text-xs px-3 py-1 rounded bg-emerald-600 text-white disabled:opacity-50">
+        Aplicar
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Janela do Hedge PnL (datetime picker) -->
+<div x-show="pnlWindowModal"
+     x-cloak
+     class="fixed inset-0 z-50 flex items-center justify-center bg-black/30">
+  <div class="bg-white rounded-lg shadow-lg p-4 w-96">
+    <h3 class="font-semibold mb-2">Janela do Hedge PnL</h3>
+    <p class="text-xs text-slate-500 mb-2">
+      Selecione a partir de quando medir o Hedge PnL (consulta a Lighter
+      account.pnl). Deixe vazio para usar o início da operação.
+      <br/><span class="italic">Atual:</span>
+      <span x-text="state.operation_pnl_breakdown?.pnl_window_since_ts
+                    ? new Date(state.operation_pnl_breakdown.pnl_window_since_ts * 1000).toLocaleString('pt-BR')
+                    : 'desde início da operação'"></span>
+    </p>
+    <input type="datetime-local"
+           class="w-full border rounded px-2 py-1 text-sm"
+           x-model="pnlWindowInput" />
+    <div class="flex justify-end gap-2 mt-3">
+      <button @click="pnlWindowModal = false"
+              class="text-xs px-3 py-1 rounded bg-slate-100">
+        Cancelar
+      </button>
+      <button @click="clearPnlWindow()"
+              class="text-xs px-3 py-1 rounded bg-amber-100 text-amber-700">
+        Limpar (usar op start)
+      </button>
+      <button @click="savePnlWindow()"
+              :disabled="!pnlWindowInput"
+              class="text-xs px-3 py-1 rounded bg-emerald-600 text-white disabled:opacity-50">
+        Aplicar
+      </button>
+    </div>
+  </div>
+</div>
+
+<!-- Modal: Importar operação existente -->
+<div x-show="showImportModal" x-cloak
+     class="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+     @click.self="closeImportModal()">
+    <div class="bg-white rounded-2xl p-6 w-full max-w-lg shadow-xl">
+        <div class="flex items-center justify-between mb-4">
+            <h3 class="text-lg font-semibold text-slate-800">Importar operação existente</h3>
+            <button @click="closeImportModal()" class="text-slate-400 hover:text-slate-600 text-xl leading-none">&times;</button>
+        </div>
+
+        <p class="text-sm text-slate-600 mb-4">
+            Vai ler a posição que já está depositada na Beefy e abrir os shorts dimensionados pra ela.
+            <span class="text-slate-500">Não faz swap, não faz novo deposit.</span>
+        </p>
+
+        <!-- Loading -->
+        <div x-show="importLoading" x-cloak class="text-center py-6">
+            <p class="text-sm text-slate-500" x-text="importLoadingMsg"></p>
+        </div>
+
+        <!-- Preview -->
+        <div x-show="!importLoading && importPreview" x-cloak class="space-y-3">
+            <div class="bg-slate-50 rounded-lg p-3 text-sm space-y-1">
+                <p class="text-xs uppercase tracking-wider text-slate-500 mb-1">Posição detectada na Beefy</p>
+                <div class="flex justify-between font-mono">
+                    <span x-text="importPreview && importPreview.position && importPreview.position.token0_symbol"></span>
+                    <span x-text="importPreview && importPreview.position ? importPreview.position.token0.toFixed(6) : '—'"></span>
+                </div>
+                <div class="flex justify-between font-mono" x-show="importPreview && importPreview.position && importPreview.position.token1 > 0">
+                    <span x-text="importPreview && importPreview.position && importPreview.position.token1_symbol"></span>
+                    <span x-text="importPreview && importPreview.position ? importPreview.position.token1.toFixed(6) : '—'"></span>
+                </div>
+                <div class="flex justify-between font-mono pt-1 mt-1 border-t border-slate-200 font-semibold">
+                    <span>Valor total</span>
+                    <span x-text="importPreview && importPreview.position ? '$' + importPreview.position.pool_value_usd.toFixed(2) : '—'"></span>
+                </div>
+            </div>
+
+            <div class="bg-amber-50 border border-amber-200 rounded-lg p-3 text-sm">
+                <p class="text-xs uppercase tracking-wider text-amber-700 mb-1">Shorts que serão abertos</p>
+                <template x-for="s in (importPreview ? importPreview.shorts_planned : [])" :key="s.symbol">
+                    <div class="flex justify-between font-mono text-amber-900">
+                        <span x-text="'short ' + s.symbol"></span>
+                        <span x-text="s.size.toFixed(6) + ' @ ~$' + s.ref_price_usd.toFixed(4)"></span>
+                    </div>
+                </template>
+            </div>
+
+            <p class="text-xs text-slate-500">
+                Hedge ratio atual: <span class="font-mono" x-text="(state.hedge_ratio || 1).toFixed(2)"></span>.
+                Após abrir, o bot toma controle e usa level-triggered taker (só fira ordens quando |drift| × preço ≥ min_notional).
+            </p>
+        </div>
+
+        <!-- Error -->
+        <div x-show="!importLoading && importError" x-cloak class="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-700" x-text="importError"></div>
+
+        <div class="flex justify-end gap-2 mt-5">
+            <button @click="closeImportModal()"
+                    class="px-4 py-1.5 text-sm bg-slate-100 text-slate-700 rounded-lg hover:bg-slate-200">
+                Cancelar
+            </button>
+            <button x-show="!importLoading && importPreview && !importError" x-cloak
+                    @click="confirmImport()"
+                    class="px-4 py-1.5 text-sm bg-emerald-600 text-white rounded-lg hover:bg-emerald-700">
+                Confirmar e abrir shorts
+            </button>
+        </div>
     </div>
 </div>

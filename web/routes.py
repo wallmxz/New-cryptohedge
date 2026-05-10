@@ -131,6 +131,37 @@ async def get_current_operation(request: Request):
     })
 
 
+async def preview_operation(request: Request):
+    """POST /operations/preview {usdc_budget} → returns the swap+deposit+hedge
+    plan without sending any transactions. The UI shows this to the user for
+    explicit confirmation before /operations/start is called."""
+    if not hasattr(request.app.state, "engine"):
+        return JSONResponse(
+            {"error": "Engine not running (set START_ENGINE=true)"}, status_code=503,
+        )
+    engine = request.app.state.engine
+
+    try:
+        body = await request.json()
+        usdc_budget = float(body.get("usdc_budget", 0))
+    except Exception:
+        return JSONResponse({"error": "Body must be {usdc_budget: number}"}, status_code=400)
+    if usdc_budget <= 0:
+        return JSONResponse({"error": "usdc_budget must be positive"}, status_code=400)
+
+    try:
+        # Engine routes through pair_factory when a vault is selected, so the
+        # preview uses the SAME addresses the real operation would use.
+        plan = await engine.preview_operation(usdc_budget=usdc_budget)
+        return JSONResponse(plan, status_code=200)
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).exception(f"preview_operation failed: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 async def start_operation(request: Request):
     if not hasattr(request.app.state, "engine"):
         return JSONResponse(
@@ -138,19 +169,44 @@ async def start_operation(request: Request):
         )
     engine = request.app.state.engine
 
-    # Parse optional JSON body for Phase 2.0 budget
+    # Parse optional JSON body for Phase 2.0 budget + per-leg swap strategies
     usdc_budget = None
+    swap_strategies = None
     try:
         body = await request.json()
         if "usdc_budget" in body:
             usdc_budget = float(body["usdc_budget"])
             if usdc_budget <= 0:
                 return JSONResponse({"error": "usdc_budget must be positive"}, status_code=400)
+        if "swap_strategies" in body and isinstance(body["swap_strategies"], dict):
+            # Per-leg accepted values:
+            #   token0 → how to acquire token0 (USDC swap)
+            #   token1 → what to do with existing token1 (consolidate to
+            #     token0 pre-deposit, or keep stranded in wallet)
+            valid_per_leg = {
+                "token0": {"use_existing", "full_swap", "swap_diff"},
+                "token1": {"consolidate", "keep"},
+            }
+            raw = body["swap_strategies"]
+            cleaned: dict = {}
+            for leg, valid_choices in valid_per_leg.items():
+                if leg in raw:
+                    choice = str(raw[leg])
+                    if choice not in valid_choices:
+                        return JSONResponse(
+                            {"error": f"swap_strategies.{leg} must be one of {sorted(valid_choices)}"},
+                            status_code=400,
+                        )
+                    cleaned[leg] = choice
+            if cleaned:
+                swap_strategies = cleaned
     except Exception:
         pass  # No body or invalid JSON; legacy mode
 
     try:
-        op_id = await engine.start_operation(usdc_budget=usdc_budget)
+        op_id = await engine.start_operation(
+            usdc_budget=usdc_budget, swap_strategies=swap_strategies,
+        )
         return JSONResponse({"id": op_id, "status": "active"}, status_code=201)
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=409)
@@ -180,9 +236,8 @@ async def stop_operation(request: Request):
 
 
 async def cashout(request: Request):
-    """Manual swap WETH -> USDC. Used after teardown when user wants USDC out.
-
-    Only operates when there's NO active operation (otherwise teardown handles it).
+    """Swap any residual token0 in the wallet to token1. Only allowed when
+    no operation is active (otherwise teardown handles it via swap_to_usdc).
     """
     if not hasattr(request.app.state, "engine"):
         return JSONResponse({"error": "Engine not running"}, status_code=503)
@@ -199,38 +254,262 @@ async def cashout(request: Request):
         return JSONResponse({"error": "Lifecycle not configured"}, status_code=503)
 
     try:
-        bal = await engine._lifecycle._read_wallet_balance()
-        if bal["token0"] <= 0:
-            return JSONResponse({"weth_swapped": 0.0, "message": "No WETH in wallet"}, status_code=200)
-        import time
-        p_now = await engine._lifecycle._pool_reader.read_price()
-        slippage = engine._lifecycle._settings.slippage_bps / 10000.0
-        amount_in_raw = int(bal["token0"] * 10**engine._lifecycle._decimals0)
-        min_out = int(bal["token0"] * p_now * (1 - slippage) * 10**engine._lifecycle._decimals1)
-        tx_hash = await engine._lifecycle._uniswap.swap_exact_input(
-            token_in=engine._lifecycle._settings.token0_address,
-            token_out=engine._lifecycle._settings.token1_address,
-            fee=500,
-            amount_in=amount_in_raw, amount_out_minimum=min_out,
-            recipient=engine._lifecycle._uniswap.address,
-            deadline=int(time.time()) + 300,
+        return JSONResponse(await engine._lifecycle.cashout_residual(), status_code=200)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def curve_preview(request: Request):
+    """GET /curve → V3 range + grid that the engine WILL post (or is
+    posting) for the currently selected vault. Used by the dashboard to
+    render the LP curve visually so the user can see where buy/sell
+    orders trigger before/after starting an operation."""
+    if not hasattr(request.app.state, "engine"):
+        return JSONResponse({"error": "Engine not running"}, status_code=503)
+    engine = request.app.state.engine
+    try:
+        return JSONResponse(await engine.compute_curve_preview(), status_code=200)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def hedge_existing(request: Request):
+    """POST /operations/hedge-existing → open shorts against the Beefy
+    position currently in the wallet, without re-doing the bootstrap.
+    Useful when a previous bootstrap deposited but failed to open shorts.
+    """
+    if not hasattr(request.app.state, "engine"):
+        return JSONResponse({"error": "Engine not running"}, status_code=503)
+    engine = request.app.state.engine
+    try:
+        result = await engine.open_shorts_for_existing_position()
+        return JSONResponse(result, status_code=200)
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def update_operation_baseline(request: Request):
+    """POST /operations/<int:op_id>/baseline body {usd_value: float} →
+    set the cost-basis baseline used by the panel's Pool $ row. Per spec
+    2026-05-08-manual-deposit-baseline. Validates >0; persists via
+    db.update_operation_baseline_deposit (which guards on status='active').
+    """
+    if not hasattr(request.app.state, "db"):
+        return JSONResponse(
+            {"success": False, "error": "DB not available"}, status_code=503,
         )
-        return JSONResponse({"tx_hash": tx_hash, "weth_swapped": bal["token0"]}, status_code=200)
+    db = request.app.state.db
+    try:
+        op_id = int(request.path_params["op_id"])
+    except (KeyError, ValueError):
+        return JSONResponse(
+            {"success": False, "error": "invalid op_id"}, status_code=400,
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"success": False, "error": "Body must be JSON {usd_value: float}"},
+            status_code=400,
+        )
+    raw_value = body.get("usd_value")
+    if raw_value is None:
+        return JSONResponse(
+            {"success": False, "error": "missing usd_value"},
+            status_code=400,
+        )
+    try:
+        usd_value = float(raw_value)
+    except (TypeError, ValueError):
+        return JSONResponse(
+            {"success": False, "error": "usd_value must be a number"},
+            status_code=400,
+        )
+    if usd_value <= 0:
+        return JSONResponse(
+            {"success": False, "error": "usd_value must be positive"},
+            status_code=400,
+        )
+    try:
+        await db.update_operation_baseline_deposit(op_id, usd_value)
+    except Exception as e:
+        return JSONResponse(
+            {"success": False, "error": str(e)}, status_code=500,
+        )
+    return JSONResponse(
+        {"success": True, "baseline_deposit_usd": usd_value},
+        status_code=200,
+    )
+
+
+async def update_pnl_window(request: Request):
+    """POST /operations/<int:op_id>/pnl-window body {since_ts: float|null} →
+    set the user-selected window start for Hedge PnL. Per spec 2026-05-09:
+    when set, get_trade_pnl_since uses this timestamp instead of
+    op.started_at. Pass null to clear (revert to op.started_at).
+    """
+    if not hasattr(request.app.state, "db"):
+        return JSONResponse(
+            {"success": False, "error": "DB not available"}, status_code=503,
+        )
+    db = request.app.state.db
+    try:
+        op_id = int(request.path_params["op_id"])
+    except (KeyError, ValueError):
+        return JSONResponse(
+            {"success": False, "error": "invalid op_id"}, status_code=400,
+        )
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"success": False, "error": "Body must be JSON {since_ts: float|null}"},
+            status_code=400,
+        )
+    raw_value = body.get("since_ts", "_missing_")
+    if raw_value == "_missing_":
+        return JSONResponse(
+            {"success": False, "error": "missing since_ts (use null to clear)"},
+            status_code=400,
+        )
+    if raw_value is None:
+        since_ts = None
+    else:
+        try:
+            since_ts = float(raw_value)
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"success": False, "error": "since_ts must be a number or null"},
+                status_code=400,
+            )
+        if since_ts <= 0:
+            return JSONResponse(
+                {"success": False, "error": "since_ts must be positive"},
+                status_code=400,
+            )
+    try:
+        await db.update_pnl_window_since_ts(op_id, since_ts)
+    except Exception as e:
+        return JSONResponse(
+            {"success": False, "error": str(e)}, status_code=500,
+        )
+    return JSONResponse(
+        {"success": True, "pnl_window_since_ts": since_ts},
+        status_code=200,
+    )
+
+
+async def withdraw_partial(request: Request):
+    """POST /operations/withdraw-partial {usd_amount?, fraction?} → burn
+    proportional Beefy shares so the matching slice of the LP returns to
+    the wallet. Pass EITHER `usd_amount` (oracle-priced) OR `fraction`
+    (0..1, direct share fraction — preferred when oracle unavailable).
+    """
+    if not hasattr(request.app.state, "engine"):
+        return JSONResponse({"error": "Engine not running"}, status_code=503)
+    engine = request.app.state.engine
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            {"error": "Body must be JSON {usd_amount?, fraction?}"},
+            status_code=400,
+        )
+    usd_amount = body.get("usd_amount")
+    fraction = body.get("fraction")
+    if (usd_amount is None) == (fraction is None):
+        return JSONResponse(
+            {"error": "pass exactly one of {usd_amount} or {fraction}"},
+            status_code=400,
+        )
+    try:
+        result = await engine.withdraw_partial(
+            usd_amount=float(usd_amount) if usd_amount is not None else None,
+            fraction=float(fraction) if fraction is not None else None,
+        )
+        return JSONResponse(result, status_code=200)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+async def recover_partial(request: Request):
+    """Emergency recovery: withdraw any Beefy shares; optionally swap
+    residuals to USDC.
+
+    For when an operation fails mid-bootstrap and leaves orphaned shares
+    or wallet balances. Idempotent. Body: `{swap_to_usdc?: bool}`. Default
+    False — keeps tokens in the wallet so the next start_operation reuses
+    them.
+    """
+    if not hasattr(request.app.state, "engine"):
+        return JSONResponse({"error": "Engine not running"}, status_code=503)
+    engine = request.app.state.engine
+    db = request.app.state.db
+
+    active = await db.get_active_operation()
+    if active is not None:
+        return JSONResponse(
+            {"error": "Active operation in progress; use /operations/stop instead"},
+            status_code=409,
+        )
+
+    swap_to_usdc = False
+    try:
+        body = await request.json()
+        swap_to_usdc = bool(body.get("swap_to_usdc", False))
+    except Exception:
+        pass
+
+    try:
+        result = await engine.recover_partial_position(swap_to_usdc=swap_to_usdc)
+        return JSONResponse(result, status_code=200)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
 async def wallet_balance(request: Request):
+    """Return wallet balances + total USD value via oracle.
+
+    Routing mirrors preview_operation: pair-picker mode rebuilds the
+    lifecycle from the selected vault, so cross-pair vaults expose all
+    three balances (native USDC + token0 + token1) and the total in USD.
+
+    Backwards-compatible fields: `usdc_balance`, `weth_balance`,
+    `eth_balance` are still emitted (where `weth_balance` aliases
+    `token0_balance`, regardless of whether token0 is actually WETH).
+    New callers should use the explicit per-token fields.
+    """
+    empty = {
+        "usdc_balance": 0.0, "weth_balance": 0.0, "eth_balance": 0.0,
+        "token0_balance": 0.0, "token1_balance": 0.0,
+        "token0_symbol": "", "token1_symbol": "",
+        "token0_usd_price": 0.0, "token1_usd_price": 0.0,
+        "total_usd": 0.0, "is_dual_leg": False,
+    }
     if not hasattr(request.app.state, "engine"):
-        return JSONResponse({"usdc_balance": 0, "weth_balance": 0, "eth_balance": 0})
+        return JSONResponse(empty)
     engine = request.app.state.engine
-    if engine._lifecycle is None:
-        return JSONResponse({"usdc_balance": 0, "weth_balance": 0, "eth_balance": 0})
-    bal = await engine._lifecycle._read_wallet_balance()
+    summary = await engine.wallet_summary()
+    if summary is None:
+        return JSONResponse(empty)
     return JSONResponse({
-        "usdc_balance": bal["token1"],
-        "weth_balance": bal["token0"],
-        "eth_balance": bal["eth"],
+        # Backwards-compat keys
+        "usdc_balance": summary["usdc_balance"],
+        "weth_balance": summary["token0_balance"],
+        "eth_balance": summary["eth_balance"],
+        # Explicit per-token + USD breakdown
+        "token0_balance": summary["token0_balance"],
+        "token1_balance": summary["token1_balance"],
+        "token0_symbol": summary["token0_symbol"],
+        "token1_symbol": summary["token1_symbol"],
+        "token0_usd_price": summary["token0_usd_price"],
+        "token1_usd_price": summary["token1_usd_price"],
+        "total_usd": summary["total_usd"],
+        "is_dual_leg": summary["is_dual_leg"],
     })
 
 
@@ -267,15 +546,21 @@ async def select_pair(request: Request):
             {"error": f"Vault {vault_id} not in cache. Refresh pair list first."},
             status_code=400,
         )
-    if not pair.get("is_usd_pair"):
+
+    decimals = (pair.get("token0_decimals"), pair.get("token1_decimals"))
+    # Supported: (18, 6) USD-pairs (WETH/USDC) and (18, 18) cross-pairs (ARB/WETH)
+    SUPPORTED_DECIMALS = {(18, 6), (18, 18)}
+    if decimals not in SUPPORTED_DECIMALS:
         return JSONResponse(
-            {"error": "Cross-pairs not selectable in MVP (Phase 3.x scope)"},
+            {"error": f"Unsupported decimals {decimals}; MVP supports {sorted(SUPPORTED_DECIMALS)}"},
             status_code=400,
         )
-    decimals = (pair.get("token0_decimals"), pair.get("token1_decimals"))
-    if decimals != (18, 6):
+
+    # Cross-pair (is_usd_pair=False) requires token1's perp to be active
+    # so the bot can hedge both legs.
+    if not pair.get("is_usd_pair") and not pair.get("dydx_perp_token1"):
         return JSONResponse(
-            {"error": f"Unsupported decimals {decimals}; MVP only (18, 6)"},
+            {"error": "Cross-pair: token1 sem perp dYdX ativo"},
             status_code=400,
         )
 
@@ -287,17 +572,34 @@ async def select_pair(request: Request):
 
 
 async def refresh_pairs(request: Request):
-    """POST /pairs/refresh - re-fetch dYdX + Beefy and update caches."""
+    """POST /pairs/refresh - re-fetch dYdX + Beefy and update caches.
+
+    Builds an async Web3 client from settings.arbitrum_rpc_url so the Beefy
+    fetcher can resolve ERC20 metadata (symbol/decimals) on-chain for any
+    token addresses not yet in the DB cache.
+    """
     db = request.app.state.db
+    settings = request.app.state.settings
     from chains.dydx_markets import DydxMarketsFetcher
     from chains.beefy_api import BeefyApiFetcher
+
+    w3 = None
+    try:
+        from web3 import AsyncWeb3, AsyncHTTPProvider
+        if settings.arbitrum_rpc_url:
+            w3 = AsyncWeb3(AsyncHTTPProvider(settings.arbitrum_rpc_url))
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"Could not init w3 for ERC20 reads ({e}); will rely on cache only"
+        )
 
     try:
         dydx = DydxMarketsFetcher(db=db)
         n_dydx = await dydx.refresh()
         active = await dydx.get_active_tickers()
 
-        beefy = BeefyApiFetcher(db=db)
+        beefy = BeefyApiFetcher(db=db, w3=w3)
         n_beefy = await beefy.refresh(active_dydx_tickers=active)
 
         import time

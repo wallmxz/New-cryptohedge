@@ -64,13 +64,32 @@ class ChainExecutor:
 
         nonce = await self.get_nonce()
         chain_id = await _resolve_async_attr(self._w3.eth.chain_id)
-        gas_price = await _resolve_async_attr(self._w3.eth.gas_price)
+
+        # EIP-1559 gas pricing with safety margin. Arbitrum's `eth.gas_price`
+        # alone returns the current base fee with zero buffer — by the time
+        # the tx hits a block (1-3s later) the base fee has often nudged up
+        # and the tx is rejected with `max fee per gas less than block base
+        # fee`. Cap maxFeePerGas at 2× current base + tip so a 100% spike
+        # mid-flight still gets included.
+        try:
+            block = await _resolve_async_attr(self._w3.eth.get_block("pending"))
+            base_fee = int(block.get("baseFeePerGas", 0))
+        except Exception:
+            base_fee = 0
+        if base_fee <= 0:
+            # Fallback to legacy gas_price (e.g. tests / non-1559 chain).
+            base_fee = await _resolve_async_attr(self._w3.eth.gas_price)
+
+        # Arbitrum tip: a fraction of a gwei is plenty.
+        priority_fee = 100_000_000  # 0.1 gwei
+        max_fee = base_fee * 2 + priority_fee
 
         tx_params = {
             "from": self._account.address,
             "nonce": nonce,
             "gas": gas_limit,
-            "gasPrice": gas_price,
+            "maxFeePerGas": max_fee,
+            "maxPriorityFeePerGas": priority_fee,
             "value": value,
             "chainId": chain_id,
         }

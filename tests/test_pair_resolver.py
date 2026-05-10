@@ -73,26 +73,51 @@ def test_format_pair_for_ui_usd_pair():
     formatted = format_pair_for_ui(raw)
     assert formatted["pair"] == "WETH-USDC"
     assert formatted["selectable"] is True
-    assert formatted["pool_fee_pct"] == 0.05  # 500 bps
+    # Uniswap V3 fee param 500 = 0.05% = 0.0005 fraction (NOT 5%)
+    assert formatted["pool_fee_pct"] == 0.0005
+    assert formatted["pool_fee_label"] == "0.05%"
     assert formatted["dydx_perp"] == "ETH-USD"
 
 
-def test_format_pair_for_ui_cross_pair_not_selectable():
+def test_format_pair_for_ui_cross_pair_without_token1_perp_not_selectable():
+    """Cross-pair without dydx_perp_token1 is not selectable: cannot dual-leg hedge."""
     raw = {
         "vault_id": "0xV2",
+        "token0_symbol": "LDO", "token1_symbol": "WETH",
+        "token0_address": "0xLDO", "token1_address": "0xWETH",
+        "token0_decimals": 18, "token1_decimals": 18,
+        "manager": "wide", "pool_fee": 3000,
+        "tvl_usd": 1900000, "apy_30d": 0.7835,
+        "is_usd_pair": 0, "dydx_perp": "LDO-USD",
+        "dydx_perp_token1": None,
+        "tick_lower": None, "tick_upper": None,
+        "token0_logo_url": "https://logo/ldo", "token1_logo_url": "https://logo/weth",
+        "pool_address": "0xPOOL2",
+    }
+    formatted = format_pair_for_ui(raw)
+    assert formatted["selectable"] is False
+    assert "token1 sem perp" in formatted["reason"]
+
+
+def test_format_pair_for_ui_cross_pair_with_both_perps_selectable():
+    """Cross-pair with both perps active (e.g. ARB/WETH) is now selectable."""
+    raw = {
+        "vault_id": "0xV2B",
         "token0_symbol": "ARB", "token1_symbol": "WETH",
         "token0_address": "0xARB", "token1_address": "0xWETH",
         "token0_decimals": 18, "token1_decimals": 18,
         "manager": "wide", "pool_fee": 3000,
         "tvl_usd": 1900000, "apy_30d": 0.7835,
         "is_usd_pair": 0, "dydx_perp": "ARB-USD",
+        "dydx_perp_token1": "ETH-USD",
         "tick_lower": None, "tick_upper": None,
         "token0_logo_url": "https://logo/arb", "token1_logo_url": "https://logo/weth",
         "pool_address": "0xPOOL2",
     }
     formatted = format_pair_for_ui(raw)
-    assert formatted["selectable"] is False
-    assert "Phase 3.x" in formatted["reason"]
+    assert formatted["selectable"] is True
+    assert formatted["reason"] is None
+    assert formatted["dydx_perp_token1"] == "ETH-USD"
 
 
 def test_format_pair_for_ui_filters_exotic_decimals():
