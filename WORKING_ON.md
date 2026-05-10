@@ -1,19 +1,19 @@
 # WORKING_ON
 
-**Última atualização:** 2026-05-10 (predictive v2 implementado, PR #2 aberto)
+**Última atualização:** 2026-05-10 (PR #2 MERGEADO — predictive v2 em master)
 
 ## Foco atual
-**Predictive Hedge Model v2** — implementação completa via pipeline `superpowers:brainstorming` → spec → writing-plans → subagent-driven-development (T1-T9 ✅, 15 commits). PR [#2](https://github.com/wallmxz/New-cryptohedge/pull/2) aberto contra master, **aguardando user validar live + decidir merge**.
+**Predictive Hedge Model v2 em produção (master).** PR [#2](https://github.com/wallmxz/New-cryptohedge/pull/2) mergeado em 2026-05-10 via merge commit `c68f1ae`. Branch `feature/predictive-grid-v2` mantida (não deletada).
 
-**Próximo passo após merge do #2:**
-1. Funding window (item 3 do roadmap) — estender datetime picker pra também afetar Funding (~50 LoC)
-2. Deploy Fly.io (item 4)
-3. **Brainstorm UI/UX** — user pediu antes do compact ("o site é quase inútil"), discutir o que ter no painel
+**Próximos passos imediatos:**
+1. **User valida live** — `stop.bat` → `start.bat` → checar `hedge_model_status: warming_up → active`
+2. Decidir: começar **item 3 (funding window)** já, ou esperar 1-2h de runtime pra confirmar steady-state primeiro
+3. Depois funding: **item 4 (Fly.io)** + **brainstorm UI/UX** (user pediu antes do compact: "o site é quase inútil")
 
 ## Estado do bot agora
-- **Branch local:** `feature/predictive-grid-v2` — pushada
-- **PR aberto:** [#2 feat: predictive hedge model](https://github.com/wallmxz/New-cryptohedge/pull/2) — 15 commits, ~+650/-1100 LoC
-- **`master`:** sem o predictive v2 ainda — aguarda merge
+- **Branch atual:** `master` (fast-forwardada após merge do PR #2)
+- **`master`:** contém predictive v2 + tudo anterior (merge commit `c68f1ae`, +2367/-1110 LoC)
+- **Branch `feature/predictive-grid-v2`:** preservada (caso queira referência)
 - **Op ativa no DB:** #28 (cross-pair WETH/ARB, baseline manual $50.03)
 - **Hedge model:** novo módulo `engine/hedge_model.py` + `chains/v3_position.py` — lê L_main + L_alt direto da Uniswap V3 pool, computa target via fórmula V3, verify vs Beefy actual a cada iter
 - **Invariante estrutural:** target sempre vem de `actual × hedge_ratio` (Beefy), predicted é só pra verify+status
@@ -27,8 +27,8 @@
 | # | Item | Status |
 |---|---|---|
 | 1 | Fix do over-hedge ARB | ✅ user confirmou OK em 2026-05-10 |
-| 2 | **Predictive Hedge Model v2** | ✅ pushada (PR #2), aguardando validação live + merge |
-| 3 | Funding window (estender datetime picker) | pendente, próximo após v2 mergear |
+| 2 | **Predictive Hedge Model v2** | ✅ MERGEADO em master (PR #2, c68f1ae) — aguarda validação live |
+| 3 | Funding window (estender datetime picker) | próximo (após validação live) |
 | 4 | Deploy Fly.io | pendente |
 | 5 | Brainstorm UI/UX (novo) | pendente, user explicitamente pediu antes do compact |
 
