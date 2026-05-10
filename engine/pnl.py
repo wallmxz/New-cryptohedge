@@ -31,6 +31,10 @@ def compute_operation_pnl(
     # Authoritative hedge_pnl override (used when the venue exposes
     # cumulative trade_pnl since op start — survives uvicorn restarts).
     hedge_pnl_aggregate_override: float | None = None,
+    # Funding override (token0_paid, token1_paid) — caller computed funding
+    # for a user-selected window via get_funding_total_since. When provided,
+    # bypasses op.funding_paid_token0/1 from the DB.
+    funding_override: tuple[float, float] | None = None,
 ) -> dict:
     """Returns the live PnL breakdown for an operation.
 
@@ -106,7 +110,16 @@ def compute_operation_pnl(
 
     # Funding — convention: stored as "paid by us" so we negate to get the
     # signed amount in the breakdown (positive = received).
-    if is_cross_pair:
+    if funding_override is not None:
+        # Override path: caller (engine) computed funding for a
+        # user-selected window via get_funding_total_since.
+        # Override values are in "paid" convention (positive = paid);
+        # display inverts to "received" convention for the breakdown.
+        funding_t0 = -funding_override[0]
+        funding_t1 = -funding_override[1]
+    elif is_cross_pair:
+        # Default path: cumulative since op.started_at from DB column
+        # (populated by the funding poller).
         funding_t0 = -op.funding_paid_token0
         funding_t1 = -op.funding_paid_token1
     else:
