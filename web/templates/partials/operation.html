@@ -16,6 +16,10 @@
         </div>
     </div>
 
+    <div x-show="state.operation_state !== 'none'" x-cloak class="text-xs text-slate-500 mt-1 mb-2">
+        Hedge model: <span x-text="state.hedge_model_status || 'warming_up'"></span>
+    </div>
+
     <!-- Bootstrap/teardown progress -->
     <div x-show="state.bootstrap_progress" x-cloak
          class="mb-3 p-3 rounded-lg"

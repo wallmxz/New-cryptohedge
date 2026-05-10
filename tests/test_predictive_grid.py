@@ -134,6 +134,13 @@ def test_predictive_unavailable_is_exception():
     assert str(exc) == "book empty"
 
 
+import pytest
+
+
+@pytest.mark.skip(
+    reason="T6 removed `predictive_status` from StateHub (renamed to "
+    "`hedge_model_status`). This file is deleted in T7."
+)
 def test_state_hub_has_predictive_status_field():
     from state import StateHub
     hub = StateHub(hedge_ratio=0.98)
