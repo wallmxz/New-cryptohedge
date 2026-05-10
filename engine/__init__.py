@@ -905,10 +905,19 @@ class GridMakerEngine:
             await self._maybe_reconcile()
 
             t = time.monotonic()
-            beefy_pos, p_now = await asyncio.gather(
-                self._beefy_reader.read_position(),
-                self._pool_reader.read_price(),
-            )
+            try:
+                beefy_pos, p_now = await asyncio.wait_for(
+                    asyncio.gather(
+                        self._beefy_reader.read_position(),
+                        self._pool_reader.read_price(),
+                    ),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError as e:
+                logger.warning(
+                    "_iterate: chain RPC gather timeout, skipping iter: %s", e,
+                )
+                return
             timings["chain_read"] = (time.monotonic() - t) * 1000
             metrics.loop_duration.labels(step="chain_read").observe(timings["chain_read"] / 1000)
 
