@@ -10,6 +10,7 @@ dist/
 # Runtime / per-machine
 uvicorn.log
 scripts/lighter_diagnose.log
+tmp_out/
 .claude/scheduled_tasks.lock
 .claude/settings.local.json
 .superpowers/
