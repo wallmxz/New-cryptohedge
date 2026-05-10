@@ -21,12 +21,6 @@ def _make_reader(positions_return=(123456789, 0, 0, 0, 0),
     pool_contract.functions.positions.return_value.call = pool_positions_call
 
     strategy_main_call = AsyncMock(return_value=main_range)
-    strategy_alt_call = AsyncMock(
-        side_effect=Exception("alt not active") if alt_raises
-        else (lambda: alt_range) if callable(alt_range)
-        else None,
-        return_value=alt_range if not alt_raises else None,
-    )
     if alt_raises:
         strategy_alt_call = AsyncMock(side_effect=Exception("alt not active"))
     elif alt_range is None:
@@ -52,12 +46,17 @@ def _make_reader(positions_return=(123456789, 0, 0, 0, 0),
 @pytest.mark.asyncio
 async def test_compute_position_key_uses_strategy_owner_and_ticks():
     """Position key must be keccak256(owner, int24 tickLower, int24 tickUpper)
-    matching Uniswap V3's PositionKey.compute() encoding."""
+    matching Uniswap V3's PositionKey.compute() encoding. Pin the
+    solidity_keccak call shape so anyone reordering args or changing
+    int24->int256 fails this test instead of silently mining wrong keys."""
     reader, _, _ = _make_reader()
+    spy = MagicMock(return_value=b"\xab" * 32)
+    reader._w3.solidity_keccak = spy
     key = reader._compute_position_key(96040, 97540)
-    # Verify w3.solidity_keccak was called with right args
-    # (we use a stub returning b'\xab'*32, so check the call shape)
-    reader._w3.solidity_keccak  # accessed during _compute_position_key
+    spy.assert_called_once_with(
+        ["address", "int24", "int24"],
+        ["0xSTRATEGY", 96040, 97540],
+    )
     assert key == b"\xab" * 32
     assert len(key) == 32
 
