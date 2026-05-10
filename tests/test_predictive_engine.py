@@ -212,6 +212,10 @@ async def test_iterate_predictive_raises_when_slot0_fails():
         await eng._iterate_predictive()
 
 
+@pytest.mark.skip(reason=(
+    "Deleted in T7 — engine no longer writes predictive_status; see "
+    "hedge_model_status. T5 swapped predictive grid for HedgeModel."
+))
 @pytest.mark.asyncio
 async def test_iterate_falls_back_to_reactive_when_predictive_unavailable():
     """When _iterate_predictive raises PredictiveUnavailable, _iterate runs

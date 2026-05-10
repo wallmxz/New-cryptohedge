@@ -5,6 +5,14 @@ import pytest
 
 from state import StateHub
 
+# Deleted in T7 — engine no longer has _grid / _refresh_grid / _grid_stale
+# (T5 swapped predictive grid for HedgeModel). Skip the whole module to
+# keep the suite green until T7 deletes these files.
+pytestmark = pytest.mark.skip(reason=(
+    "Deleted in T7 — engine no longer has _grid / _refresh_grid / "
+    "_grid_stale; T5 swapped predictive grid for HedgeModel."
+))
+
 
 def _engine_with_predictive():
     """Build an engine instance ready to test refresh logic."""

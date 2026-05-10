@@ -97,6 +97,12 @@ class GridMakerEngine:
         # pool_reader is available (e.g. test/no-vault state); engine
         # falls back to Beefy direct in that case.
         self._hedge_model = None  # type: "HedgeModel | None"
+        # Strong reference to the in-flight refresh_cache() task.
+        # Python 3.13 may garbage-collect tasks that aren't referenced
+        # anywhere; we overwrite each iter (prior task either completed
+        # or is still running, which is fine — refresh_cache is
+        # idempotent and short-lived).
+        self._refresh_task: asyncio.Task | None = None
 
     def _ensure_reconciler(self):
         if self._reconciler is None and self._exchange is not None:
@@ -1116,12 +1122,19 @@ class GridMakerEngine:
             # target via V3 formula with cached L_main + L_alt. Verify
             # vs Beefy actual; use ACTUAL as the authoritative target
             # (predicted is informational + drives status field).
+            from engine.hedge_model import DIVERGENCE_THRESHOLD
             predicted = None
             if self._hedge_model is not None:
                 # Trigger async refresh if cache stale or pending — does
                 # NOT await, so iter is never blocked by RPC.
                 if self._hedge_model.should_refresh():
-                    asyncio.create_task(self._hedge_model.refresh_cache())
+                    # Hold strong ref so 3.13 GC doesn't drop a pending
+                    # task. Each iter overwrites; prior task either
+                    # completed or is still running (which is fine —
+                    # refresh_cache is idempotent and short-lived).
+                    self._refresh_task = asyncio.create_task(
+                        self._hedge_model.refresh_cache()
+                    )
                 # Predict (returns None if cache cold)
                 predicted = self._hedge_model.predict(
                     p_now,
@@ -1136,9 +1149,11 @@ class GridMakerEngine:
                     predicted=predicted, actual=actual_total,
                 )
                 self._hub.hedge_model_status = (
-                    "active" if div <= 0.01
+                    "active" if div <= DIVERGENCE_THRESHOLD
                     else f"verify_diverging:{div * 100:.1f}%"
                 )
+            elif self._hedge_model is None:
+                self._hub.hedge_model_status = "unavailable"
             else:
                 self._hub.hedge_model_status = "warming_up"
 
