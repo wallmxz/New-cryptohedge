@@ -126,3 +126,84 @@ async def test_cache_stale_after_ttl(monkeypatch):
     fake_now = time.monotonic() + REFRESH_TTL_S + 1.0
     monkeypatch.setattr(time, "monotonic", lambda: fake_now)
     assert model.cache_stale() is True
+
+
+@pytest.mark.asyncio
+async def test_predict_handles_asymmetric_decimals():
+    """Asymmetric pair (WETH 18 / USDC 6) — predicted_amount1 should be
+    scaled by 10^6 not 10^18. Catches regressions where someone uses a
+    single decimals factor or swaps the two."""
+    model, _ = _make_model(alt_pos=None)
+    await model.refresh_cache()
+    p_now = math.pow(1.0001, 96800)
+
+    # Symmetric (control): decimals0=decimals1=18
+    sym = model.predict(p_now, decimals0=18, decimals1=18)
+
+    # Asymmetric: decimals0=18 (WETH), decimals1=6 (USDC) — same raw L
+    asym = model.predict(p_now, decimals0=18, decimals1=6)
+
+    assert sym is not None and asym is not None
+    # token0 (decimals0=18) is identical in both calls
+    assert math.isclose(sym[0], asym[0])
+    # token1 (decimals1=18 vs 6): asym should be 10^12 LARGER (less divide)
+    assert math.isclose(asym[1] / sym[1], 10**12, rel_tol=1e-6)
+
+
+def test_v3_amount_formulas_match_canonical_uniswap_math():
+    """Lock the V3 formulas to known values. Regressions in sign or
+    operand order will fail this test (current tests only check sign/
+    monotonicity, not magnitude)."""
+    from engine.hedge_model import _v3_amount0, _v3_amount1
+
+    # In-range case: L=10^21, p=1.0, p_a=0.5, p_b=2.0
+    L = 10**21
+    p = 1.0
+    p_a = 0.5
+    p_b = 2.0
+
+    # amount0 = L * (1/sqrt(p) - 1/sqrt(p_b))
+    #         = 10^21 * (1/1 - 1/sqrt(2))
+    #         = 10^21 * (1 - 0.7071067811865475)
+    #         = 10^21 * 0.2928932188134525
+    expected_a0 = 10**21 * (1.0 - 1.0 / math.sqrt(2.0))
+    actual_a0 = _v3_amount0(L, p, p_a, p_b)
+    assert math.isclose(actual_a0, expected_a0, rel_tol=1e-12), (
+        f"_v3_amount0 returned {actual_a0}, expected {expected_a0}"
+    )
+
+    # amount1 = L * (sqrt(p) - sqrt(p_a))
+    #         = 10^21 * (1 - sqrt(0.5))
+    #         = 10^21 * (1 - 0.7071067811865476)
+    #         = 10^21 * 0.2928932188134524
+    expected_a1 = 10**21 * (1.0 - math.sqrt(0.5))
+    actual_a1 = _v3_amount1(L, p, p_a, p_b)
+    assert math.isclose(actual_a1, expected_a1, rel_tol=1e-12), (
+        f"_v3_amount1 returned {actual_a1}, expected {expected_a1}"
+    )
+
+    # Edge clamping
+    assert _v3_amount0(L, p_b, p_a, p_b) == 0.0  # at p_b → 0
+    assert _v3_amount0(L, p_b + 0.5, p_a, p_b) == 0.0  # above p_b → 0
+    assert _v3_amount1(L, p_a, p_a, p_b) == 0.0  # at p_a → 0
+    assert _v3_amount1(L, p_a - 0.1, p_a, p_b) == 0.0  # below p_a → 0
+
+
+@pytest.mark.asyncio
+async def test_refresh_pending_survives_failed_refresh():
+    """If verify scheduled a refresh (_refresh_pending=True) and the
+    next refresh attempt RPC-fails, _refresh_pending must REMAIN True
+    so the engine retries on the next iter (not silently swallowed)."""
+    model, _ = _make_model()
+    await model.refresh_cache()  # populate cache, _refresh_pending=False
+
+    # Trigger pending via verify divergence
+    model.verify(predicted=(0.5, 100.0), actual=(1.0, 100.0))  # 50% on leg 0
+    assert model._refresh_pending is True
+
+    # Now fail the next refresh
+    model._reader.read_position_main = AsyncMock(side_effect=Exception("RPC down"))
+    await model.refresh_cache()  # raises internally; logs warning
+
+    # Pending must still be True (retry next iter)
+    assert model._refresh_pending is True
