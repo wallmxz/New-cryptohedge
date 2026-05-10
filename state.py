@@ -64,10 +64,13 @@ class StateHub:
     wallet_eth_balance: float = 0.0
     bootstrap_progress: str = ""  # human-readable string for UI ("Swapping...", "Depositing...")
 
-    # Predictive grid status (predictive grid spec 2026-05-08).
-    # Values: "idle", "active", "warmup", "no_grid",
-    #         "fallback: <reason>". Surfaces in dashboard.
-    predictive_status: str = "idle"
+    # Hedge model status (predictive hedge model spec 2026-05-10).
+    # Values: "warming_up", "active", "verify_diverging:<pct>%",
+    #         "unavailable". Surfaces in dashboard. Replaces the v1
+    #         `predictive_status` field (removed in T6) — that one was
+    #         tied to the grid-based design; v2 is a pure formula-based
+    #         hedge model and the new name reflects that.
+    hedge_model_status: str = "warming_up"
 
     # Live USD prices for the active pair's tokens (from exchange oracle —
     # WS midpoint on Lighter). The dashboard uses these to USD-format

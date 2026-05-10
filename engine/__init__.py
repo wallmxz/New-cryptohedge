@@ -24,14 +24,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class PredictiveUnavailable(Exception):
-    """Raised by predictive_grid path when this iter can't fire predictively
-    (book empty, RPC down, grid not built yet). Caller falls back to the
-    reactive `_maybe_rebalance_leg` path. Per spec
-    2026-05-08-predictive-curve-grid-hedge-design § Coexistence.
-    """
-
-
 class GridMakerEngine:
     """Main loop:
     1. Read pool position (Beefy + Uniswap pool)
@@ -90,14 +82,19 @@ class GridMakerEngine:
         # Default no-op on adapters that don't implement it.
         if self._exchange is not None:
             self._exchange.subscribe_funding(self._on_funding_payment)
-        # Predictive curve-grid (spec 2026-05-08). _grid is None until
-        # _refresh_grid() runs successfully. _last_level_idx is None
-        # immediately after a rebuild → next iter snaps without firing
-        # (warmup). _last_grid_check_at gates polling cadence.
-        self._grid = None  # type: "LevelGrid | None"
-        self._last_level_idx: int | None = None
-        self._last_grid_check_at: float = 0.0
-        self._GRID_CHECK_INTERVAL_S = 60.0
+        # Predictive hedge model (spec 2026-05-10). Cache populated on
+        # first iter via _hedge_model.refresh_cache(); engine compares
+        # predicted vs Beefy actual each iter and uses ACTUAL as the
+        # authoritative target. _hedge_model is None when no
+        # pool_reader is available (e.g. test/no-vault state); engine
+        # falls back to Beefy direct in that case.
+        self._hedge_model = None  # type: "HedgeModel | None"
+        # Strong reference to the in-flight refresh_cache() task.
+        # Python 3.13 may garbage-collect tasks that aren't referenced
+        # anywhere; we overwrite each iter (prior task either completed
+        # or is still running, which is fine — refresh_cache is
+        # idempotent and short-lived).
+        self._refresh_task: asyncio.Task | None = None
 
     def _ensure_reconciler(self):
         if self._reconciler is None and self._exchange is not None:
@@ -865,6 +862,22 @@ class GridMakerEngine:
             logger.warning(
                 f"resolve_market_ids_for_funding (post-rebuild) failed: {e}"
             )
+        # Build / rebuild HedgeModel whenever vault readers change. The
+        # V3PositionReader needs the pool address (from settings) and
+        # the Beefy strategy address (resolved from the vault).
+        from chains.v3_position import V3PositionReader
+        from engine.hedge_model import HedgeModel
+        try:
+            strategy_addr = await self._beefy_reader._earn.functions.strategy().call()
+            v3_reader = V3PositionReader(
+                w3=self._beefy_reader._w3,
+                pool_address=str(self._settings.clm_pool_address),
+                beefy_strategy_address=strategy_addr,
+            )
+            self._hedge_model = HedgeModel(v3_reader)
+        except Exception as e:
+            logger.warning(f"HedgeModel build failed: {e}; engine will fall back to Beefy actual")
+            self._hedge_model = None
         logger.info(
             f"Engine readers rebuilt for vault {selected} "
             f"({pair_settings.pool_token0_symbol}/{pair_settings.pool_token1_symbol})"
@@ -892,10 +905,19 @@ class GridMakerEngine:
             await self._maybe_reconcile()
 
             t = time.monotonic()
-            beefy_pos, p_now = await asyncio.gather(
-                self._beefy_reader.read_position(),
-                self._pool_reader.read_price(),
-            )
+            try:
+                beefy_pos, p_now = await asyncio.wait_for(
+                    asyncio.gather(
+                        self._beefy_reader.read_position(),
+                        self._pool_reader.read_price(),
+                    ),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError as e:
+                logger.warning(
+                    "_iterate: chain RPC gather timeout, skipping iter: %s", e,
+                )
+                return
             timings["chain_read"] = (time.monotonic() - t) * 1000
             metrics.loop_duration.labels(step="chain_read").observe(timings["chain_read"] / 1000)
 
@@ -1097,35 +1119,60 @@ class GridMakerEngine:
             if is_dual_leg:
                 targets[symbols[1]] = my_amount1 * self._hub.hedge_ratio
 
-            # Predictive curve-grid DISABLED (2026-05-09): the model
-            # derives L from total strategy balances via
-            # compute_l_from_value, but Beefy CLM v2 has TWO V3 positions
-            # (positionMain + positionAlt) plus idle balances + pending
-            # fees. Treating all of that as one positionMain inflates L
-            # ~3x → grid amounts at any level are completely wrong →
-            # recon fires in wrong direction (witnessed live: ETH BUY
-            # 0.0099 + ARB SELL 168 vs the actual needs).
-            #
-            # Reactive (_maybe_rebalance_leg) uses my_amount0/1 directly
-            # from beefy_pos with no L derivation — works correctly.
-            # Until predictive is redesigned to model positionAlt + idle
-            # balances explicitly, force fallback every iter.
-            fallback_reason = "predictive disabled (positionAlt unmodeled)"
-
-            if fallback_reason is not None:
-                self._hub.predictive_status = f"fallback: {fallback_reason}"
-                # Fire rebalance per leg via reactive engine (legacy path)
-                for sym in symbols:
-                    idx = symbols.index(sym)
-                    current = abs(positions[idx].size) if positions[idx] else 0.0
-                    ref_price = oracle_prices.get(sym, 0.0)
-                    if ref_price <= 0:
-                        continue
-                    await self._maybe_rebalance_leg(
-                        symbol=sym, target=targets[sym], current=current,
-                        min_notional=self._settings.min_rebalance_notional_usd,
-                        ref_price=ref_price,
+            # Predictive hedge model (spec 2026-05-10). Compute predicted
+            # target via V3 formula with cached L_main + L_alt. Verify
+            # vs Beefy actual; use ACTUAL as the authoritative target
+            # (predicted is informational + drives status field).
+            from engine.hedge_model import DIVERGENCE_THRESHOLD
+            predicted = None
+            if self._hedge_model is not None:
+                # Trigger async refresh if cache stale or pending — does
+                # NOT await, so iter is never blocked by RPC.
+                if self._hedge_model.should_refresh():
+                    # Hold strong ref so 3.13 GC doesn't drop a pending
+                    # task. Each iter overwrites; prior task either
+                    # completed or is still running (which is fine —
+                    # refresh_cache is idempotent and short-lived).
+                    self._refresh_task = asyncio.create_task(
+                        self._hedge_model.refresh_cache()
                     )
+                # Predict (returns None if cache cold)
+                predicted = self._hedge_model.predict(
+                    p_now,
+                    decimals0=self._decimals0,
+                    decimals1=self._decimals1,
+                )
+
+            # Verify (informational; sets _refresh_pending if diverging)
+            if predicted is not None:
+                actual_total = (beefy_pos.amount0, beefy_pos.amount1)
+                div = self._hedge_model.verify(
+                    predicted=predicted, actual=actual_total,
+                )
+                self._hub.hedge_model_status = (
+                    "active" if div <= DIVERGENCE_THRESHOLD
+                    else f"verify_diverging:{div * 100:.1f}%"
+                )
+            elif self._hedge_model is None:
+                self._hub.hedge_model_status = "unavailable"
+            else:
+                self._hub.hedge_model_status = "warming_up"
+
+            # Always fire per leg via _maybe_rebalance_leg (reactive path).
+            # Target = actual × share × hedge_ratio (computed above into
+            # `targets`). predicted is informational only (drives
+            # hedge_model_status field).
+            for sym in symbols:
+                idx = symbols.index(sym)
+                current = abs(positions[idx].size) if positions[idx] else 0.0
+                ref_price = oracle_prices.get(sym, 0.0)
+                if ref_price <= 0:
+                    continue
+                await self._maybe_rebalance_leg(
+                    symbol=sym, target=targets[sym], current=current,
+                    min_notional=self._settings.min_rebalance_notional_usd,
+                    ref_price=ref_price,
+                )
         finally:
             timings["total"] = (time.monotonic() - iter_start) * 1000
             metrics.loop_duration.labels(step="total").observe(timings["total"] / 1000)
@@ -1140,98 +1187,6 @@ class GridMakerEngine:
             return await self._exchange.get_collateral()
         except Exception:
             return None
-
-    def _grid_stale(self) -> bool:
-        """True if it's time to re-poll Beefy strategy.positionMain() to
-        check for tick range change. Polling cadence
-        self._GRID_CHECK_INTERVAL_S (60 s by default).
-        """
-        return (
-            time.monotonic() - self._last_grid_check_at
-        ) > self._GRID_CHECK_INTERVAL_S
-
-    async def _refresh_grid(self) -> None:
-        """Polls Beefy + rebuilds grid if tick range changed.
-
-        Atomic on failure: keeps existing self._grid intact, just bumps
-        the check timestamp so we don't retry-storm. Resets
-        self._last_level_idx to None on a real rebuild → next iter snaps
-        (no spurious fire). Per spec § Re-grid.
-        """
-        from engine.predictive_grid import build_grid
-        from engine.curve import compute_l_from_value
-
-        try:
-            position_main = await (
-                self._beefy_reader._strategy.functions.positionMain().call()
-            )
-            # Beefy CLM v2 returns positionMain as flat [tickLower, tickUpper]
-            # (verified against vault 0xBfaDfc... strategy 0xC443a6...).
-            # Earlier spec assumed nested ((tickLower,tickUpper),...) — wrong.
-            new_lower = int(position_main[0])
-            new_upper = int(position_main[1])
-        except Exception as e:
-            logger.warning(f"_refresh_grid: positionMain() failed: {e}")
-            self._last_grid_check_at = time.monotonic()  # avoid retry storm
-            return
-
-        self._last_grid_check_at = time.monotonic()
-
-        if (self._grid is not None
-                and self._grid.tick_lower == new_lower
-                and self._grid.tick_upper == new_upper):
-            return  # cached grid is current
-
-        # Rebuild needed. Need L = compute_l_from_value(my_value_t1, p_a, p_b, p_now).
-        try:
-            beefy_pos = await self._beefy_reader.read_position()
-            my_amount0 = beefy_pos.amount0 * beefy_pos.share
-            my_amount1 = beefy_pos.amount1 * beefy_pos.share
-            sqrt_price_x96, _current_tick = await self._pool_reader.read_slot0()
-            p_now = (sqrt_price_x96 / 2**96) ** 2
-        except Exception as e:
-            logger.warning(f"_refresh_grid: chain read failed: {e}")
-            return
-
-        my_value_t1 = my_amount0 * p_now + my_amount1
-        if my_value_t1 <= 0:
-            logger.warning("_refresh_grid: my_value_t1 <= 0, skipping build")
-            return
-
-        import math
-        p_a = math.pow(1.0001, new_lower)
-        p_b = math.pow(1.0001, new_upper)
-        # L_user requires p inside [p_a, p_b]. If OOR, fall back to the
-        # closer boundary as p for the L solve.
-        p_for_l = max(p_a, min(p_b, p_now))
-        try:
-            L_user = compute_l_from_value(my_value_t1, p_a, p_b, p_for_l)
-        except Exception as e:
-            logger.warning(f"_refresh_grid: compute_l_from_value failed: {e}")
-            return
-
-        try:
-            new_grid = build_grid(
-                tick_lower=new_lower, tick_upper=new_upper,
-                L=L_user,
-                p0_usd=self._hub.token0_usd_price or 1.0,
-                p1_usd=self._hub.token1_usd_price or 1.0,
-                min_leg_notional_usd=self._settings.min_rebalance_notional_usd,
-            )
-        except Exception as e:
-            logger.exception(f"_refresh_grid: build_grid failed: {e}")
-            return
-
-        old_range = (
-            (self._grid.tick_lower, self._grid.tick_upper)
-            if self._grid else None
-        )
-        self._grid = new_grid
-        self._last_level_idx = None
-        logger.info(
-            f"Grid rebuilt: range {old_range} → ({new_lower}, {new_upper}), "
-            f"{len(new_grid.p_levels)} levels"
-        )
 
     async def resolve_market_ids_for_funding(self) -> None:
         """Resolve the market_index for token0 and token1 perp symbols.
@@ -1338,132 +1293,6 @@ class GridMakerEngine:
             (leg_byte << 8) |
             (self._cloid_seq & 0xFF)
         )
-
-    async def _fire_predictive_leg(
-        self, symbol: str, delta: float,
-    ) -> None:
-        """Place a taker order at the current bid (sell) or ask (buy) for
-        a per-leg `delta`. Skips silently if leg notional < $0.50.
-        Raises PredictiveUnavailable if the book has no entry for this
-        market. Per spec § Per-leg fire.
-        """
-        if abs(delta) < 1e-12:
-            return
-
-        side = "sell" if delta > 0 else "buy"
-        size = abs(delta)
-
-        # Reuse market_id resolved by the funding-handler wiring (a571603).
-        if symbol == self._settings.dydx_symbol_token0:
-            market_id = self._token0_mid
-        elif symbol == self._settings.dydx_symbol_token1:
-            market_id = self._token1_mid
-        else:
-            market_id = None
-        if market_id is None:
-            raise PredictiveUnavailable(
-                f"market_id unresolved for {symbol}"
-            )
-
-        book = getattr(self._exchange, "_ws_book_top", {}).get(market_id)
-        if not book or not book.get("best_bid") or not book.get("best_ask"):
-            raise PredictiveUnavailable(
-                f"book empty for {symbol} (mid={market_id})"
-            )
-
-        price = book["best_bid"] if side == "sell" else book["best_ask"]
-        leg_notional_usd = size * price
-        if leg_notional_usd < self._settings.min_rebalance_notional_usd:
-            logger.debug(
-                f"Predictive: skip {symbol} leg, "
-                f"${leg_notional_usd:.4f} < ${self._settings.min_rebalance_notional_usd:.2f}"
-            )
-            return
-
-        cloid = self._next_cloid_for_leg(symbol)
-        await self._exchange.place_long_term_order(
-            symbol=symbol, side=side, size=size, price=price,
-            cloid_int=cloid, ttl_seconds=60,
-        )
-        logger.info(
-            f"Predictive fire [{symbol}]: {side} {size:.6f} @ {price:.6f} "
-            f"(${leg_notional_usd:.2f})"
-        )
-
-    async def _iterate_predictive(self) -> None:
-        """One predictive iter:
-        1. Read pool slot0 (raises PredictiveUnavailable on failure).
-        2. Map p_now → level idx via bisect.
-        3. If first iter post-rebuild (_last_level_idx None): snap, no fire.
-        4. On level change: fire incremental delta per leg.
-        5. ALWAYS: reconcile against absolute target (catches warmup
-           baseline mismatch, residuals from reactive fires, manual
-           interference, missed fires). Recon delta uses the same
-           per-leg fire path → same $0.50 floor in
-           _fire_predictive_leg, so sub-floor drifts skip silently.
-        Per spec § Per-iter logic + reconciliation patch (2026-05-09).
-        """
-        from engine.predictive_grid import find_level_idx, compute_deltas
-
-        if self._grid is None:
-            raise PredictiveUnavailable("grid not built")
-
-        try:
-            sqrt_price_x96, _current_tick = await self._pool_reader.read_slot0()
-            p_now = (sqrt_price_x96 / 2**96) ** 2
-        except Exception as e:
-            raise PredictiveUnavailable(f"slot0 read failed: {e}")
-
-        new_idx = find_level_idx(self._grid, p_now)
-
-        if self._last_level_idx is None:
-            self._last_level_idx = new_idx
-            return  # warmup, no fire — recon ALSO skipped this iter
-
-        sym_t0 = self._settings.dydx_symbol_token0
-        sym_t1 = self._settings.dydx_symbol_token1
-
-        # ---- Per-level incremental fires (only on level change) ----
-        if new_idx != self._last_level_idx:
-            delta_t0, delta_t1 = compute_deltas(
-                self._grid, self._last_level_idx, new_idx,
-            )
-            delta_t0 *= self._hub.hedge_ratio
-            delta_t1 *= self._hub.hedge_ratio
-            # Sequential — Lighter nonce_manager races on parallel.
-            await self._fire_predictive_leg(sym_t0, delta_t0)
-            await self._fire_predictive_leg(sym_t1, delta_t1)
-            self._last_level_idx = new_idx
-
-        # ---- Absolute reconciliation (every iter) ----
-        # The per-level deltas above only track INCREMENTAL changes. If
-        # the bot's actual short doesn't match what the grid expects at
-        # the current level (because of warmup baseline mismatch, prior
-        # reactive fallback fires, manual close/open by the user, or
-        # partial fills), the offset persists indefinitely without this.
-        # Recon compares amount_at_level × hedge_ratio (the absolute
-        # target) to the actual short and fires the diff. _fire_predictive_leg's
-        # internal $0.50 floor (settings.min_rebalance_notional_usd)
-        # gates whether the recon fire actually goes — sub-floor drift
-        # accumulates until the next level crossing absorbs it.
-        target_t0 = self._grid.amount0_at[new_idx] * self._hub.hedge_ratio
-        target_t1 = self._grid.amount1_at[new_idx] * self._hub.hedge_ratio
-        pos_t0 = await self._safe_get_position(sym_t0)
-        pos_t1 = await self._safe_get_position(sym_t1)
-        current_t0 = abs(pos_t0.size) if pos_t0 else 0.0
-        current_t1 = abs(pos_t1.size) if pos_t1 else 0.0
-        recon_delta_t0 = target_t0 - current_t0
-        recon_delta_t1 = target_t1 - current_t1
-        try:
-            await self._fire_predictive_leg(sym_t0, recon_delta_t0)
-            await self._fire_predictive_leg(sym_t1, recon_delta_t1)
-        except PredictiveUnavailable:
-            # Book empty during recon — let reactive fallback take over
-            # next iter. Don't raise here because per-level fires above
-            # may have already succeeded; raising would trigger the
-            # _iterate try/except and run reactive on top of predictive's
-            # per-level fires (double-hedge). Silent recovery instead.
-            logger.debug("Recon: book empty, skipping this iter")
 
     async def _on_funding_payment(self, entry) -> None:
         """Handle one funding payment from the exchange.

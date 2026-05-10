@@ -62,3 +62,16 @@ def test_statehub_last_iter_timings_default():
     s = StateHub()
     assert s.last_iter_timings == {}
     assert isinstance(s.last_iter_timings, dict)
+
+
+def test_statehub_hedge_model_status_default():
+    from state import StateHub
+    s = StateHub()
+    assert s.hedge_model_status == "warming_up"
+
+
+def test_statehub_predictive_status_removed():
+    """v1 `predictive_status` was renamed to `hedge_model_status` in T6."""
+    from state import StateHub
+    s = StateHub()
+    assert not hasattr(s, "predictive_status")
