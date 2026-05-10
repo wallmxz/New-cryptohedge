@@ -1,38 +1,59 @@
 # WORKING_ON
 
-**Última atualização:** 2026-05-10 (PR #1 mergeado, abrindo predictive v2)
+**Última atualização:** 2026-05-10 (predictive v2 implementado, PR #2 aberto)
 
 ## Foco atual
-**Predictive curve-grid v2** — brainstorm em andamento. Virada arquitetural: grid serve só pra TIMING (detectar cruzamento de level), target absoluto sempre vem de `my_amount × hedge_ratio` direto da Beefy. Reconciler $0.50 toda iter. Engine não pode "engasgar" (RPC timeout sem fallback, await infinito, etc). Pipeline `superpowers:brainstorming` → spec → plan → subagent.
+**Predictive Hedge Model v2** — implementação completa via pipeline `superpowers:brainstorming` → spec → writing-plans → subagent-driven-development (T1-T9 ✅, 15 commits). PR [#2](https://github.com/wallmxz/New-cryptohedge/pull/2) aberto contra master, **aguardando user validar live + decidir merge**.
+
+**Próximo passo após merge do #2:**
+1. Funding window (item 3 do roadmap) — estender datetime picker pra também afetar Funding (~50 LoC)
+2. Deploy Fly.io (item 4)
+3. **Brainstorm UI/UX** — user pediu antes do compact ("o site é quase inútil"), discutir o que ter no painel
 
 ## Estado do bot agora
-- **Branch atual:** `feature/predictive-grid-v2` (fast-forward de `master` pós-merge do PR #1)
-- **`master`:** sincronizado com `origin/master`, contém todo o trabalho cross-pair + position-truth + baseline + funding poller + datetime picker (merge commit `ea479b9`)
+- **Branch local:** `feature/predictive-grid-v2` — pushada
+- **PR aberto:** [#2 feat: predictive hedge model](https://github.com/wallmxz/New-cryptohedge/pull/2) — 15 commits, ~+650/-1100 LoC
+- **`master`:** sem o predictive v2 ainda — aguarda merge
 - **Op ativa no DB:** #28 (cross-pair WETH/ARB, baseline manual $50.03)
-- **Predictive grid v1:** DESLIGADO desde `ed8923d` (bug `positionAlt` — ver `memory/project_predictive_status.md`)
-- **Reactive rebalance:** ativo, floor `$0,50` USD/leg — user confirmou que está OK em 2026-05-10
-- **Hedge ratio:** `0.98` (98%)
-- **Uvicorn:** rodando na :8000 (PID 24200 visto no último brief; pode ter mudado)
-- **Working tree:** limpo exceto `tmp_out/` untracked
+- **Hedge model:** novo módulo `engine/hedge_model.py` + `chains/v3_position.py` — lê L_main + L_alt direto da Uniswap V3 pool, computa target via fórmula V3, verify vs Beefy actual a cada iter
+- **Invariante estrutural:** target sempre vem de `actual × hedge_ratio` (Beefy), predicted é só pra verify+status
+- **`hedge_model_status` field:** novo (states: `warming_up | active | verify_diverging:X% | unavailable`); UI surfacing em operation card
+- **Reactive `_maybe_rebalance_leg`:** ÚNICO fire path — nada mudou no comportamento das ordens
+- **Hedge ratio:** `0.98`; **Floor rebalance:** `$0.50` USD/leg
+- **Anti-engasgo:** 5s `asyncio.wait_for` em RPC reads + try/except outer + position-truth stamping mantida
+- **Uvicorn:** estado live desconhecido — user precisa restart pra carregar v2
 
 ## Status da fila de trabalho
 | # | Item | Status |
 |---|---|---|
-| 1 | Fix do over-hedge ARB | ✅ user confirmou OK |
-| 2 | **Predictive v2** | 🔄 em andamento agora |
-| 3 | Funding window (estender datetime picker) | pendente |
+| 1 | Fix do over-hedge ARB | ✅ user confirmou OK em 2026-05-10 |
+| 2 | **Predictive Hedge Model v2** | ✅ pushada (PR #2), aguardando validação live + merge |
+| 3 | Funding window (estender datetime picker) | pendente, próximo após v2 mergear |
 | 4 | Deploy Fly.io | pendente |
+| 5 | Brainstorm UI/UX (novo) | pendente, user explicitamente pediu antes do compact |
 
-## Decisões em aberto
-Brainstorm do predictive v2 ainda não começou — perguntas chave a cobrir:
-1. Como detectar level crossing sem confiar em `compute_l_from_value` (que estava inflado por positionAlt)?
-2. Quando o grid precisa ser reconstruído (Beefy rebalanceia ticks)?
-3. Como o engine garante que NÃO trava (timeout, fallback, circuit breaker)?
-4. Coexistência com reactive (que já funciona) — primary/fallback ou substituir totalmente?
+## Final review do PR #2 — verdict: SHIP WITH FOLLOWUP
+- ✅ Spec coverage 100%
+- ✅ Arquitetura sound, invariante "actual wins" enforced
+- ✅ Live deploy risk **LOW** (target sempre vem de Beefy, idêntico ao reactive que já funciona)
+- ✅ Op #28 restart-safe (sem mudança de schema)
+
+Follow-ups (não bloqueantes, em qualquer sessão futura):
+- Reforçar `test_iterate_uses_actual_target_for_fire_even_when_predicted_diverges` pra invocar engine real (atualmente é puramente arithmetic)
+- Estreitar o `except Exception` em `read_position_alt` pra exceptions específicas do web3
+- Monitorar `hedge_model_status` na primeira hora pós-deploy — se oscila entre `active` e `verify_diverging`, threshold 1% pode precisar tuning
+
+## Verificação live (próximo passo do user)
+1. `stop.bat` → `start.bat`
+2. Watch `uvicorn.log` → `HedgeModel.refresh_cache: L_main=<int>, L_alt=<int|None>` + `hedge_model_status: warming_up → active`
+3. Operation card mostra "Hedge model: <status>" — confirmar
+4. Drift fires (se necessário) acontecem via `_maybe_rebalance_leg` (reactive path)
+5. Se OK → merge PR #2 pra master
 
 ## Notas pra próxima sessão
-- Pipeline obrigatório: brainstorm → spec → plan → subagent (`memory/feedback_use_pipelines.md`)
+- Pipeline obrigatório (`memory/feedback_use_pipelines.md`)
 - Compra no ask, vende no bid — sem buffer (`memory/feedback_no_price_buffer.md`)
-- Verificar posição via fonte autoritativa antes de re-fire (`memory/feedback_verify_before_fire.md`)
-- Não disparar trades por iniciativa — user clica botão (`memory/feedback_no_autonomous_trades.md`)
-- Próximas prioridades depois deste item: 3 (funding window) → 4 (fly.io)
+- Verificar posição via fonte autoritativa (`memory/feedback_verify_before_fire.md`)
+- Não disparar trades por iniciativa (`memory/feedback_no_autonomous_trades.md`)
+- Subagent-driven default ao executar plans (`memory/feedback_subagent_driven_default.md`)
+- Atualizar WORKING_ON e memory a cada mudança de foco (`memory/feedback_keep_state_fresh.md`)
