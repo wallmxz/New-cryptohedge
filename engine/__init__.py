@@ -1069,6 +1069,35 @@ class GridMakerEngine:
                                     f"get_trade_pnl_since failed: {e}"
                                 )
 
+                        # Funding window override: when the user picked
+                        # a start in the UI, sum funding from Lighter
+                        # since that ts instead of the DB cumulative
+                        # (which is since op.started_at).
+                        funding_override = None
+                        try:
+                            window_since = op_row.get("pnl_window_since_ts")
+                        except Exception:
+                            window_since = None
+                        if window_since is not None and float(window_since) > 0:
+                            try:
+                                fgetter = getattr(
+                                    self._exchange, "get_funding_total_since", None,
+                                )
+                                if fgetter is not None:
+                                    funding_override = await asyncio.wait_for(
+                                        fgetter(
+                                            since_ts=float(window_since),
+                                            market_id_token0=self._token0_mid,
+                                            market_id_token1=self._token1_mid,
+                                        ),
+                                        timeout=5.0,
+                                    )
+                            except Exception as e:
+                                logger.warning(
+                                    f"get_funding_total_since failed: {e}"
+                                )
+                                funding_override = None
+
                         if is_dual_leg:
                             self._hub.operation_pnl_breakdown = compute_operation_pnl(
                                 op,
@@ -1078,6 +1107,7 @@ class GridMakerEngine:
                                 hedge_realized_per_symbol=dict(self._hub.hedge_realized_pnls),
                                 hedge_unrealized_per_symbol=dict(self._hub.hedge_unrealized_pnls),
                                 hedge_pnl_aggregate_override=hedge_pnl_override,
+                                funding_override=funding_override,
                             )
                         else:
                             self._hub.operation_pnl_breakdown = compute_operation_pnl(
@@ -1087,6 +1117,7 @@ class GridMakerEngine:
                                 hedge_realized_since_baseline=self._hub.hedge_realized_pnl,
                                 hedge_unrealized_since_baseline=self._hub.hedge_unrealized_pnl,
                                 hedge_pnl_aggregate_override=hedge_pnl_override,
+                                funding_override=funding_override,
                             )
                 except Exception as e:
                     logger.error(f"PnL breakdown update failed: {e}")
