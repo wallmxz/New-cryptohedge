@@ -90,14 +90,13 @@ class GridMakerEngine:
         # Default no-op on adapters that don't implement it.
         if self._exchange is not None:
             self._exchange.subscribe_funding(self._on_funding_payment)
-        # Predictive curve-grid (spec 2026-05-08). _grid is None until
-        # _refresh_grid() runs successfully. _last_level_idx is None
-        # immediately after a rebuild → next iter snaps without firing
-        # (warmup). _last_grid_check_at gates polling cadence.
-        self._grid = None  # type: "LevelGrid | None"
-        self._last_level_idx: int | None = None
-        self._last_grid_check_at: float = 0.0
-        self._GRID_CHECK_INTERVAL_S = 60.0
+        # Predictive hedge model (spec 2026-05-10). Cache populated on
+        # first iter via _hedge_model.refresh_cache(); engine compares
+        # predicted vs Beefy actual each iter and uses ACTUAL as the
+        # authoritative target. _hedge_model is None when no
+        # pool_reader is available (e.g. test/no-vault state); engine
+        # falls back to Beefy direct in that case.
+        self._hedge_model = None  # type: "HedgeModel | None"
 
     def _ensure_reconciler(self):
         if self._reconciler is None and self._exchange is not None:
@@ -865,6 +864,22 @@ class GridMakerEngine:
             logger.warning(
                 f"resolve_market_ids_for_funding (post-rebuild) failed: {e}"
             )
+        # Build / rebuild HedgeModel whenever vault readers change. The
+        # V3PositionReader needs the pool address (from settings) and
+        # the Beefy strategy address (resolved from the vault).
+        from chains.v3_position import V3PositionReader
+        from engine.hedge_model import HedgeModel
+        try:
+            strategy_addr = await self._beefy_reader._earn.functions.strategy().call()
+            v3_reader = V3PositionReader(
+                w3=self._beefy_reader._w3,
+                pool_address=str(self._settings.clm_pool_address),
+                beefy_strategy_address=strategy_addr,
+            )
+            self._hedge_model = HedgeModel(v3_reader)
+        except Exception as e:
+            logger.warning(f"HedgeModel build failed: {e}; engine will fall back to Beefy actual")
+            self._hedge_model = None
         logger.info(
             f"Engine readers rebuilt for vault {selected} "
             f"({pair_settings.pool_token0_symbol}/{pair_settings.pool_token1_symbol})"
