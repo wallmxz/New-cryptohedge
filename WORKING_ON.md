@@ -1,14 +1,13 @@
 # WORKING_ON
 
-**Última atualização:** 2026-05-10 (PR #2 MERGEADO — predictive v2 em master)
+**Última atualização:** 2026-05-10 (predictive v2 mergeado + funding window PR aberto)
 
 ## Foco atual
-**Predictive Hedge Model v2 em produção (master).** PR [#2](https://github.com/wallmxz/New-cryptohedge/pull/2) mergeado em 2026-05-10 via merge commit `c68f1ae`. Branch `feature/predictive-grid-v2` mantida (não deletada).
+**Funding window** implementado (item 3). PR aberto contra master. Aguarda validação live (escolhe data no picker → Funding deve mudar) + merge.
 
-**Próximos passos imediatos:**
-1. **User valida live** — `stop.bat` → `start.bat` → checar `hedge_model_status: warming_up → active`
-2. Decidir: começar **item 3 (funding window)** já, ou esperar 1-2h de runtime pra confirmar steady-state primeiro
-3. Depois funding: **item 4 (Fly.io)** + **brainstorm UI/UX** (user pediu antes do compact: "o site é quase inútil")
+**Próximos passos:**
+1. User valida live: clica 🕒 Janela no card de operação → escolhe data → Funding line muda? Limpar → volta cumulativo?
+2. Após merge: **item 4 (Fly.io)** + **brainstorm UI/UX**
 
 ## Estado do bot agora
 - **Branch atual:** `master` (fast-forwardada após merge do PR #2)
