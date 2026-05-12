@@ -12,7 +12,8 @@
 ## Próximos passos (importância decrescente)
 1. **Bug `'PositionFunding' object has no attribute 'get'`** — `LighterAdapter.get_funding_total_since` chama `e.get(k, default)` mas SDK retorna typed object. Fix: `getattr(e, k, default)`. ~5 min. Bloqueia merge do PR #3.
 2. **Cross-check on-chain** (sua hipótese de fills mal-sync) — script via Alchemy archive comparando ticks Beefy vs fills Lighter. ~30 min.
-3. **Brainstorm UI/UX** — você pediu desde o compact ("o site é quase inútil"). Pipeline completo. 1-2 sessões.
+3. **Otimizar verify_fill latency** — fires sequenciais ETH+ARB com HTTP poll causam spikes de 7-8s/iter quando os 2 legs fire ao mesmo tempo. Opções: skip `_verify_fill` HTTP (confiar só em position-truth WS + reconciler), reduzir timeout 3-5s → 1s, ou migrar pra WS push `update/account_all` em vez de HTTP poll. ~1h.
+4. **Brainstorm UI/UX** — você pediu desde o compact ("o site é quase inútil"). Pipeline completo. 1-2 sessões.
 
 ## PRs status
 - PR #3 funding window — bloqueado pelo bug `.get()`. Após fix, merge.
