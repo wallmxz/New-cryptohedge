@@ -8,7 +8,7 @@ web3>=7.0,<8.0
 aiosqlite>=0.20,<1.0
 python-dotenv>=1.0,<2.0
 eth-account>=0.13,<1.0
-dydx-v4-client>=1.1,<2.0
+# dydx-v4-client>=1.1,<2.0  # excluded from Fly build — coincurve dep needs CMake/SWIG not in slim base; we run Lighter (ACTIVE_EXCHANGE=lighter)
 prometheus-client>=0.21,<1.0
 python-json-logger>=2.0,<3.0
 pytest>=8.0
