@@ -1,26 +1,29 @@
 # WORKING_ON
 
-**Última atualização:** 2026-05-12 (Fly.io DESCARTADO — Lighter WAF bloqueia datacenter IPs; bot local OK)
+**Última atualização:** 2026-05-12 (BOT DEPLOYED em DO Frankfurt — 24/7 sem PC ligado)
 
 ## Foco atual
-**Bot local segue rodando estável** (Windows + Alchemy + start.bat). Op #28 active, hedge model active, ~$447 LP.
+**Bot rodando em DigitalOcean Frankfurt** (`104.248.44.6:8000`, systemd `automoney.service`). Op #28 ATIVA, hedgeando, latência 12× melhor (117ms vs 1400ms local). PC pode desligar.
 
-**Fly.io rolled back após confirmação de bloqueio CloudFront WAF** (testado 2x, ambos com 403/HTTP 400 imediatos do IP do Fly em região iad). Detalhes em `memory/project_lighter_waf_datacenter.md`.
+**Setup:** `/opt/automoney/` (git clone master), `/opt/automoney/.env` (secrets), `/opt/automoney/venv/` (Python deps), `/data/automoney.db` (DB persistente), `/etc/systemd/system/automoney.service` (unit), `/var/log/automoney.log` (stdout). Comandos completos em `memory/reference_do_deploy.md`.
 
-**PRs status:**
-- PR #3 funding window — aguarda validação live + merge
-- PR #4 Fly.io deploy — preservar branch mas FECHAR PR (não vai mergear; código fica disponível caso Lighter mude política WAF)
+**Por que DO FRA e não Fly/Oracle:** Lighter retorna `code 20558 "restricted jurisdiction"` pra IP do Fly (qualquer região) e qualquer cloud em US/Canada (Oracle Ashburn, DO NYC). DO Frankfurt passa. Detalhes em `memory/project_lighter_waf_datacenter.md`.
 
-**Próximos passos:**
-1. Bug `'PositionFunding' object has no attribute 'get'` — apareceu nos logs do Fly mas reproduz local também (PR #3 tem bug). Fix simples: trocar `e.get(...)` por `getattr(e, ..., default)` em `LighterAdapter.get_funding_total_since`. Vou consertar antes de mergear PR #3.
-2. Cross-check on-chain (script + análise) — agora sem o bloqueio do Fly, retomar
-3. Brainstorm UI/UX (item 5) — user pediu desde o compact
+## Próximos passos (importância decrescente)
+1. **Bug `'PositionFunding' object has no attribute 'get'`** — `LighterAdapter.get_funding_total_since` chama `e.get(k, default)` mas SDK retorna typed object. Fix: `getattr(e, k, default)`. ~5 min. Bloqueia merge do PR #3.
+2. **Cross-check on-chain** (sua hipótese de fills mal-sync) — script via Alchemy archive comparando ticks Beefy vs fills Lighter. ~30 min.
+3. **Brainstorm UI/UX** — você pediu desde o compact ("o site é quase inútil"). Pipeline completo. 1-2 sessões.
 
-## Pendente
-- Bug funding `.get()` — fix em PR #3 antes do merge
-- Cross-check on-chain via Alchemy archive
-- Brainstorm UI/UX
-- (futuro) Reavaliar deploy se houver VPS residencial-grade ou Lighter mudar WAF
+## PRs status
+- PR #3 funding window — bloqueado pelo bug `.get()`. Após fix, merge.
+- PR #4 Fly.io deploy — fechado com postmortem (código preservado mas Fly inviável).
+
+## Operacional
+- Dashboard: http://104.248.44.6:8000 (admin / Wallace1)
+- Restart: `ssh ... "systemctl restart automoney"`
+- Logs: `ssh ... "tail -f /var/log/automoney.log"`
+- Backup DB: `scp ...:/data/automoney.db ./backup.db`
+- Rollback emergência: stop systemd → scp DB pro local → `start.bat`
 
 ## Estado do bot agora
 - **Branch atual:** `master` (fast-forwardada após merge do PR #2)
