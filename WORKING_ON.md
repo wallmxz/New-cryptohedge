@@ -1,22 +1,26 @@
 # WORKING_ON
 
-**Última atualização:** 2026-05-11 (predictive v2 ✅ master + funding window PR #3 + Fly.io PR #4 abertos)
+**Última atualização:** 2026-05-12 (Fly.io DESCARTADO — Lighter WAF bloqueia datacenter IPs; bot local OK)
 
 ## Foco atual
-**Fly.io deploy** implementado (item 4). PR [#4](https://github.com/wallmxz/New-cryptohedge/pull/4) aberto. Aguarda **operação manual do user** (push secrets, criar volume, deploy, migrar DB, smoke compare) — runbook em `docs/flyio-runbook.md`.
+**Bot local segue rodando estável** (Windows + Alchemy + start.bat). Op #28 active, hedge model active, ~$447 LP.
 
-**Status PRs:**
-- PR #3 funding window — aguarda validação + merge
-- PR #4 Fly.io deploy — aguarda operação cutover (~25 min do user)
+**Fly.io rolled back após confirmação de bloqueio CloudFront WAF** (testado 2x, ambos com 403/HTTP 400 imediatos do IP do Fly em região iad). Detalhes em `memory/project_lighter_waf_datacenter.md`.
+
+**PRs status:**
+- PR #3 funding window — aguarda validação live + merge
+- PR #4 Fly.io deploy — preservar branch mas FECHAR PR (não vai mergear; código fica disponível caso Lighter mude política WAF)
 
 **Próximos passos:**
-1. Mergear PR #3 (funding window) — quando validar live
-2. Operação Fly.io: secrets + volume + deploy + sftp DB + smoke compare (runbook step-a-step)
-3. Pós-deploy estável: encerrar `start.bat` local permanentemente
-4. **Próxima feature:** brainstorm UI/UX (item 5) — user pediu desde o compact
+1. Bug `'PositionFunding' object has no attribute 'get'` — apareceu nos logs do Fly mas reproduz local também (PR #3 tem bug). Fix simples: trocar `e.get(...)` por `getattr(e, ..., default)` em `LighterAdapter.get_funding_total_since`. Vou consertar antes de mergear PR #3.
+2. Cross-check on-chain (script + análise) — agora sem o bloqueio do Fly, retomar
+3. Brainstorm UI/UX (item 5) — user pediu desde o compact
 
-## Pendente (próximas sessões)
-- **Cross-check on-chain:** script analisando fills Lighter vs ticks Beefy históricos via Alchemy archive (user pediu "primeiro Fly, depois script")
+## Pendente
+- Bug funding `.get()` — fix em PR #3 antes do merge
+- Cross-check on-chain via Alchemy archive
+- Brainstorm UI/UX
+- (futuro) Reavaliar deploy se houver VPS residencial-grade ou Lighter mudar WAF
 
 ## Estado do bot agora
 - **Branch atual:** `master` (fast-forwardada após merge do PR #2)
