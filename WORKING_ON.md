@@ -1,13 +1,22 @@
 # WORKING_ON
 
-**Última atualização:** 2026-05-10 (predictive v2 mergeado + funding window PR aberto)
+**Última atualização:** 2026-05-11 (predictive v2 ✅ master + funding window PR #3 + Fly.io PR #4 abertos)
 
 ## Foco atual
-**Funding window** implementado (item 3). PR aberto contra master. Aguarda validação live (escolhe data no picker → Funding deve mudar) + merge.
+**Fly.io deploy** implementado (item 4). PR [#4](https://github.com/wallmxz/New-cryptohedge/pull/4) aberto. Aguarda **operação manual do user** (push secrets, criar volume, deploy, migrar DB, smoke compare) — runbook em `docs/flyio-runbook.md`.
+
+**Status PRs:**
+- PR #3 funding window — aguarda validação + merge
+- PR #4 Fly.io deploy — aguarda operação cutover (~25 min do user)
 
 **Próximos passos:**
-1. User valida live: clica 🕒 Janela no card de operação → escolhe data → Funding line muda? Limpar → volta cumulativo?
-2. Após merge: **item 4 (Fly.io)** + **brainstorm UI/UX**
+1. Mergear PR #3 (funding window) — quando validar live
+2. Operação Fly.io: secrets + volume + deploy + sftp DB + smoke compare (runbook step-a-step)
+3. Pós-deploy estável: encerrar `start.bat` local permanentemente
+4. **Próxima feature:** brainstorm UI/UX (item 5) — user pediu desde o compact
+
+## Pendente (próximas sessões)
+- **Cross-check on-chain:** script analisando fills Lighter vs ticks Beefy históricos via Alchemy archive (user pediu "primeiro Fly, depois script")
 
 ## Estado do bot agora
 - **Branch atual:** `master` (fast-forwardada após merge do PR #2)
