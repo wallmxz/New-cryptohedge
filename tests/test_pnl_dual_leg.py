@@ -1,4 +1,6 @@
 """compute_operation_pnl: per-leg fields + IL with two oracle prices."""
+import pytest
+
 from engine.operation import Operation, OperationState
 from engine.pnl import compute_operation_pnl
 
@@ -181,3 +183,29 @@ def test_compute_operation_pnl_falls_back_to_hodl_when_baseline_deposit_zero():
     )
     # Same HODL fallback as the null case: -6.30
     assert bd["pool_dollar"] == -6.3
+
+
+def test_compute_operation_pnl_uses_funding_override_when_provided():
+    """When funding_override=(token0_paid, token1_paid) is passed,
+    compute_operation_pnl uses those values directly and IGNORES
+    op.funding_paid_token0/1 from the DB. Sign matches existing behavior:
+    positive in override = positive in DB column = 'we paid'.
+    Display sign in breakdown is INVERTED from input (received convention).
+    """
+    op = _op(funding_paid_token0=999.0, funding_paid_token1=999.0)
+    # Override says we paid 10 in t0, received 5 in t1 (negative = received)
+    bd = compute_operation_pnl(
+        op,
+        current_pool_value_usd=326.20,
+        current_token0_usd_price=1.75,
+        current_token1_usd_price=4200.0,
+        hedge_realized_per_symbol={},
+        hedge_unrealized_per_symbol={},
+        funding_override=(10.0, -5.0),
+    )
+    # breakdown["funding_token0"] = -override[0] = -10 (we paid 10 → display -10)
+    # breakdown["funding_token1"] = -override[1] = 5 (we received 5 → display +5)
+    assert bd["funding_token0"] == pytest.approx(-10.0)
+    assert bd["funding_token1"] == pytest.approx(5.0)
+    # Aggregate matches sum of per-leg.
+    assert bd["funding"] == pytest.approx(-5.0)

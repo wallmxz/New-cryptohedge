@@ -1,11 +1,18 @@
 app = "automoney"
-primary_region = "iad"
+primary_region = "fra"
 
 [build]
   dockerfile = "Dockerfile"
 
 [env]
   PYTHONUNBUFFERED = "true"
+  DB_PATH = "/data/automoney.db"
+  LOG_FORMAT = "json"
+  START_ENGINE = "true"
+
+[mounts]
+  source = "automoney_data"
+  destination = "/data"
 
 [http_service]
   internal_port = 8000
@@ -15,7 +22,7 @@ primary_region = "iad"
   min_machines_running = 1
 
 [[vm]]
-  memory = "256mb"
+  memory = "512mb"
   cpu_kind = "shared"
   cpus = 1
 
@@ -26,3 +33,11 @@ primary_region = "iad"
     path = "/health"
     interval = "15s"
     timeout = "5s"
+
+  [checks.engine_alive]
+    type = "http"
+    port = 8000
+    path = "/health/engine"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "60s"

@@ -87,3 +87,18 @@ class ExchangeAdapter(ABC):
         Default: not supported (returns None) — adapters that integrate
         the venue's cumulative-pnl endpoint override this."""
         return None
+
+    async def get_funding_total_since(
+        self, *, since_ts: float,
+        market_id_token0: int | None = None,
+        market_id_token1: int | None = None,
+    ) -> tuple[float, float]:
+        """Returns (token0_total, token1_total) of cumulative funding paid
+        since the given unix timestamp.
+
+        Sign convention: positive = "we paid", negative = "we received"
+        — matches op.funding_paid_token0/1 stored in the DB.
+
+        Default implementation returns (0.0, 0.0). Concrete adapters
+        override (currently only LighterAdapter)."""
+        return (0.0, 0.0)

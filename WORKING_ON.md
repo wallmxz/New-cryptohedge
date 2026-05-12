@@ -1,14 +1,30 @@
 # WORKING_ON
 
-**Última atualização:** 2026-05-10 (PR #2 MERGEADO — predictive v2 em master)
+**Última atualização:** 2026-05-12 (BOT DEPLOYED em DO Frankfurt — 24/7 sem PC ligado)
 
 ## Foco atual
-**Predictive Hedge Model v2 em produção (master).** PR [#2](https://github.com/wallmxz/New-cryptohedge/pull/2) mergeado em 2026-05-10 via merge commit `c68f1ae`. Branch `feature/predictive-grid-v2` mantida (não deletada).
+**Bot rodando em DigitalOcean Frankfurt** (`104.248.44.6:8000`, systemd `automoney.service`). Op #28 ATIVA, hedgeando, latência 12× melhor (117ms vs 1400ms local). PC pode desligar.
 
-**Próximos passos imediatos:**
-1. **User valida live** — `stop.bat` → `start.bat` → checar `hedge_model_status: warming_up → active`
-2. Decidir: começar **item 3 (funding window)** já, ou esperar 1-2h de runtime pra confirmar steady-state primeiro
-3. Depois funding: **item 4 (Fly.io)** + **brainstorm UI/UX** (user pediu antes do compact: "o site é quase inútil")
+**Setup:** `/opt/automoney/` (git clone master), `/opt/automoney/.env` (secrets), `/opt/automoney/venv/` (Python deps), `/data/automoney.db` (DB persistente), `/etc/systemd/system/automoney.service` (unit), `/var/log/automoney.log` (stdout). Comandos completos em `memory/reference_do_deploy.md`.
+
+**Por que DO FRA e não Fly/Oracle:** Lighter retorna `code 20558 "restricted jurisdiction"` pra IP do Fly (qualquer região) e qualquer cloud em US/Canada (Oracle Ashburn, DO NYC). DO Frankfurt passa. Detalhes em `memory/project_lighter_waf_datacenter.md`.
+
+## Próximos passos (importância decrescente)
+1. **Bug `'PositionFunding' object has no attribute 'get'`** — `LighterAdapter.get_funding_total_since` chama `e.get(k, default)` mas SDK retorna typed object. Fix: `getattr(e, k, default)`. ~5 min. Bloqueia merge do PR #3.
+2. **Cross-check on-chain** (sua hipótese de fills mal-sync) — script via Alchemy archive comparando ticks Beefy vs fills Lighter. ~30 min.
+3. **Otimizar verify_fill latency** — fires sequenciais ETH+ARB com HTTP poll causam spikes de 7-8s/iter quando os 2 legs fire ao mesmo tempo. Opções: skip `_verify_fill` HTTP (confiar só em position-truth WS + reconciler), reduzir timeout 3-5s → 1s, ou migrar pra WS push `update/account_all` em vez de HTTP poll. ~1h.
+4. **Brainstorm UI/UX** — você pediu desde o compact ("o site é quase inútil"). Pipeline completo. 1-2 sessões.
+
+## PRs status
+- PR #3 funding window — bloqueado pelo bug `.get()`. Após fix, merge.
+- PR #4 Fly.io deploy — fechado com postmortem (código preservado mas Fly inviável).
+
+## Operacional
+- Dashboard: http://104.248.44.6:8000 (admin / Wallace1)
+- Restart: `ssh ... "systemctl restart automoney"`
+- Logs: `ssh ... "tail -f /var/log/automoney.log"`
+- Backup DB: `scp ...:/data/automoney.db ./backup.db`
+- Rollback emergência: stop systemd → scp DB pro local → `start.bat`
 
 ## Estado do bot agora
 - **Branch atual:** `master` (fast-forwardada após merge do PR #2)

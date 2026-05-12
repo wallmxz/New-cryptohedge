@@ -1192,6 +1192,40 @@ class LighterAdapter(ExchangeAdapter):
             return []
         return list(getattr(resp, "position_fundings", None) or [])
 
+    async def get_funding_total_since(
+        self, *, since_ts: float,
+        market_id_token0: int | None = None,
+        market_id_token1: int | None = None,
+    ) -> tuple[float, float]:
+        """Sum funding paid since `since_ts`, routing per-market.
+
+        Reuses _fetch_position_funding (paginated, auth-token aware).
+        Sign convention: returns positive = paid, negative = received
+        (matches op.funding_paid_token0/1 in the DB).
+
+        Note: _fetch_position_funding only returns the latest 100 entries.
+        For windows farther back than ~100 funding cycles (~4 days at 1h
+        cadence), older entries are missed. Picker is typically used for
+        recent windows; cursor pagination can be added later if needed.
+        """
+        if self._signer is None:
+            return (0.0, 0.0)
+        entries = await self._fetch_position_funding(limit=100)
+        t0 = 0.0
+        t1 = 0.0
+        for e in entries:
+            ts = float(e.get("timestamp", 0))
+            if ts < since_ts:
+                continue
+            change = float(e.get("change", 0))
+            attributed = -change  # invert sign: received → paid
+            mid = int(e.get("market_id", -1))
+            if market_id_token0 is not None and mid == market_id_token0:
+                t0 += attributed
+            elif market_id_token1 is not None and mid == market_id_token1:
+                t1 += attributed
+        return (t0, t1)
+
     async def get_trade_pnl_since(
         self, start_ts: float, end_ts: float,
     ) -> tuple[float, float] | None:

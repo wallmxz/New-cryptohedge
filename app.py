@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import os
 import logging
+import time
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -9,6 +10,7 @@ from contextlib import asynccontextmanager
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
 from starlette.staticfiles import StaticFiles
+from starlette.requests import Request
 from starlette.responses import JSONResponse
 from config import Settings
 from state import StateHub
@@ -25,6 +27,24 @@ from web.routes import (
 )
 
 setup_logging()
+
+
+async def health_engine(request: Request) -> JSONResponse:
+    """Loop watchdog for Fly's secondary health check.
+
+    Returns 200 if the engine iter ran within the last 30s, 503 otherwise.
+    Fly considers the machine unhealthy if 503, and will restart per its
+    autoheal policy. Excluded from basic auth so Fly probes work.
+    """
+    hub = request.app.state.hub
+    last_update = getattr(hub, "last_update", 0) or 0
+    age = time.time() - last_update
+    if age < 30:
+        return JSONResponse({"alive": True, "iter_age_s": round(age, 1)})
+    return JSONResponse(
+        {"alive": False, "iter_age_s": round(age, 1)},
+        status_code=503,
+    )
 
 
 def create_app(start_engine: bool = True) -> Starlette:
@@ -174,6 +194,7 @@ def create_app(start_engine: bool = True) -> Starlette:
 
     routes = [
         Route("/health", lambda r: JSONResponse({"status": "ok"})),
+        Route("/health/engine", health_engine),
         Route("/", dashboard),
         Route("/sse/state", sse_state),
         Route("/sse/logs", sse_logs),
@@ -220,7 +241,7 @@ def create_app(start_engine: bool = True) -> Starlette:
         BasicAuthMiddleware,
         username=settings.auth_user,
         password=settings.auth_pass,
-        exclude=["/health", "/metrics"],
+        exclude=["/health", "/health/engine", "/metrics"],
     )
     return app
 
