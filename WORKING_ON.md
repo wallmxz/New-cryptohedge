@@ -1,75 +1,48 @@
 # WORKING_ON
 
-**Última atualização:** 2026-05-12 (BOT DEPLOYED em DO Frankfurt — 24/7 sem PC ligado)
+**Última atualização:** 2026-05-12 (BOT EM PRODUÇÃO no DO Frankfurt — local desligado)
 
 ## Foco atual
-**Bot rodando em DigitalOcean Frankfurt** (`104.248.44.6:8000`, systemd `automoney.service`). Op #28 ATIVA, hedgeando, latência 12× melhor (117ms vs 1400ms local). PC pode desligar.
+Bot rodando 24/7 em **DigitalOcean Frankfurt** (`104.248.44.6:8000`, systemd `automoney.service`). Op #28 ATIVA, hedgeando com latência ~200ms steady-state (vs 1400ms local). Master pós-PR #5 inclui /health/engine + lighter-sdk fix em requirements.txt + Fly tooling preservado como histórico.
 
-**Setup:** `/opt/automoney/` (git clone master), `/opt/automoney/.env` (secrets), `/opt/automoney/venv/` (Python deps), `/data/automoney.db` (DB persistente), `/etc/systemd/system/automoney.service` (unit), `/var/log/automoney.log` (stdout). Comandos completos em `memory/reference_do_deploy.md`.
+## Última ação pendente do user
+User mudou `hedge_ratio` no dialog de Configurações pra **0.99** mas DB ainda mostra `0.98` — falta clicar **Salvar** no dialog. Dito ao user: ou clica Salvar OU eu faço via `curl -u admin:Wallace1 -X POST http://104.248.44.6:8000/settings -d "hedge_ratio=0.99"`. User pediu compact ANTES de eu rodar. Próxima sessão: confirmar com user e fazer.
 
-**Por que DO FRA e não Fly/Oracle:** Lighter retorna `code 20558 "restricted jurisdiction"` pra IP do Fly (qualquer região) e qualquer cloud em US/Canada (Oracle Ashburn, DO NYC). DO Frankfurt passa. Detalhes em `memory/project_lighter_waf_datacenter.md`.
+## Estado do deploy (operacional)
+- **IP:** `104.248.44.6`
+- **Dashboard:** http://104.248.44.6:8000 (admin / Wallace1)
+- **SSH:** `ssh -i C:\Users\Wallace\.ssh\id_ed25519 root@104.248.44.6`
+- **Systemd unit:** `/etc/systemd/system/automoney.service`
+- **Code:** `/opt/automoney/` (git clone master)
+- **DB:** `/data/automoney.db` (persistente)
+- **Logs:** `/var/log/automoney.log`
+- **Comandos completos:** `~/.claude/projects/.../memory/reference_do_deploy.md`
 
-## Próximos passos (importância decrescente)
-1. **Bug `'PositionFunding' object has no attribute 'get'`** — `LighterAdapter.get_funding_total_since` chama `e.get(k, default)` mas SDK retorna typed object. Fix: `getattr(e, k, default)`. ~5 min. Bloqueia merge do PR #3.
-2. **Cross-check on-chain** (sua hipótese de fills mal-sync) — script via Alchemy archive comparando ticks Beefy vs fills Lighter. ~30 min.
-3. **Otimizar verify_fill latency** — fires sequenciais ETH+ARB com HTTP poll causam spikes de 7-8s/iter quando os 2 legs fire ao mesmo tempo. Opções: skip `_verify_fill` HTTP (confiar só em position-truth WS + reconciler), reduzir timeout 3-5s → 1s, ou migrar pra WS push `update/account_all` em vez de HTTP poll. ~1h.
-4. **Brainstorm UI/UX** — você pediu desde o compact ("o site é quase inútil"). Pipeline completo. 1-2 sessões.
+## Por que DO Frankfurt e não Fly/Oracle/etc
+Lighter retorna `code 20558 "restricted jurisdiction"` (mensagem JSON literal do servidor) pra:
+- Fly.io qualquer região (testado fra + iad) — ASN bloqueado
+- Qualquer cloud em US/Canada (Oracle Ashburn, DO NYC1 testados)
+- DO Frankfurt (ASN 14061) **passa**
 
-## PRs status
-- PR #3 funding window — bloqueado pelo bug `.get()`. Após fix, merge.
-- PR #4 Fly.io deploy — fechado com postmortem (código preservado mas Fly inviável).
+Workaround documentado pela Lighter (`?readonly=true`) só serve pra read-only — bot precisa trade. Detalhes em `memory/project_lighter_waf_datacenter.md`.
 
-## Operacional
-- Dashboard: http://104.248.44.6:8000 (admin / Wallace1)
-- Restart: `ssh ... "systemctl restart automoney"`
-- Logs: `ssh ... "tail -f /var/log/automoney.log"`
-- Backup DB: `scp ...:/data/automoney.db ./backup.db`
-- Rollback emergência: stop systemd → scp DB pro local → `start.bat`
+## Status PRs/branches
+- **PR #5** (feat: deploy + /health/engine + lighter-sdk fix) — ✅ MERGEADO em master (`c5713895`)
+- **PR #4** (Fly.io deploy) — fechado com postmortem (Fly inviável)
+- **PR #3** (funding window) — aberto, BLOQUEADO pelo bug `'PositionFunding' object has no attribute 'get'` em `LighterAdapter.get_funding_total_since`
+- Branch `feature/flyio-deploy` — preservada após merge (não deletada)
 
-## Estado do bot agora
-- **Branch atual:** `master` (fast-forwardada após merge do PR #2)
-- **`master`:** contém predictive v2 + tudo anterior (merge commit `c68f1ae`, +2367/-1110 LoC)
-- **Branch `feature/predictive-grid-v2`:** preservada (caso queira referência)
-- **Op ativa no DB:** #28 (cross-pair WETH/ARB, baseline manual $50.03)
-- **Hedge model:** novo módulo `engine/hedge_model.py` + `chains/v3_position.py` — lê L_main + L_alt direto da Uniswap V3 pool, computa target via fórmula V3, verify vs Beefy actual a cada iter
-- **Invariante estrutural:** target sempre vem de `actual × hedge_ratio` (Beefy), predicted é só pra verify+status
-- **`hedge_model_status` field:** novo (states: `warming_up | active | verify_diverging:X% | unavailable`); UI surfacing em operation card
-- **Reactive `_maybe_rebalance_leg`:** ÚNICO fire path — nada mudou no comportamento das ordens
-- **Hedge ratio:** `0.98`; **Floor rebalance:** `$0.50` USD/leg
-- **Anti-engasgo:** 5s `asyncio.wait_for` em RPC reads + try/except outer + position-truth stamping mantida
-- **Uvicorn:** estado live desconhecido — user precisa restart pra carregar v2
-
-## Status da fila de trabalho
-| # | Item | Status |
-|---|---|---|
-| 1 | Fix do over-hedge ARB | ✅ user confirmou OK em 2026-05-10 |
-| 2 | **Predictive Hedge Model v2** | ✅ MERGEADO em master (PR #2, c68f1ae) — aguarda validação live |
-| 3 | Funding window (estender datetime picker) | próximo (após validação live) |
-| 4 | Deploy Fly.io | pendente |
-| 5 | Brainstorm UI/UX (novo) | pendente, user explicitamente pediu antes do compact |
-
-## Final review do PR #2 — verdict: SHIP WITH FOLLOWUP
-- ✅ Spec coverage 100%
-- ✅ Arquitetura sound, invariante "actual wins" enforced
-- ✅ Live deploy risk **LOW** (target sempre vem de Beefy, idêntico ao reactive que já funciona)
-- ✅ Op #28 restart-safe (sem mudança de schema)
-
-Follow-ups (não bloqueantes, em qualquer sessão futura):
-- Reforçar `test_iterate_uses_actual_target_for_fire_even_when_predicted_diverges` pra invocar engine real (atualmente é puramente arithmetic)
-- Estreitar o `except Exception` em `read_position_alt` pra exceptions específicas do web3
-- Monitorar `hedge_model_status` na primeira hora pós-deploy — se oscila entre `active` e `verify_diverging`, threshold 1% pode precisar tuning
-
-## Verificação live (próximo passo do user)
-1. `stop.bat` → `start.bat`
-2. Watch `uvicorn.log` → `HedgeModel.refresh_cache: L_main=<int>, L_alt=<int|None>` + `hedge_model_status: warming_up → active`
-3. Operation card mostra "Hedge model: <status>" — confirmar
-4. Drift fires (se necessário) acontecem via `_maybe_rebalance_leg` (reactive path)
-5. Se OK → merge PR #2 pra master
+## Pendências da fila (importância decrescente)
+1. **Bug funding `.get()`** (~5 min) — fix `e.get(k, default)` → `getattr(e, k, default)` em `exchanges/lighter.py::get_funding_total_since`. Bloqueia merge do PR #3.
+2. **Cross-check on-chain** (~30 min) — script via Alchemy archive comparando ticks Beefy vs fills Lighter, validar hipótese do user sobre fires mal-sincronizados.
+3. **Otimizar verify_fill latency** (~1h) — eliminar spikes de 7s/iter quando 2 legs fire simultâneo. Opções: skip `_verify_fill` HTTP (confiar só em position-truth + reconciler), reduzir timeout 3-5s → 1s, ou migrar pra WS push `update/account_all`.
+4. **Brainstorm UI/UX** — user pediu desde o compact ("o site é quase inútil"). Pipeline brainstorm/spec/plan/subagent completo. 1-2 sessões.
 
 ## Notas pra próxima sessão
-- Pipeline obrigatório (`memory/feedback_use_pipelines.md`)
-- Compra no ask, vende no bid — sem buffer (`memory/feedback_no_price_buffer.md`)
-- Verificar posição via fonte autoritativa (`memory/feedback_verify_before_fire.md`)
-- Não disparar trades por iniciativa (`memory/feedback_no_autonomous_trades.md`)
+- Pipeline brainstorm/spec/plan/subagent obrigatório (`memory/feedback_use_pipelines.md`)
 - Subagent-driven default ao executar plans (`memory/feedback_subagent_driven_default.md`)
 - Atualizar WORKING_ON e memory a cada mudança de foco (`memory/feedback_keep_state_fresh.md`)
+- Compra no ask, vende no bid — sem buffer (`memory/feedback_no_price_buffer.md`)
+- Verificar posição via fonte autoritativa antes de re-fire (`memory/feedback_verify_before_fire.md`)
+- Não disparar trades por iniciativa — user clica botão (`memory/feedback_no_autonomous_trades.md`)
+- start.bat / stop.bat agora são DEPRECATED (bot está em DO, não local)
