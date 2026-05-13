@@ -32,3 +32,37 @@ def test_tick_to_human_price_monotonic():
     p_low = tick_to_human_price(tick=-296200, decimals0=18, decimals1=6)
     p_high = tick_to_human_price(tick=-296100, decimals0=18, decimals1=6)
     assert p_high > p_low
+
+
+from engine.curve import compute_grid_from_pool_ticks
+
+
+def test_compute_grid_minimal_range():
+    """Range muito estreito com 1 nível acima + 1 abaixo do tick_now.
+    Verifica que gera exatamente 2 levels (um buy, um sell), spacing respeitado.
+
+    Setup: tick_lower=-296200, tick_now=-296100, tick_upper=-296000, spacing=100
+    Ticks alinhados < tick_now: -296200 → 1 sell
+    Ticks alinhados > tick_now: -296000 → 1 buy
+    tick_now skipped (mid)
+    """
+    L = 1e15
+    grid = compute_grid_from_pool_ticks(
+        L=L,
+        tick_lower=-296200,
+        tick_upper=-296000,
+        tick_spacing=100,
+        tick_now=-296100,
+        decimals0=18,
+        decimals1=6,
+        hedge_ratio=1.0,
+        lighter_price_decimals=5,
+        lighter_size_decimals=1,
+    )
+    assert len(grid) == 2
+    sells = [lv for lv in grid if lv.side == "sell"]
+    buys = [lv for lv in grid if lv.side == "buy"]
+    assert len(sells) == 1
+    assert len(buys) == 1
+    # Sell tem preço menor que buy
+    assert sells[0].price < buys[0].price

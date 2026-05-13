@@ -144,6 +144,96 @@ def compute_target_grid(
     return sorted(levels, key=lambda lv: lv.price)
 
 
+def compute_grid_from_pool_ticks(
+    *,
+    L: float,
+    tick_lower: int,
+    tick_upper: int,
+    tick_spacing: int,
+    tick_now: int,
+    decimals0: int,
+    decimals1: int,
+    hedge_ratio: float,
+    lighter_price_decimals: int,
+    lighter_size_decimals: int,
+) -> list[GridLevel]:
+    """Gera grade de níveis alinhada aos ticks ativos do pool V3.
+
+    Two-loop pattern centrado em tick_now:
+      - Loop DOWN: emite sells em ticks alinhados < tick_now
+      - Loop UP: emite buys em ticks alinhados > tick_now
+      - tick_now em si não tem level (mid)
+
+    Size de cada nível = delta V3 token0 entre tick atual e tick anterior
+    (toward tick_now) × hedge_ratio, arredondado pro step da Lighter.
+    Price arredondado pro tick da Lighter.
+
+    Caller garante:
+      - tick_lower < tick_upper
+      - tick_lower <= tick_now <= tick_upper
+      - L > 0
+    """
+    if tick_lower >= tick_upper:
+        return []
+    if L <= 0:
+        return []
+
+    price_upper = tick_to_human_price(
+        tick=tick_upper, decimals0=decimals0, decimals1=decimals1,
+    )
+    price_at_tick_now = tick_to_human_price(
+        tick=tick_now, decimals0=decimals0, decimals1=decimals1,
+    )
+    x_at_tick_now = compute_x(L, price_at_tick_now, price_upper)
+
+    levels: list[GridLevel] = []
+
+    # Loop DOWN: ticks alinhados < tick_now, side="sell"
+    # Primeiro aligned tick estritamente menor que tick_now
+    down_start = (tick_now // tick_spacing) * tick_spacing
+    if down_start >= tick_now:
+        down_start -= tick_spacing
+    t = down_start
+    prev_x = x_at_tick_now
+    while t >= tick_lower:
+        price_human = tick_to_human_price(
+            tick=t, decimals0=decimals0, decimals1=decimals1,
+        )
+        price_rounded = round(price_human, lighter_price_decimals)
+        x_at_t = compute_x(L, price_human, price_upper)
+        delta = abs(x_at_t - prev_x)
+        size = round(delta * hedge_ratio, lighter_size_decimals)
+        if size > 0 and price_rounded > 0:
+            levels.append(GridLevel(
+                price=price_rounded, size=size, side="sell",
+                target_short=x_at_t * hedge_ratio,
+            ))
+        prev_x = x_at_t
+        t -= tick_spacing
+
+    # Loop UP: ticks alinhados > tick_now, side="buy"
+    up_start = ((tick_now // tick_spacing) + 1) * tick_spacing
+    t = up_start
+    prev_x = x_at_tick_now
+    while t <= tick_upper:
+        price_human = tick_to_human_price(
+            tick=t, decimals0=decimals0, decimals1=decimals1,
+        )
+        price_rounded = round(price_human, lighter_price_decimals)
+        x_at_t = compute_x(L, price_human, price_upper)
+        delta = abs(prev_x - x_at_t)
+        size = round(delta * hedge_ratio, lighter_size_decimals)
+        if size > 0 and price_rounded > 0:
+            levels.append(GridLevel(
+                price=price_rounded, size=size, side="buy",
+                target_short=x_at_t * hedge_ratio,
+            ))
+        prev_x = x_at_t
+        t += tick_spacing
+
+    return sorted(levels, key=lambda lv: lv.price)
+
+
 def tick_to_human_price(*, tick: int, decimals0: int, decimals1: int) -> float:
     """Converte tick V3 pra preço human-readable (token1 por token0).
 
