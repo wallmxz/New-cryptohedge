@@ -1304,12 +1304,15 @@ class LighterAdapter(ExchangeAdapter):
         t0 = 0.0
         t1 = 0.0
         for e in entries:
-            ts = float(e.get("timestamp", 0))
+            # PositionFunding from the SDK is a typed object, not a dict —
+            # use getattr, not .get() (the latter raises AttributeError and
+            # crashes the picker/accumulator).
+            ts = float(getattr(e, "timestamp", 0) or 0)
             if ts < since_ts:
                 continue
-            change = float(e.get("change", 0))
+            change = float(getattr(e, "change", 0) or 0)
             attributed = -change  # invert sign: received → paid
-            mid = int(e.get("market_id", -1))
+            mid = int(getattr(e, "market_id", -1))
             if market_id_token0 is not None and mid == market_id_token0:
                 t0 += attributed
             elif market_id_token1 is not None and mid == market_id_token1:

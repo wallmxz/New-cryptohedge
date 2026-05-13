@@ -1225,3 +1225,71 @@ async def test_get_trade_pnl_since_returns_zero_baseline_when_no_history_before_
     ))
     out = await a.get_trade_pnl_since(start_ts=1500.0, end_ts=3500.0)
     assert out == (0.0, -3.0)
+
+
+# ---------------------------------------------------------------------------
+# get_funding_total_since — must read SDK PositionFunding objects by attribute,
+# not .get() (those are typed objects, not dicts). Bug repro from 2026-05.
+# ---------------------------------------------------------------------------
+
+
+class _FakeFunding:
+    """Mimics SDK PositionFunding: attribute access only, no .get() method."""
+    def __init__(self, *, timestamp, change, market_id):
+        self.timestamp = timestamp
+        self.change = change
+        self.market_id = market_id
+
+
+@pytest.mark.asyncio
+async def test_get_funding_total_since_reads_sdk_attributes_not_dict_get():
+    """Regression: PositionFunding is a typed SDK object exposing fields as
+    attributes; calling .get('timestamp', 0) on it raises AttributeError and
+    crashes the funding accumulator. Must use getattr."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("TOKEN", None))
+    a._account_api = MagicMock()
+    entries = [
+        # t0 market (id=0): change=+0.10 received → -0.10 paid
+        _FakeFunding(timestamp=1700000100, change="0.10", market_id=0),
+        # t1 market (id=50): change=-0.05 received → +0.05 paid
+        _FakeFunding(timestamp=1700000200, change="-0.05", market_id=50),
+        # before since_ts — must be skipped
+        _FakeFunding(timestamp=1699999000, change="9.99", market_id=0),
+    ]
+    a._account_api.position_funding = AsyncMock(return_value=MagicMock(
+        position_fundings=entries, next_cursor=None,
+    ))
+    t0, t1 = await a.get_funding_total_since(
+        since_ts=1700000000,
+        market_id_token0=0,
+        market_id_token1=50,
+    )
+    assert t0 == pytest.approx(-0.10)
+    assert t1 == pytest.approx(0.05)
+
+
+@pytest.mark.asyncio
+async def test_get_funding_total_since_skips_unknown_market():
+    """Entries for markets not matching token0/token1 must be ignored."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("TOKEN", None))
+    a._account_api = MagicMock()
+    entries = [
+        _FakeFunding(timestamp=1700000100, change="0.10", market_id=999),  # unknown
+        _FakeFunding(timestamp=1700000200, change="-0.05", market_id=50),
+    ]
+    a._account_api.position_funding = AsyncMock(return_value=MagicMock(
+        position_fundings=entries, next_cursor=None,
+    ))
+    t0, t1 = await a.get_funding_total_since(
+        since_ts=1700000000,
+        market_id_token0=0,
+        market_id_token1=50,
+    )
+    assert t0 == 0.0
+    assert t1 == pytest.approx(0.05)
