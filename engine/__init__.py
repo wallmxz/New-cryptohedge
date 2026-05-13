@@ -1309,6 +1309,10 @@ class GridMakerEngine:
             return
 
         # Algo mudou (primeira posta OU range/L mudou). Cancel-all + rebuild.
+        rebuild_reason = "range_change" if posted_sig is not None else "initial"
+        if posted_sig is not None:
+            # Range/L mudou — Beefy reposicionou
+            metrics.beefy_range_change_total.inc()
         try:
             await self._exchange.cancel_all_stops(
                 symbol=self._settings.dydx_symbol_token0,
@@ -1323,6 +1327,7 @@ class GridMakerEngine:
                 await self._db.mark_grid_order_cancelled(
                     row["cloid"], time.time(),
                 )
+                metrics.grid_stops_cancelled_total.inc()
         except Exception as e:
             logger.warning(f"db cleanup during rebuild failed: {e}")
 
@@ -1361,6 +1366,7 @@ class GridMakerEngine:
 
         # Post each level
         symbol = self._settings.dydx_symbol_token0
+        placed_count = 0
         for lv in new_grid:
             cloid = self._next_cloid_for_leg(symbol)
             try:
@@ -1371,6 +1377,8 @@ class GridMakerEngine:
                     trigger_price=lv.trigger_price,
                     cloid_int=cloid,
                 )
+                metrics.grid_stops_placed_total.inc()
+                placed_count += 1
                 try:
                     await self._db.insert_grid_order(
                         cloid=str(cloid),
@@ -1388,6 +1396,19 @@ class GridMakerEngine:
                 logger.warning(
                     f"place_stop_limit_order failed for level @{lv.price}: {e}",
                 )
+
+        metrics.grid_levels_active.set(placed_count)
+        metrics.grid_rebuild_total.labels(reason=rebuild_reason).inc()
+
+        # Atualizar state hub pra dashboard
+        gh = self._hub.grid_health_metrics
+        gh["levels_active"] = placed_count
+        gh["stops_placed_total"] = gh.get("stops_placed_total", 0) + placed_count
+        gh["rebuilds_total"] = gh.get("rebuilds_total", 0) + 1
+        gh["last_rebuild_reason"] = rebuild_reason
+        gh["last_rebuild_ts"] = time.time()
+        if rebuild_reason == "range_change":
+            gh["range_changes_total"] = gh.get("range_changes_total", 0) + 1
 
         self._posted_grid_signature = current_sig
 
@@ -1412,6 +1433,10 @@ class GridMakerEngine:
         row = await self._db.get_grid_order(cloid)
         if row is None or not row.get("is_stop_order"):
             return
+
+        metrics.grid_stops_filled_total.inc()
+        gh = self._hub.grid_health_metrics
+        gh["stops_filled_total"] = gh.get("stops_filled_total", 0) + 1
 
         # Marca como filled no DB (best-effort)
         try:
@@ -1467,6 +1492,8 @@ class GridMakerEngine:
                 symbol=symbol, side=side, size=row["size"],
                 trigger_price=new_price, cloid_int=new_cloid,
             )
+            metrics.grid_stops_placed_total.inc()
+            metrics.grid_rebuild_total.labels(reason="fill").inc()
             try:
                 await self._db.insert_grid_order(
                     cloid=str(new_cloid), side=side, target_price=new_price,

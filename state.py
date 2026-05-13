@@ -80,6 +80,21 @@ class StateHub:
     token0_usd_price: float = 0.0
     token1_usd_price: float = 0.0
 
+    # Predictive grid v2 telemetry (spec 2026-05-12). Engine populates
+    # esses campos a cada _maintain_grid / _on_grid_fill. Dashboard partial
+    # `grid_health.html` lê eles via SSE pra mostrar health da grade.
+    grid_health_metrics: dict = field(default_factory=lambda: {
+        "levels_active": 0,
+        "stops_placed_total": 0,
+        "stops_filled_total": 0,
+        "stops_cancelled_total": 0,
+        "rebuilds_total": 0,
+        "last_rebuild_reason": None,
+        "last_rebuild_ts": None,
+        "replication_error_pct": 0.0,
+        "range_changes_total": 0,
+    })
+
     @property
     def hedge_position(self) -> dict | None:
         """Legacy compat: returns first hedge position (single-leg) or None."""

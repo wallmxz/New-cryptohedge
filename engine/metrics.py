@@ -75,6 +75,56 @@ loop_duration = Histogram(
 )
 
 
+# Predictive grid v2 (spec 2026-05-12) ----------------------------------
+
+grid_stops_placed_total = Counter(
+    "bot_grid_stops_placed_total",
+    "Total stop-limit orders postadas pelo predictive grid v2.",
+)
+
+grid_stops_filled_total = Counter(
+    "bot_grid_stops_filled_total",
+    "Total fills das stop-limit orders da grade predictive.",
+)
+
+grid_stops_cancelled_total = Counter(
+    "bot_grid_stops_cancelled_total",
+    "Cancelamentos de stops (por rebuild ou teardown).",
+)
+
+grid_rebuild_total = Counter(
+    "bot_grid_rebuild_total",
+    "Rebuilds da grade predictive por motivo.",
+    ["reason"],  # fill, drift, range_change, range_exit
+)
+
+beefy_range_change_total = Counter(
+    "bot_beefy_range_change_total",
+    "Quantas vezes Beefy reposicionou o CLM (tick_lower/upper ou L mudou).",
+)
+
+grid_fill_latency_ms = Histogram(
+    "bot_grid_fill_latency_ms",
+    "Tempo entre trigger e fill da stop-limit (cenário B = miss-temporário).",
+    buckets=[100, 500, 1000, 5000, 10000, 30000, 60000, 120000, 300000],
+)
+
+grid_replication_error_pct = Gauge(
+    "bot_grid_replication_error_pct",
+    "|sum(posted_target) - hedge_target| / hedge_target (drift da grade vs LP).",
+)
+
+grid_levels_active = Gauge(
+    "bot_grid_levels_active",
+    "Stops ativos no Lighter (varia conforme range Beefy).",
+)
+
+mark_vs_pool_drift_bps = Gauge(
+    "bot_mark_vs_pool_drift_bps",
+    "|markPrice Lighter - poolPrice Uniswap| em bps (informativo).",
+)
+
+
 # Helpers ---------------------------------------------------------------
 
 def render_metrics() -> bytes:

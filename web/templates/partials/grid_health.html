@@ -1,0 +1,43 @@
+<!-- web/templates/partials/grid_health.html -->
+<!-- Predictive Grid v2 telemetry (spec 2026-05-12).
+     Só visível quando bot está em modo predictive_grid_v2 ativo. -->
+<div class="card" x-show="grid_health_metrics && grid_health_metrics.levels_active > 0 || (grid_health_metrics && grid_health_metrics.rebuilds_total > 0)" x-cloak>
+    <p class="card-title">Grid Predictive v2</p>
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div>
+            <p class="text-xs text-slate-400 mb-1">Levels ativos</p>
+            <p class="text-sm font-mono text-slate-700" x-text="grid_health_metrics.levels_active || 0"></p>
+        </div>
+        <div>
+            <p class="text-xs text-slate-400 mb-1">Placed (total)</p>
+            <p class="text-sm font-mono text-slate-700" x-text="grid_health_metrics.stops_placed_total || 0"></p>
+        </div>
+        <div>
+            <p class="text-xs text-slate-400 mb-1">Filled (total)</p>
+            <p class="text-sm font-mono text-slate-700" x-text="grid_health_metrics.stops_filled_total || 0"></p>
+        </div>
+        <div>
+            <p class="text-xs text-slate-400 mb-1">Rebuilds</p>
+            <p class="text-sm font-mono text-slate-700" x-text="grid_health_metrics.rebuilds_total || 0"></p>
+        </div>
+        <div>
+            <p class="text-xs text-slate-400 mb-1">Range changes</p>
+            <p class="text-sm font-mono text-slate-700" x-text="grid_health_metrics.range_changes_total || 0"></p>
+        </div>
+        <div>
+            <p class="text-xs text-slate-400 mb-1">Replication error</p>
+            <p class="text-sm font-mono"
+               :class="(grid_health_metrics.replication_error_pct || 0) > 0.05 ? 'text-red-500' : (grid_health_metrics.replication_error_pct || 0) > 0.02 ? 'text-amber-600' : 'text-slate-700'"
+               x-text="((grid_health_metrics.replication_error_pct || 0) * 100).toFixed(2) + '%'"></p>
+        </div>
+        <div class="md:col-span-2">
+            <p class="text-xs text-slate-400 mb-1">Último rebuild</p>
+            <p class="text-sm font-mono text-slate-700">
+                <span x-text="grid_health_metrics.last_rebuild_reason || '—'"></span>
+                <span class="text-slate-400 ml-2" x-show="grid_health_metrics.last_rebuild_ts">
+                    (<span x-text="grid_health_metrics.last_rebuild_ts ? new Date(grid_health_metrics.last_rebuild_ts * 1000).toLocaleTimeString() : ''"></span>)
+                </span>
+            </p>
+        </div>
+    </div>
+</div>
