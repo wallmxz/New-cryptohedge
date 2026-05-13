@@ -1061,7 +1061,9 @@ class LighterAdapter(ExchangeAdapter):
                 f"trigger_price {trigger_price} rounds to zero ticks",
             )
 
-        result = await self._signer.create_sl_limit_order(
+        # SDK retorna (CreateOrder, RespSendTx, err_or_None). Tuple-unpack
+        # pra documentar o contrato no código.
+        _, _, err = await self._signer.create_sl_limit_order(
             market_index=meta.market_index,
             client_order_index=int(cloid_int) & 0xFFFFFFFF,
             base_amount=base_amount_raw,
@@ -1070,11 +1072,8 @@ class LighterAdapter(ExchangeAdapter):
             is_ask=is_ask,
             reduce_only=reduce_only,
         )
-        # SDK retorna (CreateOrder, RespSendTx, err_or_None).
-        if result[2] is not None:
-            raise RuntimeError(
-                f"place_stop_limit_order failed: {result[2]}",
-            )
+        if err is not None:
+            raise RuntimeError(f"place_stop_limit_order failed: {err}")
 
     async def cancel_stop_order(
         self, *, symbol: str, order_index: int,
@@ -1088,12 +1087,12 @@ class LighterAdapter(ExchangeAdapter):
         SDK `cancel_order` retorna 3-tuple (CancelOrder, RespSendTx, err_or_None).
         """
         meta = self._market_meta_or_raise(symbol)
-        result = await self._signer.cancel_order(
+        _, _, err = await self._signer.cancel_order(
             market_index=meta.market_index,
             order_index=order_index,
         )
-        if result[-1] is not None:
-            raise RuntimeError(f"cancel_stop_order failed: {result[-1]}")
+        if err is not None:
+            raise RuntimeError(f"cancel_stop_order failed: {err}")
 
     async def cancel_all_stops(self, *, symbol: str) -> None:
         """Cancela TODAS as ordens (incluindo stops) da conta na Lighter.
@@ -1104,18 +1103,20 @@ class LighterAdapter(ExchangeAdapter):
         NOTA: `cancel_all_orders` da SDK cancela todas as ordens da CONTA,
         não filtra por market. O param `symbol` é mantido por consistência
         com o resto da API (validamos que existe) mas não vai pro SDK call.
+        Em produção single-pair, isso é equivalente a "cancel all stops
+        desse market". Multi-market vai exigir revisão.
 
         SDK requer `time_in_force` (CANCEL_ALL_TIF_IMMEDIATE=0) e `timestamp_ms`.
-        Retorna 3-tuple (Withdraw, RespSendTx, err_or_None).
+        Retorna 3-tuple (CancelAllOrders, RespSendTx, err_or_None).
         """
         # symbol validado pra raise se inválido, mas não vai pro SDK call
         self._market_meta_or_raise(symbol)
-        result = await self._signer.cancel_all_orders(
+        _, _, err = await self._signer.cancel_all_orders(
             time_in_force=0,  # CANCEL_ALL_TIF_IMMEDIATE
             timestamp_ms=int(time.time() * 1000),
         )
-        if result[-1] is not None:
-            raise RuntimeError(f"cancel_all_stops failed: {result[-1]}")
+        if err is not None:
+            raise RuntimeError(f"cancel_all_stops failed: {err}")
 
     async def batch_place(self, orders: list[dict]) -> list[Order]:
         # Sequential for now; Lighter has create_grouped_orders for batch
