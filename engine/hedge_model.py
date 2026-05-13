@@ -33,6 +33,17 @@ class HedgeModelCache:
     p_a_alt: float | None
     p_b_alt: float | None
     refreshed_at: float  # monotonic seconds
+    # Raw V3 ticks (int) for the active concentrated-liquidity range.
+    # `p_a_main`/`p_b_main` above store the RAW V3 ratio
+    # (`1.0001^tick`), which is what `predict()` needs for the V3
+    # amount formula. But `_maintain_grid` and `_on_grid_fill` work
+    # with ticks, so storing them here saves a `log(...) / log(1.0001)`
+    # roundtrip and — more importantly — sidesteps the
+    # double-decimal-factor unit bug that produced ticks ~2x more
+    # negative than reality (e.g. -574215 instead of -297890).
+    # Verified live 2026-05-13 (op #29 smoke v2).
+    tick_lower_main: int = 0
+    tick_upper_main: int = 0
 
 
 class HedgeModel:
@@ -68,6 +79,8 @@ class HedgeModel:
                 p_a_alt=math.pow(1.0001, alt.tick_lower) if alt is not None else None,
                 p_b_alt=math.pow(1.0001, alt.tick_upper) if alt is not None else None,
                 refreshed_at=time.monotonic(),
+                tick_lower_main=main.tick_lower,
+                tick_upper_main=main.tick_upper,
             )
             self._refresh_pending = False
         except Exception as e:

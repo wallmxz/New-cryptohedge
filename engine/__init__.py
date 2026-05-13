@@ -1300,8 +1300,10 @@ class GridMakerEngine:
 
         cache = self._hedge_model._cache
 
-        # Signature atual da geometria (L + bounds)
-        current_sig = (cache.L_main, cache.p_a_main, cache.p_b_main)
+        # Signature atual da geometria (L + ticks bounds). Usar ticks
+        # (ints) em vez de p_a/p_b (raw V3 floats) pra comparação exata e
+        # pra `_on_grid_fill` poder extrair ticks direto da signature.
+        current_sig = (cache.L_main, cache.tick_lower_main, cache.tick_upper_main)
         posted_sig = getattr(self, "_posted_grid_signature", None)
 
         if posted_sig == current_sig:
@@ -1331,17 +1333,22 @@ class GridMakerEngine:
         except Exception as e:
             logger.warning(f"db cleanup during rebuild failed: {e}")
 
-        # Derivar tick_lower / tick_upper a partir dos preços human-readable.
-        # p_human = 1.0001^tick * 10^(decimals0 - decimals1)
-        # tick = log(p / 10^(d0-d1)) / log(1.0001)
+        # tick_lower / tick_upper come direto do cache (são ints raw V3).
+        # cache.p_a_main / p_b_main armazenam o RAW V3 ratio (= 1.0001^tick),
+        # que `predict()` precisa pra fórmula V3 — mas pra computar tick
+        # diretamente, usar `tick_lower_main` / `tick_upper_main` evita o
+        # bug do double-decimal-factor (cache RAW dividido por decimal_factor
+        # produzia ticks ~2x mais negativos que a realidade).
+        # Verificado live 2026-05-13 op #29 smoke v2 (tick_lower=-574215
+        # quando real era -297890).
         decimals0 = self._settings.token0_decimals
         decimals1 = self._settings.token1_decimals
         decimal_factor = 10 ** (decimals0 - decimals1)
-        # math.floor (não int()) pra ticks negativos: int(-296199.7) = -296199
-        # mas o tick boundary correto é -296200. ARB-USDC.e usa ticks negativos
-        # (~-296000), então usar int() introduz off-by-one no boundary.
-        tick_lower = floor(log(cache.p_a_main / decimal_factor) / log(1.0001))
-        tick_upper = floor(log(cache.p_b_main / decimal_factor) / log(1.0001))
+        tick_lower = cache.tick_lower_main
+        tick_upper = cache.tick_upper_main
+        # p_now é HUMAN price (do read_price). Converter pra tick precisa
+        # do decimal_factor. math.floor (não int()) pra ticks negativos:
+        # int(-296199.7) = -296199 mas o boundary correto é -296200.
         tick_now = floor(log(p_now / decimal_factor) / log(1.0001))
 
         # tick_spacing depende do fee tier do pool
@@ -1482,9 +1489,8 @@ class GridMakerEngine:
         if sig is None:
             return  # nada posted; _maintain_grid vai cuidar na proxima iter
 
-        _L, p_a_main, p_b_main = sig
-        tick_lower = floor(log(p_a_main / decimal_factor) / log(1.0001))
-        tick_upper = floor(log(p_b_main / decimal_factor) / log(1.0001))
+        # Signature stores raw V3 ticks (ints) directly — see _maintain_grid.
+        _L, tick_lower, tick_upper = sig
 
         if not (tick_lower <= next_tick <= tick_upper):
             return  # fora do range; deixa _maintain_grid lidar na proxima iter
