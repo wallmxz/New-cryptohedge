@@ -158,3 +158,80 @@ async def test_place_stop_limit_order_cloid_masked_to_32bit():
     )
     call = adapter._signer.create_sl_limit_order.call_args
     assert call.kwargs["client_order_index"] == big_cloid & 0xFFFFFFFF
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Task A7: cancel_stop_order + cancel_all_stops
+# ────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_cancel_stop_order_calls_sdk():
+    """cancel_stop_order routes to SDK cancel_order with market_index +
+    order_index. SDK returns 3-tuple (CancelOrder, RespSendTx, err_or_None)."""
+    adapter = LighterAdapter.__new__(LighterAdapter)
+    adapter._signer = MagicMock()
+    adapter._signer.cancel_order = AsyncMock(
+        return_value=(MagicMock(), MagicMock(), None),
+    )
+    meta = MagicMock()
+    meta.market_index = 50
+    adapter._market_meta_or_raise = MagicMock(return_value=meta)
+
+    await adapter.cancel_stop_order(symbol="ARB-USD", order_index=987)
+    adapter._signer.cancel_order.assert_called_once_with(
+        market_index=50, order_index=987,
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancel_stop_order_sdk_error_raises():
+    adapter = LighterAdapter.__new__(LighterAdapter)
+    adapter._signer = MagicMock()
+    adapter._signer.cancel_order = AsyncMock(
+        return_value=(None, None, "not found"),
+    )
+    meta = MagicMock()
+    meta.market_index = 50
+    adapter._market_meta_or_raise = MagicMock(return_value=meta)
+
+    with pytest.raises(RuntimeError, match="not found"):
+        await adapter.cancel_stop_order(symbol="ARB-USD", order_index=987)
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_stops_calls_sdk():
+    """cancel_all_stops routes to SDK cancel_all_orders. SDK requires
+    time_in_force + timestamp_ms; we pass IMMEDIATE + current ms.
+    Note: SDK cancels ALL orders for the account, not market-scoped."""
+    adapter = LighterAdapter.__new__(LighterAdapter)
+    adapter._signer = MagicMock()
+    adapter._signer.cancel_all_orders = AsyncMock(
+        return_value=(MagicMock(), MagicMock(), None),
+    )
+    meta = MagicMock()
+    meta.market_index = 50
+    adapter._market_meta_or_raise = MagicMock(return_value=meta)
+
+    await adapter.cancel_all_stops(symbol="ARB-USD")
+    adapter._signer.cancel_all_orders.assert_called_once()
+    call = adapter._signer.cancel_all_orders.call_args
+    # Must pass time_in_force=IMMEDIATE (0) and a timestamp_ms
+    assert call.kwargs["time_in_force"] == 0
+    assert isinstance(call.kwargs["timestamp_ms"], int)
+    assert call.kwargs["timestamp_ms"] > 0
+
+
+@pytest.mark.asyncio
+async def test_cancel_all_stops_sdk_error_raises():
+    adapter = LighterAdapter.__new__(LighterAdapter)
+    adapter._signer = MagicMock()
+    adapter._signer.cancel_all_orders = AsyncMock(
+        return_value=(None, None, "rate limited"),
+    )
+    meta = MagicMock()
+    meta.market_index = 50
+    adapter._market_meta_or_raise = MagicMock(return_value=meta)
+
+    with pytest.raises(RuntimeError, match="rate limited"):
+        await adapter.cancel_all_stops(symbol="ARB-USD")
