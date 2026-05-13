@@ -245,6 +245,25 @@ class Database:
         )
         await self._conn.commit()
 
+        # Predictive grid v2 (2026-05-12): stop orders on grid_orders.
+        # `trigger_price` holds the trigger level for stop orders (NULL for
+        # regular maker grid orders). `is_stop_order` is a 0/1 flag used by
+        # the fill-event handler to filter stops from the maker grid.
+        try:
+            await self._conn.execute(
+                "ALTER TABLE grid_orders ADD COLUMN trigger_price REAL"
+            )
+            await self._conn.commit()
+        except aiosqlite.OperationalError:
+            pass
+        try:
+            await self._conn.execute(
+                "ALTER TABLE grid_orders ADD COLUMN is_stop_order INTEGER NOT NULL DEFAULT 0"
+            )
+            await self._conn.commit()
+        except aiosqlite.OperationalError:
+            pass
+
     async def get_token_metadata(self, address: str) -> dict | None:
         """Returns {symbol, decimals} for an address, or None if not cached."""
         cursor = await self._conn.execute(
