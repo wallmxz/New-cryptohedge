@@ -53,8 +53,8 @@ Este runbook é a checklist de smoke.
   - `bot_grid_stops_filled_total` incrementou
   - `bot_grid_stops_placed_total` incrementou de novo (próximo tick reposto)
   - `bot_grid_rebuild_total{reason="fill"}` incrementou
-- [ ] DB query: `SELECT * FROM grid_orders WHERE cloid = <filled_cloid>` mostra `filled_at IS NOT NULL`
-- [ ] DB query: `SELECT * FROM grid_orders WHERE is_stop_order=1 AND filled_at IS NULL` mostra os ativos atuais
+- [ ] DB query: `SELECT * FROM grid_orders WHERE cloid = <filled_cloid>` mostra `fill_id IS NOT NULL`
+- [ ] DB query: `SELECT * FROM grid_orders WHERE is_stop_order=1 AND fill_id IS NULL AND cancelled_at IS NULL` mostra os stops ativos atualmente
 - [ ] Dashboard `/`: `stops_filled_total` no card aumentou
 
 **Critério de pass:** ≥3 fills observados sem crash, fill_latency mediana < 30s.
@@ -139,14 +139,52 @@ Quando todos os critérios de promoção forem ✓:
 
 ---
 
+## Limitações conhecidas (do code review final)
+
+Documentado aqui pra user ter clareza durante smoke:
+
+- **C-2 (`cancel_all_stops` cancela TODA a conta, não só market):** A SDK Lighter
+  `cancel_all_orders` é account-wide. Em produção single-market single-account
+  isso é equivalente a "cancel all stops desse market" — sem problema. Mas se
+  algum dia o bot rodar multi-market OU mixar com ordens manuais na mesma
+  conta, esse rebuild zera tudo. Mitigação futura: implementar market-scoped
+  cancel iterando active orders + cancel_stop_order individual.
+
+- **C-3 (sem mapping cloid → order_index):** `place_stop_limit_order` descarta
+  o `order_index` retornado pela SDK. Sem ele, `cancel_stop_order` individual
+  é inviável — só `cancel_all_stops` funciona. Pra MVP isso é OK porque o
+  flow é "rebuild inteiro on range_change" (cancela tudo via cancel_all) e
+  "fill repõe próximo tick" (não precisa cancelar nada). Mas se quiser
+  cancelar nível específico (ex: out-of-range cleanup parcial), precisa
+  capturar order_index — refactor futuro.
+
+- **I-1 (decimals hardcoded ARB-USD: `lighter_price_decimals=5`,
+  `lighter_size_decimals=1`):** `_maintain_grid` e `_on_grid_fill` usam esses
+  valores fixos. Funciona pra ARB/USDC.e (pair atual escolhido). Se você
+  trocar pra outro par via pair-picker, vai precisar atualizar antes da
+  próxima op. Fix definitivo: ler de `meta = exchange.get_market_meta(symbol)`.
+
+- **I-6 (replication_error_pct sempre = 0% no dashboard):** A métrica está
+  declarada mas nunca computada. Dashboard mostra "0.00%" verde sempre. Não
+  use esse critério no Smoke 4 — verifique via PnL breakdown (`hedge_pnl /
+  il_natural`) que é a métrica real de replicação.
+
+- **`min_quote_amount=$10` Lighter:** o adapter raise apenas se `base_amount_raw <= 0`.
+  Se um nível da grade tiver notional `< $10`, a Lighter pode rejeitar com erro
+  da SDK (`place_stop_limit_order failed: ...`). Vai aparecer em log warning,
+  mas não bloqueia o resto da grade. Se ver muitos warnings, considerar
+  raise size mínimo via diluir L (menos níveis, cada um maior).
+
+---
+
 ## Anexo: queries úteis pra debug durante smoke
 
 ```bash
-# Estado atual da grade
+# Estado atual da grade (stops ativos sem fill nem cancelamento)
 ssh root@<sandbox_ip> '/opt/automoney/venv/bin/python3 -c "
 import sqlite3
 c = sqlite3.connect(\"/data/automoney.db\")
-cur = c.execute(\"SELECT side, price, size, trigger_price, placed_at, filled_at FROM grid_orders WHERE is_stop_order=1 AND filled_at IS NULL ORDER BY price\")
+cur = c.execute(\"SELECT side, target_price, size, trigger_price, placed_at FROM grid_orders WHERE is_stop_order=1 AND fill_id IS NULL AND cancelled_at IS NULL ORDER BY target_price\")
 for r in cur.fetchall(): print(r)
 "'
 

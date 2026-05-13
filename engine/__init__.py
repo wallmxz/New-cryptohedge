@@ -1296,7 +1296,7 @@ class GridMakerEngine:
             return
 
         from engine.curve import compute_grid_from_pool_ticks
-        from math import log
+        from math import log, floor
 
         cache = self._hedge_model._cache
 
@@ -1337,9 +1337,12 @@ class GridMakerEngine:
         decimals0 = self._settings.token0_decimals
         decimals1 = self._settings.token1_decimals
         decimal_factor = 10 ** (decimals0 - decimals1)
-        tick_lower = int(log(cache.p_a_main / decimal_factor) / log(1.0001))
-        tick_upper = int(log(cache.p_b_main / decimal_factor) / log(1.0001))
-        tick_now = int(log(p_now / decimal_factor) / log(1.0001))
+        # math.floor (não int()) pra ticks negativos: int(-296199.7) = -296199
+        # mas o tick boundary correto é -296200. ARB-USDC.e usa ticks negativos
+        # (~-296000), então usar int() introduz off-by-one no boundary.
+        tick_lower = floor(log(cache.p_a_main / decimal_factor) / log(1.0001))
+        tick_upper = floor(log(cache.p_b_main / decimal_factor) / log(1.0001))
+        tick_now = floor(log(p_now / decimal_factor) / log(1.0001))
 
         # tick_spacing depende do fee tier do pool
         fee_tier = self._settings.uniswap_v3_pool_fee
@@ -1435,6 +1438,15 @@ class GridMakerEngine:
             return
 
         metrics.grid_stops_filled_total.inc()
+        # Fill latency: tempo entre placed_at e fill atual (smoke critério Phase D)
+        try:
+            placed_at = float(row.get("placed_at") or 0)
+            if placed_at > 0:
+                latency_ms = (time.time() - placed_at) * 1000.0
+                metrics.grid_fill_latency_ms.observe(latency_ms)
+        except Exception:
+            pass
+
         gh = self._hub.grid_health_metrics
         gh["stops_filled_total"] = gh.get("stops_filled_total", 0) + 1
 
@@ -1445,7 +1457,7 @@ class GridMakerEngine:
             logger.warning(f"mark_grid_order_filled failed: {e}")
 
         # Calcula proximo tick adjacente
-        from math import log
+        from math import log, floor
         from engine.curve import tick_to_human_price
 
         decimals0 = self._settings.token0_decimals
@@ -1453,7 +1465,8 @@ class GridMakerEngine:
         decimal_factor = 10 ** (decimals0 - decimals1)
 
         filled_price = row["target_price"]
-        filled_tick = int(log(filled_price / decimal_factor) / log(1.0001))
+        # math.floor pra ticks negativos (ver comentário em _maintain_grid)
+        filled_tick = floor(log(filled_price / decimal_factor) / log(1.0001))
 
         fee_tier = self._settings.uniswap_v3_pool_fee
         tick_spacing_map = {500: 10, 3000: 60, 10000: 200}
@@ -1470,8 +1483,8 @@ class GridMakerEngine:
             return  # nada posted; _maintain_grid vai cuidar na proxima iter
 
         _L, p_a_main, p_b_main = sig
-        tick_lower = int(log(p_a_main / decimal_factor) / log(1.0001))
-        tick_upper = int(log(p_b_main / decimal_factor) / log(1.0001))
+        tick_lower = floor(log(p_a_main / decimal_factor) / log(1.0001))
+        tick_upper = floor(log(p_b_main / decimal_factor) / log(1.0001))
 
         if not (tick_lower <= next_tick <= tick_upper):
             return  # fora do range; deixa _maintain_grid lidar na proxima iter
@@ -1682,6 +1695,24 @@ class GridMakerEngine:
             action="fill", side=fill.side, size=fill.size, price=fill.price,
             reason=fill.liquidity, operation_id=op_id,
         )
+
+        # Predictive grid v2 (spec 2026-05-12): se o fill corresponde a uma
+        # stop order da grade, dispatch _on_grid_fill pra repor o próximo tick.
+        # No-op silencioso fora do modo predictive (flag off OU cloid não-grid).
+        if self._settings.predictive_grid_v2 and fill.order_id:
+            try:
+                row = await self._db.get_grid_order(fill.order_id)
+                if row is not None and row.get("is_stop_order"):
+                    await self._on_grid_fill(
+                        cloid=fill.order_id,
+                        fill_price=fill.price,
+                        fill_size=fill.size,
+                        side=fill.side,
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"_on_grid_fill dispatch failed for cloid={fill.order_id}: {e}",
+                )
 
     async def _cancel_active_grid(self) -> None:
         """Cancel every order tracked as active in the DB.
