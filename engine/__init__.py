@@ -1193,17 +1193,27 @@ class GridMakerEngine:
             # Target = actual × share × hedge_ratio (computed above into
             # `targets`). predicted is informational only (drives
             # hedge_model_status field).
-            for sym in symbols:
-                idx = symbols.index(sym)
-                current = abs(positions[idx].size) if positions[idx] else 0.0
-                ref_price = oracle_prices.get(sym, 0.0)
-                if ref_price <= 0:
-                    continue
-                await self._maybe_rebalance_leg(
-                    symbol=sym, target=targets[sym], current=current,
-                    min_notional=self._settings.min_rebalance_notional_usd,
-                    ref_price=ref_price,
+            if self._settings.predictive_grid_v2:
+                # Predictive grid v2: maintain stop-limit grid event-driven.
+                # No taker chase; ordens ficam dormentes na Lighter até trigger.
+                # Spec: docs/superpowers/specs/2026-05-12-predictive-grid-v2-design.md
+                await self._maintain_grid(
+                    beefy_pos=beefy_pos, p_now=p_now,
+                    oracle_prices=oracle_prices,
                 )
+            else:
+                # Legacy reactive taker chase (default até cutover Phase D).
+                for sym in symbols:
+                    idx = symbols.index(sym)
+                    current = abs(positions[idx].size) if positions[idx] else 0.0
+                    ref_price = oracle_prices.get(sym, 0.0)
+                    if ref_price <= 0:
+                        continue
+                    await self._maybe_rebalance_leg(
+                        symbol=sym, target=targets[sym], current=current,
+                        min_notional=self._settings.min_rebalance_notional_usd,
+                        ref_price=ref_price,
+                    )
         finally:
             timings["total"] = (time.monotonic() - iter_start) * 1000
             metrics.loop_duration.labels(step="total").observe(timings["total"] / 1000)
