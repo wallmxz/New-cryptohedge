@@ -1028,6 +1028,54 @@ class LighterAdapter(ExchangeAdapter):
         except Exception as e:
             logger.debug(f"cancel_long_term_order best-effort failed: {e}")
 
+    async def place_stop_limit_order(
+        self, *,
+        symbol: str,
+        side: str,
+        size: float,
+        trigger_price: float,
+        cloid_int: int,
+        reduce_only: bool = False,
+    ) -> None:
+        """Place a STOP_LOSS_LIMIT order with `limit_price == trigger_price`.
+
+        Para a grade predictive (spec 2026-05-12, seção 5.1):
+          - side='sell' + trigger abaixo do mark → fires quando mark <= trigger
+          - side='buy'  + trigger acima do mark → fires quando mark >= trigger
+
+        Quando triggered, vira limit order em `price = trigger_price` (limit ==
+        trigger, sem slippage por design). Fill exato no nível ou rest no book.
+
+        TIF: GTT 28-day expiry (default da SDK pra non-IOC).
+        """
+        meta = self._market_meta_or_raise(symbol)
+        is_ask = (side == "sell")
+        base_amount_raw = self._size_to_int(size, meta)
+        if base_amount_raw <= 0:
+            raise ValueError(
+                f"Size {size} below market step {meta.step_size}",
+            )
+        price_raw = int(round(trigger_price * (10 ** meta.price_decimals)))
+        if price_raw <= 0:
+            raise ValueError(
+                f"trigger_price {trigger_price} rounds to zero ticks",
+            )
+
+        result = await self._signer.create_sl_limit_order(
+            market_index=meta.market_index,
+            client_order_index=int(cloid_int) & 0xFFFFFFFF,
+            base_amount=base_amount_raw,
+            trigger_price=price_raw,
+            price=price_raw,  # limit = trigger (exato, sem slippage)
+            is_ask=is_ask,
+            reduce_only=reduce_only,
+        )
+        # SDK retorna (CreateOrder, RespSendTx, err_or_None).
+        if result[2] is not None:
+            raise RuntimeError(
+                f"place_stop_limit_order failed: {result[2]}",
+            )
+
     async def batch_place(self, orders: list[dict]) -> list[Order]:
         # Sequential for now; Lighter has create_grouped_orders for batch
         # but keeping it simple in Phase A.
