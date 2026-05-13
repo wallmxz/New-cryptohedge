@@ -64,6 +64,9 @@ class GridLevel:
     # accounting on fills; GridManager.diff ignores it. Default 0 lets
     # callers reconstructing a level from a DB row omit it.
     target_short: float = 0.0
+    # Stop order trigger price. None = regular limit order.
+    # When set, place via stop-limit on Lighter (limit_price = trigger_price).
+    trigger_price: float | None = None
 
 
 def inverse_x_to_p(L: float, x: float, p_b: float) -> float:
@@ -207,6 +210,7 @@ def compute_grid_from_pool_ticks(
             levels.append(GridLevel(
                 price=price_rounded, size=size, side="sell",
                 target_short=x_at_t * hedge_ratio,
+                trigger_price=price_rounded,  # stop-limit: trigger = price exato
             ))
         prev_x = x_at_t
         t -= tick_spacing
@@ -227,6 +231,7 @@ def compute_grid_from_pool_ticks(
             levels.append(GridLevel(
                 price=price_rounded, size=size, side="buy",
                 target_short=x_at_t * hedge_ratio,
+                trigger_price=price_rounded,  # stop-limit: trigger = price exato
             ))
         prev_x = x_at_t
         t += tick_spacing

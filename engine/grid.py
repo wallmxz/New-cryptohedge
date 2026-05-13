@@ -10,8 +10,17 @@ class GridDiff:
 
 
 def _level_key(level: GridLevel) -> tuple:
-    """Identity for matching grid levels (price + side + size, rounded)."""
-    return (round(level.price, 6), level.side, round(level.size, 9))
+    """Identity for matching grid levels (price + side + size + trigger, rounded)."""
+    trigger = (
+        round(level.trigger_price, 6)
+        if level.trigger_price is not None else None
+    )
+    return (
+        round(level.price, 6),
+        level.side,
+        round(level.size, 9),
+        trigger,
+    )
 
 
 class GridManager:
