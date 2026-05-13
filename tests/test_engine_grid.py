@@ -2,6 +2,7 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 from state import StateHub
 from engine.curve import GridLevel
+from engine.grid import GridManager
 
 
 @pytest.mark.asyncio
@@ -818,3 +819,18 @@ async def test_engine_increments_counters(tmp_path):
     assert after == before + 1
 
     await db.close()
+
+
+def test_level_key_distinguishes_stop_from_limit():
+    """Stop order (com trigger_price) e limit order (sem) NO MESMO preço
+    devem ter keys diferentes — não são a mesma ordem."""
+    gm = GridManager()
+    limit_lv = GridLevel(price=0.135, size=10.0, side="buy", trigger_price=None)
+    stop_lv = GridLevel(price=0.135, size=10.0, side="buy", trigger_price=0.135)
+    diff = gm.diff(
+        current=[("cloid1", limit_lv)],
+        target=[stop_lv],
+    )
+    # Limit existente deve ser cancelado, stop deve ser placed (são ordens distintas)
+    assert diff.to_cancel == ["cloid1"]
+    assert diff.to_place == [stop_lv]

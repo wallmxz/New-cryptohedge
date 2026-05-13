@@ -64,6 +64,9 @@ class GridLevel:
     # accounting on fills; GridManager.diff ignores it. Default 0 lets
     # callers reconstructing a level from a DB row omit it.
     target_short: float = 0.0
+    # Stop order trigger price. None = regular limit order.
+    # When set, place via stop-limit on Lighter (limit_price = trigger_price).
+    trigger_price: float | None = None
 
 
 def inverse_x_to_p(L: float, x: float, p_b: float) -> float:
@@ -142,3 +145,110 @@ def compute_target_grid(
         target_x += step_x
 
     return sorted(levels, key=lambda lv: lv.price)
+
+
+def compute_grid_from_pool_ticks(
+    *,
+    L: float,
+    tick_lower: int,
+    tick_upper: int,
+    tick_spacing: int,
+    tick_now: int,
+    decimals0: int,
+    decimals1: int,
+    hedge_ratio: float,
+    lighter_price_decimals: int,
+    lighter_size_decimals: int,
+) -> list[GridLevel]:
+    """Gera grade de níveis alinhada aos ticks ativos do pool V3.
+
+    Two-loop pattern centrado em tick_now:
+      - Loop DOWN: emite sells em ticks alinhados < tick_now
+      - Loop UP: emite buys em ticks alinhados > tick_now
+      - tick_now em si não tem level (mid)
+
+    Size de cada nível = delta V3 token0 entre tick atual e tick anterior
+    (toward tick_now) × hedge_ratio, arredondado pro step da Lighter.
+    Price arredondado pro tick da Lighter.
+
+    Caller garante:
+      - tick_lower < tick_upper
+      - tick_lower <= tick_now <= tick_upper
+      - L > 0
+    """
+    if tick_lower >= tick_upper:
+        return []
+    if L <= 0:
+        return []
+
+    price_upper = tick_to_human_price(
+        tick=tick_upper, decimals0=decimals0, decimals1=decimals1,
+    )
+    price_at_tick_now = tick_to_human_price(
+        tick=tick_now, decimals0=decimals0, decimals1=decimals1,
+    )
+    x_at_tick_now = compute_x(L, price_at_tick_now, price_upper)
+
+    levels: list[GridLevel] = []
+
+    # Loop DOWN: ticks alinhados < tick_now, side="sell"
+    # Primeiro aligned tick estritamente menor que tick_now
+    down_start = (tick_now // tick_spacing) * tick_spacing
+    if down_start >= tick_now:
+        down_start -= tick_spacing
+    t = down_start
+    prev_x = x_at_tick_now
+    while t >= tick_lower:
+        price_human = tick_to_human_price(
+            tick=t, decimals0=decimals0, decimals1=decimals1,
+        )
+        price_rounded = round(price_human, lighter_price_decimals)
+        x_at_t = compute_x(L, price_human, price_upper)
+        delta = abs(x_at_t - prev_x)
+        size = round(delta * hedge_ratio, lighter_size_decimals)
+        if size > 0 and price_rounded > 0:
+            levels.append(GridLevel(
+                price=price_rounded, size=size, side="sell",
+                target_short=x_at_t * hedge_ratio,
+                trigger_price=price_rounded,  # stop-limit: trigger = price exato
+            ))
+        prev_x = x_at_t
+        t -= tick_spacing
+
+    # Loop UP: ticks alinhados > tick_now, side="buy"
+    up_start = ((tick_now // tick_spacing) + 1) * tick_spacing
+    t = up_start
+    prev_x = x_at_tick_now
+    while t <= tick_upper:
+        price_human = tick_to_human_price(
+            tick=t, decimals0=decimals0, decimals1=decimals1,
+        )
+        price_rounded = round(price_human, lighter_price_decimals)
+        x_at_t = compute_x(L, price_human, price_upper)
+        delta = abs(prev_x - x_at_t)
+        size = round(delta * hedge_ratio, lighter_size_decimals)
+        if size > 0 and price_rounded > 0:
+            levels.append(GridLevel(
+                price=price_rounded, size=size, side="buy",
+                target_short=x_at_t * hedge_ratio,
+                trigger_price=price_rounded,  # stop-limit: trigger = price exato
+            ))
+        prev_x = x_at_t
+        t += tick_spacing
+
+    return sorted(levels, key=lambda lv: lv.price)
+
+
+def tick_to_human_price(*, tick: int, decimals0: int, decimals1: int) -> float:
+    """Converte tick V3 pra preço human-readable (token1 por token0).
+
+    Uniswap V3: raw_price = 1.0001^tick, em unidades raw (decimais bruto).
+    Human-readable assume convenção do pool: token0 é o de address menor.
+    human_price = raw * 10^(decimals0 - decimals1).
+
+    Caller deve confirmar qual token é token0 no pool específico (depende
+    de qual address é menor). Para ARB/USDC.e: ARB(0x912...) < USDC.e(0xFF9...)
+    → ARB é token0, decimals0=18, decimals1=6.
+    """
+    raw = 1.0001 ** tick
+    return raw * (10 ** (decimals0 - decimals1))

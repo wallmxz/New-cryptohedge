@@ -106,6 +106,7 @@ async def test_rebalance_leg_token1_no_synthetic_fee_either():
     state.operation_state = "active"
 
     settings = MagicMock()
+    settings.predictive_grid_v2 = False
     settings.dydx_symbol_token0 = "ARB-USD"
     settings.dydx_symbol_token1 = "ETH-USD"
 
@@ -152,6 +153,7 @@ async def test_iterate_dual_leg_calls_rebalance_for_both_legs():
     state.current_operation_id = 1
 
     settings = MagicMock()
+    settings.predictive_grid_v2 = False
     settings.dydx_symbol_token0 = "ARB-USD"
     settings.dydx_symbol_token1 = "ETH-USD"
     settings.threshold_aggressive = 0.01
@@ -219,6 +221,7 @@ async def test_iterate_uses_settings_min_rebalance_not_meta_min_notional():
     state.current_operation_id = 1
 
     settings = MagicMock()
+    settings.predictive_grid_v2 = False
     settings.dydx_symbol_token0 = "ETH-USD"
     settings.dydx_symbol_token1 = ""
     settings.threshold_aggressive = 0.01
@@ -290,6 +293,7 @@ async def test_iterate_single_leg_only_calls_token0():
     state.current_operation_id = 1
 
     settings = MagicMock()
+    settings.predictive_grid_v2 = False
     settings.dydx_symbol_token0 = "ETH-USD"
     settings.dydx_symbol_token1 = ""  # single-leg
     settings.threshold_aggressive = 0.01

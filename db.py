@@ -245,6 +245,25 @@ class Database:
         )
         await self._conn.commit()
 
+        # Predictive grid v2 (2026-05-12): stop orders on grid_orders.
+        # `trigger_price` holds the trigger level for stop orders (NULL for
+        # regular maker grid orders). `is_stop_order` is a 0/1 flag used by
+        # the fill-event handler to filter stops from the maker grid.
+        try:
+            await self._conn.execute(
+                "ALTER TABLE grid_orders ADD COLUMN trigger_price REAL"
+            )
+            await self._conn.commit()
+        except aiosqlite.OperationalError:
+            pass
+        try:
+            await self._conn.execute(
+                "ALTER TABLE grid_orders ADD COLUMN is_stop_order INTEGER NOT NULL DEFAULT 0"
+            )
+            await self._conn.commit()
+        except aiosqlite.OperationalError:
+            pass
+
     async def get_token_metadata(self, address: str) -> dict | None:
         """Returns {symbol, decimals} for an address, or None if not cached."""
         cursor = await self._conn.execute(
@@ -415,11 +434,15 @@ class Database:
     async def insert_grid_order(
         self, *, cloid: str, side: str, target_price: float,
         size: float, placed_at: float, operation_id: int | None = None,
+        trigger_price: float | None = None, is_stop_order: int = 0,
     ) -> None:
         await self._conn.execute(
-            """INSERT INTO grid_orders (cloid, side, target_price, size, placed_at, operation_id)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (cloid, side, target_price, size, placed_at, operation_id),
+            """INSERT INTO grid_orders
+               (cloid, side, target_price, size, placed_at, operation_id,
+                trigger_price, is_stop_order)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (cloid, side, target_price, size, placed_at, operation_id,
+             trigger_price, is_stop_order),
         )
         await self._conn.commit()
 
@@ -445,6 +468,15 @@ class Database:
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
+
+    async def get_grid_order(self, cloid) -> dict | None:
+        """Lookup a single grid order by cloid (int or str — coerced to str
+        since column is TEXT). Returns None if not found."""
+        cursor = await self._conn.execute(
+            "SELECT * FROM grid_orders WHERE cloid = ?", (str(cloid),),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
 
     async def insert_operation(
         self, *, started_at: float, status: str,

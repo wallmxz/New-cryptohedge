@@ -1193,17 +1193,27 @@ class GridMakerEngine:
             # Target = actual × share × hedge_ratio (computed above into
             # `targets`). predicted is informational only (drives
             # hedge_model_status field).
-            for sym in symbols:
-                idx = symbols.index(sym)
-                current = abs(positions[idx].size) if positions[idx] else 0.0
-                ref_price = oracle_prices.get(sym, 0.0)
-                if ref_price <= 0:
-                    continue
-                await self._maybe_rebalance_leg(
-                    symbol=sym, target=targets[sym], current=current,
-                    min_notional=self._settings.min_rebalance_notional_usd,
-                    ref_price=ref_price,
+            if self._settings.predictive_grid_v2:
+                # Predictive grid v2: maintain stop-limit grid event-driven.
+                # No taker chase; ordens ficam dormentes na Lighter até trigger.
+                # Spec: docs/superpowers/specs/2026-05-12-predictive-grid-v2-design.md
+                await self._maintain_grid(
+                    beefy_pos=beefy_pos, p_now=p_now,
+                    oracle_prices=oracle_prices,
                 )
+            else:
+                # Legacy reactive taker chase (default até cutover Phase D).
+                for sym in symbols:
+                    idx = symbols.index(sym)
+                    current = abs(positions[idx].size) if positions[idx] else 0.0
+                    ref_price = oracle_prices.get(sym, 0.0)
+                    if ref_price <= 0:
+                        continue
+                    await self._maybe_rebalance_leg(
+                        symbol=sym, target=targets[sym], current=current,
+                        min_notional=self._settings.min_rebalance_notional_usd,
+                        ref_price=ref_price,
+                    )
         finally:
             timings["total"] = (time.monotonic() - iter_start) * 1000
             metrics.loop_duration.labels(step="total").observe(timings["total"] / 1000)
@@ -1260,6 +1270,254 @@ class GridMakerEngine:
             return await getter(sym)
         except Exception:
             return None
+
+    async def _maintain_grid(
+        self, *, beefy_pos, p_now: float, oracle_prices: dict[str, float],
+    ) -> None:
+        """Mantém grade de stop-limit orders alinhada aos ticks ativos da Beefy.
+
+        Implementa o lifecycle event-driven descrito no spec
+        (docs/superpowers/specs/2026-05-12-predictive-grid-v2-design.md, Sec 6):
+          - Detecta mudança de range (tick_lower/upper) e L_main do HedgeModel
+            cache → cancel-all + rebuild
+          - Detecta drift de composição → rebuild
+          - Detecta preço fora do range → cancel-all + idle
+          - Insere próximo nível quando ordem fillha (handler separado em
+            _on_grid_fill, Task B5)
+
+        No-op se feature flag PREDICTIVE_GRID_V2 desligada (default).
+        Implementação completa em B4.
+        """
+        if not self._settings.predictive_grid_v2:
+            return
+        if self._hedge_model is None or self._hedge_model._cache is None:
+            # Cache cold — sem L_main / ticks confiáveis. Skipa silenciosamente;
+            # próxima iter (com refresh feito) pega.
+            return
+
+        from engine.curve import compute_grid_from_pool_ticks
+        from math import log, floor
+
+        cache = self._hedge_model._cache
+
+        # Signature atual da geometria (L + bounds)
+        current_sig = (cache.L_main, cache.p_a_main, cache.p_b_main)
+        posted_sig = getattr(self, "_posted_grid_signature", None)
+
+        if posted_sig == current_sig:
+            # Nada mudou — grade posted ainda é válida
+            return
+
+        # Algo mudou (primeira posta OU range/L mudou). Cancel-all + rebuild.
+        rebuild_reason = "range_change" if posted_sig is not None else "initial"
+        if posted_sig is not None:
+            # Range/L mudou — Beefy reposicionou
+            metrics.beefy_range_change_total.inc()
+        try:
+            await self._exchange.cancel_all_stops(
+                symbol=self._settings.dydx_symbol_token0,
+            )
+        except Exception as e:
+            logger.warning(f"cancel_all_stops failed in rebuild: {e}")
+
+        # Limpar grid_orders ativos no DB (best-effort)
+        try:
+            active_orders = await self._db.get_active_grid_orders()
+            for row in active_orders:
+                await self._db.mark_grid_order_cancelled(
+                    row["cloid"], time.time(),
+                )
+                metrics.grid_stops_cancelled_total.inc()
+        except Exception as e:
+            logger.warning(f"db cleanup during rebuild failed: {e}")
+
+        # Derivar tick_lower / tick_upper a partir dos preços human-readable.
+        # p_human = 1.0001^tick * 10^(decimals0 - decimals1)
+        # tick = log(p / 10^(d0-d1)) / log(1.0001)
+        decimals0 = self._settings.token0_decimals
+        decimals1 = self._settings.token1_decimals
+        decimal_factor = 10 ** (decimals0 - decimals1)
+        # math.floor (não int()) pra ticks negativos: int(-296199.7) = -296199
+        # mas o tick boundary correto é -296200. ARB-USDC.e usa ticks negativos
+        # (~-296000), então usar int() introduz off-by-one no boundary.
+        tick_lower = floor(log(cache.p_a_main / decimal_factor) / log(1.0001))
+        tick_upper = floor(log(cache.p_b_main / decimal_factor) / log(1.0001))
+        tick_now = floor(log(p_now / decimal_factor) / log(1.0001))
+
+        # tick_spacing depende do fee tier do pool
+        fee_tier = self._settings.uniswap_v3_pool_fee
+        tick_spacing_map = {500: 10, 3000: 60, 10000: 200}
+        tick_spacing = tick_spacing_map.get(fee_tier, 10)
+
+        # Build new grid
+        hedge_ratio = (
+            getattr(self._hub, "hedge_ratio", None)
+            or self._settings.hedge_ratio
+        )
+        new_grid = compute_grid_from_pool_ticks(
+            L=float(cache.L_main),
+            tick_lower=tick_lower,
+            tick_upper=tick_upper,
+            tick_spacing=tick_spacing,
+            tick_now=tick_now,
+            decimals0=decimals0,
+            decimals1=decimals1,
+            hedge_ratio=hedge_ratio,
+            lighter_price_decimals=5,  # ARB-USD on Lighter
+            lighter_size_decimals=1,
+        )
+
+        # Post each level
+        symbol = self._settings.dydx_symbol_token0
+        placed_count = 0
+        for lv in new_grid:
+            cloid = self._next_cloid_for_leg(symbol)
+            try:
+                await self._exchange.place_stop_limit_order(
+                    symbol=symbol,
+                    side=lv.side,
+                    size=lv.size,
+                    trigger_price=lv.trigger_price,
+                    cloid_int=cloid,
+                )
+                metrics.grid_stops_placed_total.inc()
+                placed_count += 1
+                try:
+                    await self._db.insert_grid_order(
+                        cloid=str(cloid),
+                        side=lv.side,
+                        target_price=lv.price,
+                        size=lv.size,
+                        placed_at=time.time(),
+                        operation_id=self._hub.current_operation_id,
+                        trigger_price=lv.trigger_price,
+                        is_stop_order=1,
+                    )
+                except Exception as e:
+                    logger.warning(f"db insert_grid_order failed: {e}")
+            except Exception as e:
+                logger.warning(
+                    f"place_stop_limit_order failed for level @{lv.price}: {e}",
+                )
+
+        metrics.grid_levels_active.set(placed_count)
+        metrics.grid_rebuild_total.labels(reason=rebuild_reason).inc()
+
+        # Atualizar state hub pra dashboard
+        gh = self._hub.grid_health_metrics
+        gh["levels_active"] = placed_count
+        gh["stops_placed_total"] = gh.get("stops_placed_total", 0) + placed_count
+        gh["rebuilds_total"] = gh.get("rebuilds_total", 0) + 1
+        gh["last_rebuild_reason"] = rebuild_reason
+        gh["last_rebuild_ts"] = time.time()
+        if rebuild_reason == "range_change":
+            gh["range_changes_total"] = gh.get("range_changes_total", 0) + 1
+
+        self._posted_grid_signature = current_sig
+
+    async def _on_grid_fill(
+        self, *, cloid: int, fill_price: float, fill_size: float, side: str,
+    ) -> None:
+        """Chamado quando uma ordem da grade predictive v2 fillha.
+
+        Posta um novo level no proximo tick adjacente (away from mid):
+          - Sell fillou em tick T -> proximo sell em T - tick_spacing
+          - Buy  fillou em tick T -> proximo buy  em T + tick_spacing
+
+        Mantem densidade constante da grade apos fills sucessivos.
+
+        No-op se PREDICTIVE_GRID_V2 desligado OU se cloid nao corresponde
+        a uma stop order da grade (ex: ordem manual ou legacy).
+        """
+        if not self._settings.predictive_grid_v2:
+            return
+
+        # Lookup do level fillado
+        row = await self._db.get_grid_order(cloid)
+        if row is None or not row.get("is_stop_order"):
+            return
+
+        metrics.grid_stops_filled_total.inc()
+        # Fill latency: tempo entre placed_at e fill atual (smoke critério Phase D)
+        try:
+            placed_at = float(row.get("placed_at") or 0)
+            if placed_at > 0:
+                latency_ms = (time.time() - placed_at) * 1000.0
+                metrics.grid_fill_latency_ms.observe(latency_ms)
+        except Exception:
+            pass
+
+        gh = self._hub.grid_health_metrics
+        gh["stops_filled_total"] = gh.get("stops_filled_total", 0) + 1
+
+        # Marca como filled no DB (best-effort)
+        try:
+            await self._db.mark_grid_order_filled(cloid, int(time.time()))
+        except Exception as e:
+            logger.warning(f"mark_grid_order_filled failed: {e}")
+
+        # Calcula proximo tick adjacente
+        from math import log, floor
+        from engine.curve import tick_to_human_price
+
+        decimals0 = self._settings.token0_decimals
+        decimals1 = self._settings.token1_decimals
+        decimal_factor = 10 ** (decimals0 - decimals1)
+
+        filled_price = row["target_price"]
+        # math.floor pra ticks negativos (ver comentário em _maintain_grid)
+        filled_tick = floor(log(filled_price / decimal_factor) / log(1.0001))
+
+        fee_tier = self._settings.uniswap_v3_pool_fee
+        tick_spacing_map = {500: 10, 3000: 60, 10000: 200}
+        tick_spacing = tick_spacing_map.get(fee_tier, 10)
+
+        if side == "sell":
+            next_tick = filled_tick - tick_spacing  # mais abaixo
+        else:
+            next_tick = filled_tick + tick_spacing  # mais acima
+
+        # Verifica que proximo tick ainda esta dentro do range posted.
+        sig = getattr(self, "_posted_grid_signature", None)
+        if sig is None:
+            return  # nada posted; _maintain_grid vai cuidar na proxima iter
+
+        _L, p_a_main, p_b_main = sig
+        tick_lower = floor(log(p_a_main / decimal_factor) / log(1.0001))
+        tick_upper = floor(log(p_b_main / decimal_factor) / log(1.0001))
+
+        if not (tick_lower <= next_tick <= tick_upper):
+            return  # fora do range; deixa _maintain_grid lidar na proxima iter
+
+        # Compute price do proximo tick (round pro tick Lighter)
+        new_price = round(
+            tick_to_human_price(
+                tick=next_tick, decimals0=decimals0, decimals1=decimals1,
+            ),
+            5,  # ARB-USD price_decimals=5
+        )
+
+        # Post novo stop (size = mesmo do filled — aproximacao MVP)
+        symbol = self._settings.dydx_symbol_token0
+        new_cloid = self._next_cloid_for_leg(symbol)
+        try:
+            await self._exchange.place_stop_limit_order(
+                symbol=symbol, side=side, size=row["size"],
+                trigger_price=new_price, cloid_int=new_cloid,
+            )
+            metrics.grid_stops_placed_total.inc()
+            metrics.grid_rebuild_total.labels(reason="fill").inc()
+            try:
+                await self._db.insert_grid_order(
+                    cloid=str(new_cloid), side=side, target_price=new_price,
+                    size=row["size"], placed_at=time.time(),
+                    trigger_price=new_price, is_stop_order=1,
+                    operation_id=self._hub.current_operation_id,
+                )
+            except Exception as e:
+                logger.warning(f"db insert_grid_order failed: {e}")
+        except Exception as e:
+            logger.warning(f"_on_grid_fill repost failed: {e}")
 
     async def _maybe_rebalance_leg(
         self, *, symbol: str, target: float, current: float,
@@ -1437,6 +1695,24 @@ class GridMakerEngine:
             action="fill", side=fill.side, size=fill.size, price=fill.price,
             reason=fill.liquidity, operation_id=op_id,
         )
+
+        # Predictive grid v2 (spec 2026-05-12): se o fill corresponde a uma
+        # stop order da grade, dispatch _on_grid_fill pra repor o próximo tick.
+        # No-op silencioso fora do modo predictive (flag off OU cloid não-grid).
+        if self._settings.predictive_grid_v2 and fill.order_id:
+            try:
+                row = await self._db.get_grid_order(fill.order_id)
+                if row is not None and row.get("is_stop_order"):
+                    await self._on_grid_fill(
+                        cloid=fill.order_id,
+                        fill_price=fill.price,
+                        fill_size=fill.size,
+                        side=fill.side,
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"_on_grid_fill dispatch failed for cloid={fill.order_id}: {e}",
+                )
 
     async def _cancel_active_grid(self) -> None:
         """Cancel every order tracked as active in the DB.

@@ -1028,6 +1028,96 @@ class LighterAdapter(ExchangeAdapter):
         except Exception as e:
             logger.debug(f"cancel_long_term_order best-effort failed: {e}")
 
+    async def place_stop_limit_order(
+        self, *,
+        symbol: str,
+        side: str,
+        size: float,
+        trigger_price: float,
+        cloid_int: int,
+        reduce_only: bool = False,
+    ) -> None:
+        """Place a STOP_LOSS_LIMIT order with `limit_price == trigger_price`.
+
+        Para a grade predictive (spec 2026-05-12, seção 5.1):
+          - side='sell' + trigger abaixo do mark → fires quando mark <= trigger
+          - side='buy'  + trigger acima do mark → fires quando mark >= trigger
+
+        Quando triggered, vira limit order em `price = trigger_price` (limit ==
+        trigger, sem slippage por design). Fill exato no nível ou rest no book.
+
+        TIF: GTT 28-day expiry (default da SDK pra non-IOC).
+        """
+        meta = self._market_meta_or_raise(symbol)
+        is_ask = (side == "sell")
+        base_amount_raw = self._size_to_int(size, meta)
+        if base_amount_raw <= 0:
+            raise ValueError(
+                f"Size {size} below market step {meta.step_size}",
+            )
+        price_raw = int(round(trigger_price * (10 ** meta.price_decimals)))
+        if price_raw <= 0:
+            raise ValueError(
+                f"trigger_price {trigger_price} rounds to zero ticks",
+            )
+
+        # SDK retorna (CreateOrder, RespSendTx, err_or_None). Tuple-unpack
+        # pra documentar o contrato no código.
+        _, _, err = await self._signer.create_sl_limit_order(
+            market_index=meta.market_index,
+            client_order_index=int(cloid_int) & 0xFFFFFFFF,
+            base_amount=base_amount_raw,
+            trigger_price=price_raw,
+            price=price_raw,  # limit = trigger (exato, sem slippage)
+            is_ask=is_ask,
+            reduce_only=reduce_only,
+        )
+        if err is not None:
+            raise RuntimeError(f"place_stop_limit_order failed: {err}")
+
+    async def cancel_stop_order(
+        self, *, symbol: str, order_index: int,
+    ) -> None:
+        """Cancela uma stop order específica via order_index (Lighter-side id).
+
+        NOTA: o order_index é o id que Lighter atribui após place; é DIFERENTE
+        do cloid_int local. Caller deve mapear cloid → order_index via response
+        do place_stop_limit_order (ou via active orders query).
+
+        SDK `cancel_order` retorna 3-tuple (CancelOrder, RespSendTx, err_or_None).
+        """
+        meta = self._market_meta_or_raise(symbol)
+        _, _, err = await self._signer.cancel_order(
+            market_index=meta.market_index,
+            order_index=order_index,
+        )
+        if err is not None:
+            raise RuntimeError(f"cancel_stop_order failed: {err}")
+
+    async def cancel_all_stops(self, *, symbol: str) -> None:
+        """Cancela TODAS as ordens (incluindo stops) da conta na Lighter.
+
+        Usado quando Beefy reposiciona range e a grade precisa ser rebuildada
+        inteira (spec 2026-05-12, seção 6.1 trigger 3).
+
+        NOTA: `cancel_all_orders` da SDK cancela todas as ordens da CONTA,
+        não filtra por market. O param `symbol` é mantido por consistência
+        com o resto da API (validamos que existe) mas não vai pro SDK call.
+        Em produção single-pair, isso é equivalente a "cancel all stops
+        desse market". Multi-market vai exigir revisão.
+
+        SDK requer `time_in_force` (CANCEL_ALL_TIF_IMMEDIATE=0) e `timestamp_ms`.
+        Retorna 3-tuple (CancelAllOrders, RespSendTx, err_or_None).
+        """
+        # symbol validado pra raise se inválido, mas não vai pro SDK call
+        self._market_meta_or_raise(symbol)
+        _, _, err = await self._signer.cancel_all_orders(
+            time_in_force=0,  # CANCEL_ALL_TIF_IMMEDIATE
+            timestamp_ms=int(time.time() * 1000),
+        )
+        if err is not None:
+            raise RuntimeError(f"cancel_all_stops failed: {err}")
+
     async def batch_place(self, orders: list[dict]) -> list[Order]:
         # Sequential for now; Lighter has create_grouped_orders for batch
         # but keeping it simple in Phase A.
