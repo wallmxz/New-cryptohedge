@@ -1,42 +1,85 @@
 # WORKING_ON
 
-**Última atualização:** 2026-05-12 (BOT EM PRODUÇÃO no DO Frankfurt — local desligado)
+**Última atualização:** 2026-05-13 — Predictive Grid v2 implementado, aguardando smoke em sandbox
 
 ## Foco atual
-Bot rodando 24/7 em **DigitalOcean Frankfurt** (`104.248.44.6:8000`, systemd `automoney.service`). Op #28 ATIVA, hedgeando com latência ~200ms steady-state (vs 1400ms local). Master pós-PR #5 inclui /health/engine + lighter-sdk fix em requirements.txt + Fly tooling preservado como histórico.
 
-## Última ação pendente do user
-User mudou `hedge_ratio` no dialog de Configurações pra **0.99** mas DB ainda mostra `0.98` — falta clicar **Salvar** no dialog. Dito ao user: ou clica Salvar OU eu faço via `curl -u admin:Wallace1 -X POST http://104.248.44.6:8000/settings -d "hedge_ratio=0.99"`. User pediu compact ANTES de eu rodar. Próxima sessão: confirmar com user e fazer.
+**Branch `feature/predictive-grid-stops`** — Predictive Grid Hedge v2 implementado completamente em Phases A+B+C (16 commits + 2 cleanup). Próximo passo: smoke 24h em **sandbox** seguindo runbook (`docs/predictive-grid-v2-smoke-runbook.md`), depois cutover Phase D2 (flip default + remove legacy).
 
-## Estado do deploy (operacional)
-- **IP:** `104.248.44.6`
+**Bot atual produção:** continua rodando em DO Frankfurt (`104.248.44.6:8000`, op #28 já foi fechada manualmente pelo user durante a sessão de design). Master segue intacto — predictive v2 está na branch isolada com feature flag `PREDICTIVE_GRID_V2=false` default.
+
+## Spec + Plan
+
+- Spec: `docs/superpowers/specs/2026-05-12-predictive-grid-v2-design.md`
+- Plan: `docs/superpowers/plans/2026-05-12-predictive-grid-v2.md`
+- Smoke runbook: `docs/predictive-grid-v2-smoke-runbook.md`
+
+## O que foi feito na branch (resumo)
+
+**Phase A — Math & Foundations:**
+- `engine/curve.py::tick_to_human_price` (V3 tick → human price)
+- `engine/curve.py::compute_grid_from_pool_ticks` (grade alinhada aos ticks V3 do pool, two-loop pattern)
+- `engine/curve.py::GridLevel.trigger_price` field
+- `engine/grid.py::_level_key` 4-tuple (distingue limit vs stop)
+- `db.py` migration: `grid_orders.trigger_price`, `grid_orders.is_stop_order`
+- `db.py::get_grid_order(cloid)` lookup
+- `exchanges/lighter.py::place_stop_limit_order` (SDK `create_sl_limit_order`; limit=trigger, zero slip)
+- `exchanges/lighter.py::cancel_stop_order` + `cancel_all_stops`
+
+**Phase B — Engine Integration:**
+- `config.py::Settings.predictive_grid_v2 = False` (default)
+- `engine/__init__.py::_maintain_grid` event-driven rebuild (HedgeModel.cache source)
+- `engine/__init__.py::_on_grid_fill` reposta próximo tick após fill (agora wired no `_on_fill` callback)
+- Wire no `_iterate` atrás da flag
+
+**Phase C — Telemetry + UI:**
+- 9 métricas Prometheus em `engine/metrics.py`
+- `state.py::StateHub.grid_health_metrics` dict
+- `web/templates/partials/grid_health.html` dashboard card
+
+**Phase D1 — Smoke runbook:**
+- `docs/predictive-grid-v2-smoke-runbook.md` — 4 smokes, rollback, promotion criteria
+- Documenta limitações conhecidas (C-2, C-3, I-1 do code review)
+
+**Phase D2 — Cutover:** PENDENTE até smoke aprovar
+
+## Próximo passo concreto
+
+1. Provisionar droplet **SANDBOX** em FRA1 (separado do produção)
+2. Deploy do branch `feature/predictive-grid-stops` na sandbox com `PREDICTIVE_GRID_V2=true`
+3. Seguir Smokes 1-4 do runbook
+4. Se passar: PR + merge em master, deploy produção com flag=true, observar 24h, então D2 cutover (flag default=true + remove legacy)
+
+## Estado dos branches
+
+- **`feature/predictive-grid-stops`** — 18 commits, 29 tests novos (364 passing total, 1 pré-existente unrelated)
+- **`master`** — limpo (spec + plan já mergeados como `7a0118c` e `ea5d3d7`)
+
+## Fixes aplicados no code review final
+
+3 críticos foram corrigidos no commit `5104694`:
+- **C-1:** `_on_grid_fill` wirei no `_on_fill` WS subscriber (era dead code)
+- **I-2:** `int(log())` → `math.floor(log())` em 6 call sites (ticks negativos da ARB-USDC.e)
+- **I-7:** instrument `grid_fill_latency_ms.observe()`
+- **M-3:** runbook SQL `filled_at` → `fill_id IS NOT NULL`
+
+Documentadas no runbook como limitações conhecidas (não bloqueiam smoke):
+- **C-2:** `cancel_all_stops` é account-wide, não market-scoped
+- **C-3:** `place_stop_limit_order` descarta `order_index`; cancel individual indisponível
+- **I-1:** `lighter_price_decimals=5`, `lighter_size_decimals=1` hardcoded pra ARB-USD
+- **I-6:** `grid_replication_error_pct` Gauge declarada mas nunca computada (dashboard sempre 0%)
+
+Esses 4 ficam pra fix antes do cutover D2.
+
+## Deploy info (operacional, continua válido)
+- **IP produção:** `104.248.44.6`
 - **Dashboard:** http://104.248.44.6:8000 (admin / Wallace1)
 - **SSH:** `ssh -i C:\Users\Wallace\.ssh\id_ed25519 root@104.248.44.6`
 - **Systemd unit:** `/etc/systemd/system/automoney.service`
-- **Code:** `/opt/automoney/` (git clone master)
-- **DB:** `/data/automoney.db` (persistente)
+- **Code:** `/opt/automoney/` (master)
+- **DB:** `/data/automoney.db`
 - **Logs:** `/var/log/automoney.log`
-- **Comandos completos:** `~/.claude/projects/.../memory/reference_do_deploy.md`
-
-## Por que DO Frankfurt e não Fly/Oracle/etc
-Lighter retorna `code 20558 "restricted jurisdiction"` (mensagem JSON literal do servidor) pra:
-- Fly.io qualquer região (testado fra + iad) — ASN bloqueado
-- Qualquer cloud em US/Canada (Oracle Ashburn, DO NYC1 testados)
-- DO Frankfurt (ASN 14061) **passa**
-
-Workaround documentado pela Lighter (`?readonly=true`) só serve pra read-only — bot precisa trade. Detalhes em `memory/project_lighter_waf_datacenter.md`.
-
-## Status PRs/branches
-- **PR #5** (feat: deploy + /health/engine + lighter-sdk fix) — ✅ MERGEADO em master (`c5713895`)
-- **PR #4** (Fly.io deploy) — fechado com postmortem (Fly inviável)
-- **PR #3** (funding window) — aberto, BLOQUEADO pelo bug `'PositionFunding' object has no attribute 'get'` em `LighterAdapter.get_funding_total_since`
-- Branch `feature/flyio-deploy` — preservada após merge (não deletada)
-
-## Pendências da fila (importância decrescente)
-1. **Bug funding `.get()`** (~5 min) — fix `e.get(k, default)` → `getattr(e, k, default)` em `exchanges/lighter.py::get_funding_total_since`. Bloqueia merge do PR #3.
-2. **Cross-check on-chain** (~30 min) — script via Alchemy archive comparando ticks Beefy vs fills Lighter, validar hipótese do user sobre fires mal-sincronizados.
-3. **Otimizar verify_fill latency** (~1h) — eliminar spikes de 7s/iter quando 2 legs fire simultâneo. Opções: skip `_verify_fill` HTTP (confiar só em position-truth + reconciler), reduzir timeout 3-5s → 1s, ou migrar pra WS push `update/account_all`.
-4. **Brainstorm UI/UX** — user pediu desde o compact ("o site é quase inútil"). Pipeline brainstorm/spec/plan/subagent completo. 1-2 sessões.
+- **Lighter WAF:** só FRA1 passa (ASN 14061). Sandbox tem que ser FRA1 também.
 
 ## Notas pra próxima sessão
 - Pipeline brainstorm/spec/plan/subagent obrigatório (`memory/feedback_use_pipelines.md`)
@@ -45,4 +88,3 @@ Workaround documentado pela Lighter (`?readonly=true`) só serve pra read-only �
 - Compra no ask, vende no bid — sem buffer (`memory/feedback_no_price_buffer.md`)
 - Verificar posição via fonte autoritativa antes de re-fire (`memory/feedback_verify_before_fire.md`)
 - Não disparar trades por iniciativa — user clica botão (`memory/feedback_no_autonomous_trades.md`)
-- start.bat / stop.bat agora são DEPRECATED (bot está em DO, não local)
