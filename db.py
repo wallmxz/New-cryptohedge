@@ -434,11 +434,15 @@ class Database:
     async def insert_grid_order(
         self, *, cloid: str, side: str, target_price: float,
         size: float, placed_at: float, operation_id: int | None = None,
+        trigger_price: float | None = None, is_stop_order: int = 0,
     ) -> None:
         await self._conn.execute(
-            """INSERT INTO grid_orders (cloid, side, target_price, size, placed_at, operation_id)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (cloid, side, target_price, size, placed_at, operation_id),
+            """INSERT INTO grid_orders
+               (cloid, side, target_price, size, placed_at, operation_id,
+                trigger_price, is_stop_order)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (cloid, side, target_price, size, placed_at, operation_id,
+             trigger_price, is_stop_order),
         )
         await self._conn.commit()
 

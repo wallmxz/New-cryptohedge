@@ -1280,8 +1280,106 @@ class GridMakerEngine:
         """
         if not self._settings.predictive_grid_v2:
             return
-        # TODO: B4 implementa o corpo (rebuild on range change, etc)
-        pass
+        if self._hedge_model is None or self._hedge_model._cache is None:
+            # Cache cold — sem L_main / ticks confiáveis. Skipa silenciosamente;
+            # próxima iter (com refresh feito) pega.
+            return
+
+        from engine.curve import compute_grid_from_pool_ticks
+        from math import log
+
+        cache = self._hedge_model._cache
+
+        # Signature atual da geometria (L + bounds)
+        current_sig = (cache.L_main, cache.p_a_main, cache.p_b_main)
+        posted_sig = getattr(self, "_posted_grid_signature", None)
+
+        if posted_sig == current_sig:
+            # Nada mudou — grade posted ainda é válida
+            return
+
+        # Algo mudou (primeira posta OU range/L mudou). Cancel-all + rebuild.
+        try:
+            await self._exchange.cancel_all_stops(
+                symbol=self._settings.dydx_symbol_token0,
+            )
+        except Exception as e:
+            logger.warning(f"cancel_all_stops failed in rebuild: {e}")
+
+        # Limpar grid_orders ativos no DB (best-effort)
+        try:
+            active_orders = await self._db.get_active_grid_orders()
+            for row in active_orders:
+                await self._db.mark_grid_order_cancelled(
+                    row["cloid"], time.time(),
+                )
+        except Exception as e:
+            logger.warning(f"db cleanup during rebuild failed: {e}")
+
+        # Derivar tick_lower / tick_upper a partir dos preços human-readable.
+        # p_human = 1.0001^tick * 10^(decimals0 - decimals1)
+        # tick = log(p / 10^(d0-d1)) / log(1.0001)
+        decimals0 = self._settings.token0_decimals
+        decimals1 = self._settings.token1_decimals
+        decimal_factor = 10 ** (decimals0 - decimals1)
+        tick_lower = int(log(cache.p_a_main / decimal_factor) / log(1.0001))
+        tick_upper = int(log(cache.p_b_main / decimal_factor) / log(1.0001))
+        tick_now = int(log(p_now / decimal_factor) / log(1.0001))
+
+        # tick_spacing depende do fee tier do pool
+        fee_tier = self._settings.uniswap_v3_pool_fee
+        tick_spacing_map = {500: 10, 3000: 60, 10000: 200}
+        tick_spacing = tick_spacing_map.get(fee_tier, 10)
+
+        # Build new grid
+        hedge_ratio = (
+            getattr(self._hub, "hedge_ratio", None)
+            or self._settings.hedge_ratio
+        )
+        new_grid = compute_grid_from_pool_ticks(
+            L=float(cache.L_main),
+            tick_lower=tick_lower,
+            tick_upper=tick_upper,
+            tick_spacing=tick_spacing,
+            tick_now=tick_now,
+            decimals0=decimals0,
+            decimals1=decimals1,
+            hedge_ratio=hedge_ratio,
+            lighter_price_decimals=5,  # ARB-USD on Lighter
+            lighter_size_decimals=1,
+        )
+
+        # Post each level
+        symbol = self._settings.dydx_symbol_token0
+        for lv in new_grid:
+            cloid = self._next_cloid_for_leg(symbol)
+            try:
+                await self._exchange.place_stop_limit_order(
+                    symbol=symbol,
+                    side=lv.side,
+                    size=lv.size,
+                    trigger_price=lv.trigger_price,
+                    cloid_int=cloid,
+                )
+                try:
+                    await self._db.insert_grid_order(
+                        cloid=str(cloid),
+                        side=lv.side,
+                        target_price=lv.price,
+                        size=lv.size,
+                        placed_at=time.time(),
+                        operation_id=self._hub.current_operation_id,
+                        trigger_price=lv.trigger_price,
+                        is_stop_order=1,
+                    )
+                except Exception as e:
+                    logger.warning(f"db insert_grid_order failed: {e}")
+            except Exception as e:
+                logger.warning(
+                    f"place_stop_limit_order failed for level @{lv.price}: {e}",
+                )
+
+        self._posted_grid_signature = current_sig
 
     async def _maybe_rebalance_leg(
         self, *, symbol: str, target: float, current: float,
