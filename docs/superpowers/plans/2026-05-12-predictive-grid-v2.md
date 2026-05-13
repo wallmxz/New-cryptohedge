@@ -789,7 +789,22 @@ git commit -m "feat(config): PREDICTIVE_GRID_V2 feature flag (default false)"
 
 ---
 
-### Task B2: Detecção de range change em `BeefyClmReader`
+### Task B2: ~~Detecção de range change em `BeefyClmReader`~~ — SKIPPED
+
+**Decision pós-investigação A6/A7:** `engine/hedge_model.py` já tem
+`HedgeModel.cache.L_main` + tick bounds populados via `V3PositionReader.read_position_main()`
+(`hedge_model.py:64`). O `positionMain()` da Beefy strategy ABI retorna SÓ
+`(tickLower, tickUpper)`, não L. Pra obter L, precisamos da position do V3 pool,
+e isso já tá implementado no `V3PositionReader` que o `HedgeModel` usa.
+
+**`_maintain_grid` (Task B4) consome diretamente `self._hedge_model._cache`**:
+- `tick_lower`, `tick_upper` derivados de `p_a_main`, `p_b_main`
+- `L_main` direto
+- Refresh on demand via `HedgeModel.refresh_cache()`
+
+Sem mudança em `chains/beefy.py` necessária pra essa fase.
+
+### Task B2 (skipped) — placeholder removido
 
 **Files:**
 - Test: `tests/test_beefy.py` (já existe; adicionar)

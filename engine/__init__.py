@@ -1261,6 +1261,28 @@ class GridMakerEngine:
         except Exception:
             return None
 
+    async def _maintain_grid(
+        self, *, beefy_pos, p_now: float, oracle_prices: dict[str, float],
+    ) -> None:
+        """Mantém grade de stop-limit orders alinhada aos ticks ativos da Beefy.
+
+        Implementa o lifecycle event-driven descrito no spec
+        (docs/superpowers/specs/2026-05-12-predictive-grid-v2-design.md, Sec 6):
+          - Detecta mudança de range (tick_lower/upper) e L_main do HedgeModel
+            cache → cancel-all + rebuild
+          - Detecta drift de composição → rebuild
+          - Detecta preço fora do range → cancel-all + idle
+          - Insere próximo nível quando ordem fillha (handler separado em
+            _on_grid_fill, Task B5)
+
+        No-op se feature flag PREDICTIVE_GRID_V2 desligada (default).
+        Implementação completa em B4.
+        """
+        if not self._settings.predictive_grid_v2:
+            return
+        # TODO: B4 implementa o corpo (rebuild on range change, etc)
+        pass
+
     async def _maybe_rebalance_leg(
         self, *, symbol: str, target: float, current: float,
         min_notional: float, ref_price: float,
