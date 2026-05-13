@@ -469,6 +469,15 @@ class Database:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    async def get_grid_order(self, cloid) -> dict | None:
+        """Lookup a single grid order by cloid (int or str — coerced to str
+        since column is TEXT). Returns None if not found."""
+        cursor = await self._conn.execute(
+            "SELECT * FROM grid_orders WHERE cloid = ?", (str(cloid),),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
     async def insert_operation(
         self, *, started_at: float, status: str,
         baseline_eth_price: float, baseline_pool_value_usd: float,

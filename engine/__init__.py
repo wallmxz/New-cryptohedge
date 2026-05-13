@@ -1381,6 +1381,94 @@ class GridMakerEngine:
 
         self._posted_grid_signature = current_sig
 
+    async def _on_grid_fill(
+        self, *, cloid: int, fill_price: float, fill_size: float, side: str,
+    ) -> None:
+        """Chamado quando uma ordem da grade predictive v2 fillha.
+
+        Posta um novo level no proximo tick adjacente (away from mid):
+          - Sell fillou em tick T -> proximo sell em T - tick_spacing
+          - Buy  fillou em tick T -> proximo buy  em T + tick_spacing
+
+        Mantem densidade constante da grade apos fills sucessivos.
+
+        No-op se PREDICTIVE_GRID_V2 desligado OU se cloid nao corresponde
+        a uma stop order da grade (ex: ordem manual ou legacy).
+        """
+        if not self._settings.predictive_grid_v2:
+            return
+
+        # Lookup do level fillado
+        row = await self._db.get_grid_order(cloid)
+        if row is None or not row.get("is_stop_order"):
+            return
+
+        # Marca como filled no DB (best-effort)
+        try:
+            await self._db.mark_grid_order_filled(cloid, int(time.time()))
+        except Exception as e:
+            logger.warning(f"mark_grid_order_filled failed: {e}")
+
+        # Calcula proximo tick adjacente
+        from math import log
+        from engine.curve import tick_to_human_price
+
+        decimals0 = self._settings.token0_decimals
+        decimals1 = self._settings.token1_decimals
+        decimal_factor = 10 ** (decimals0 - decimals1)
+
+        filled_price = row["target_price"]
+        filled_tick = int(log(filled_price / decimal_factor) / log(1.0001))
+
+        fee_tier = self._settings.uniswap_v3_pool_fee
+        tick_spacing_map = {500: 10, 3000: 60, 10000: 200}
+        tick_spacing = tick_spacing_map.get(fee_tier, 10)
+
+        if side == "sell":
+            next_tick = filled_tick - tick_spacing  # mais abaixo
+        else:
+            next_tick = filled_tick + tick_spacing  # mais acima
+
+        # Verifica que proximo tick ainda esta dentro do range posted.
+        sig = getattr(self, "_posted_grid_signature", None)
+        if sig is None:
+            return  # nada posted; _maintain_grid vai cuidar na proxima iter
+
+        _L, p_a_main, p_b_main = sig
+        tick_lower = int(log(p_a_main / decimal_factor) / log(1.0001))
+        tick_upper = int(log(p_b_main / decimal_factor) / log(1.0001))
+
+        if not (tick_lower <= next_tick <= tick_upper):
+            return  # fora do range; deixa _maintain_grid lidar na proxima iter
+
+        # Compute price do proximo tick (round pro tick Lighter)
+        new_price = round(
+            tick_to_human_price(
+                tick=next_tick, decimals0=decimals0, decimals1=decimals1,
+            ),
+            5,  # ARB-USD price_decimals=5
+        )
+
+        # Post novo stop (size = mesmo do filled — aproximacao MVP)
+        symbol = self._settings.dydx_symbol_token0
+        new_cloid = self._next_cloid_for_leg(symbol)
+        try:
+            await self._exchange.place_stop_limit_order(
+                symbol=symbol, side=side, size=row["size"],
+                trigger_price=new_price, cloid_int=new_cloid,
+            )
+            try:
+                await self._db.insert_grid_order(
+                    cloid=str(new_cloid), side=side, target_price=new_price,
+                    size=row["size"], placed_at=time.time(),
+                    trigger_price=new_price, is_stop_order=1,
+                    operation_id=self._hub.current_operation_id,
+                )
+            except Exception as e:
+                logger.warning(f"db insert_grid_order failed: {e}")
+        except Exception as e:
+            logger.warning(f"_on_grid_fill repost failed: {e}")
+
     async def _maybe_rebalance_leg(
         self, *, symbol: str, target: float, current: float,
         min_notional: float, ref_price: float,
