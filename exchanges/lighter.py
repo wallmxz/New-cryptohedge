@@ -1108,12 +1108,18 @@ class LighterAdapter(ExchangeAdapter):
 
         SDK requer `time_in_force` (CANCEL_ALL_TIF_IMMEDIATE=0) e `timestamp_ms`.
         Retorna 3-tuple (CancelAllOrders, RespSendTx, err_or_None).
+
+        IMPORTANTE: pra `time_in_force=IMMEDIATE (0)`, o `timestamp_ms`
+        (`CancelAllTime` no Go signer) DEVE ser 0. Passar o epoch atual
+        faz a SDK rejeitar com "CancelAllTime should be nil". O campo é
+        usado só pra SCHEDULED (1) e ABORT (2). Bug validado em
+        produção 2026-05-13 (op #29 smoke v2).
         """
         # symbol validado pra raise se inválido, mas não vai pro SDK call
         self._market_meta_or_raise(symbol)
         _, _, err = await self._signer.cancel_all_orders(
             time_in_force=0,  # CANCEL_ALL_TIF_IMMEDIATE
-            timestamp_ms=int(time.time() * 1000),
+            timestamp_ms=0,   # MUST be 0 for IMMEDIATE — see docstring
         )
         if err is not None:
             raise RuntimeError(f"cancel_all_stops failed: {err}")
