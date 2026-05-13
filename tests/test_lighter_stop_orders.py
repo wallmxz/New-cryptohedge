@@ -201,9 +201,18 @@ async def test_cancel_stop_order_sdk_error_raises():
 
 @pytest.mark.asyncio
 async def test_cancel_all_stops_calls_sdk():
-    """cancel_all_stops routes to SDK cancel_all_orders. SDK requires
-    time_in_force + timestamp_ms; we pass IMMEDIATE + current ms.
-    Note: SDK cancels ALL orders for the account, not market-scoped."""
+    """cancel_all_stops routes to SDK cancel_all_orders.
+
+    Live SDK behavior (validated 2026-05-13 in production with op #29):
+    when `time_in_force = CANCEL_ALL_TIF_IMMEDIATE (0)`, the underlying
+    Go signer rejects the call if `timestamp_ms` (CancelAllTime) is
+    non-zero — error: "CancelAllTime should be nil".
+
+    The non-zero timestamp_ms is only meaningful for SCHEDULED (1) or
+    ABORT (2). For IMMEDIATE we must pass 0.
+
+    Note: SDK cancels ALL orders for the account, not market-scoped (C-2).
+    """
     adapter = LighterAdapter.__new__(LighterAdapter)
     adapter._signer = MagicMock()
     adapter._signer.cancel_all_orders = AsyncMock(
@@ -216,10 +225,9 @@ async def test_cancel_all_stops_calls_sdk():
     await adapter.cancel_all_stops(symbol="ARB-USD")
     adapter._signer.cancel_all_orders.assert_called_once()
     call = adapter._signer.cancel_all_orders.call_args
-    # Must pass time_in_force=IMMEDIATE (0) and a timestamp_ms
+    # Must pass time_in_force=IMMEDIATE (0) and timestamp_ms=0.
     assert call.kwargs["time_in_force"] == 0
-    assert isinstance(call.kwargs["timestamp_ms"], int)
-    assert call.kwargs["timestamp_ms"] > 0
+    assert call.kwargs["timestamp_ms"] == 0
 
 
 @pytest.mark.asyncio
