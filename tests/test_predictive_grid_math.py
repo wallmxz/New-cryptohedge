@@ -96,7 +96,9 @@ def test_compute_grid_with_tick_now_above_range():
         decimals0=18, decimals1=6, hedge_ratio=1.0,
         lighter_price_decimals=5, lighter_size_decimals=1,
     )
-    # Todos abaixo de tick_now → all sells
+    # Todos abaixo de tick_now → all sells. Garantir não-vazio
+    # pra prevenir regressão silenciosa do loop DOWN.
+    assert len(grid) > 0
     assert all(lv.side == "sell" for lv in grid)
 
 
@@ -108,7 +110,21 @@ def test_compute_grid_with_tick_now_below_range():
         decimals0=18, decimals1=6, hedge_ratio=1.0,
         lighter_price_decimals=5, lighter_size_decimals=1,
     )
+    # Garantir não-vazio pra prevenir regressão silenciosa do loop UP.
+    assert len(grid) > 0
     assert all(lv.side == "buy" for lv in grid)
+
+
+def test_compute_grid_returns_empty_when_hedge_ratio_zero():
+    """hedge_ratio=0 → size=0 em todos os níveis → grade vazia.
+    Comportamento defensivo: usuário desligou hedge, bot não posta nada."""
+    grid = compute_grid_from_pool_ticks(
+        L=1e15, tick_lower=-296200, tick_upper=-296000,
+        tick_spacing=100, tick_now=-296100,
+        decimals0=18, decimals1=6, hedge_ratio=0.0,
+        lighter_price_decimals=5, lighter_size_decimals=1,
+    )
+    assert grid == []
 
 
 def test_compute_grid_sizes_conserve_delta_x():
