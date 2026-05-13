@@ -66,3 +66,72 @@ def test_compute_grid_minimal_range():
     assert len(buys) == 1
     # Sell tem preço menor que buy
     assert sells[0].price < buys[0].price
+
+
+def test_compute_grid_returns_empty_when_L_zero():
+    grid = compute_grid_from_pool_ticks(
+        L=0.0, tick_lower=-296200, tick_upper=-296000,
+        tick_spacing=100, tick_now=-296100,
+        decimals0=18, decimals1=6, hedge_ratio=1.0,
+        lighter_price_decimals=5, lighter_size_decimals=1,
+    )
+    assert grid == []
+
+
+def test_compute_grid_returns_empty_when_inverted_range():
+    grid = compute_grid_from_pool_ticks(
+        L=1e15, tick_lower=-296000, tick_upper=-296200,  # inverted
+        tick_spacing=100, tick_now=-296100,
+        decimals0=18, decimals1=6, hedge_ratio=1.0,
+        lighter_price_decimals=5, lighter_size_decimals=1,
+    )
+    assert grid == []
+
+
+def test_compute_grid_with_tick_now_above_range():
+    """Se tick_now > tick_upper, todos os ticks ficam abaixo → all sells."""
+    grid = compute_grid_from_pool_ticks(
+        L=1e15, tick_lower=-296200, tick_upper=-296000,
+        tick_spacing=100, tick_now=-295900,  # acima do range
+        decimals0=18, decimals1=6, hedge_ratio=1.0,
+        lighter_price_decimals=5, lighter_size_decimals=1,
+    )
+    # Todos abaixo de tick_now → all sells
+    assert all(lv.side == "sell" for lv in grid)
+
+
+def test_compute_grid_with_tick_now_below_range():
+    """tick_now < tick_lower, todos os ticks ficam acima → all buys."""
+    grid = compute_grid_from_pool_ticks(
+        L=1e15, tick_lower=-296200, tick_upper=-296000,
+        tick_spacing=100, tick_now=-296300,  # abaixo
+        decimals0=18, decimals1=6, hedge_ratio=1.0,
+        lighter_price_decimals=5, lighter_size_decimals=1,
+    )
+    assert all(lv.side == "buy" for lv in grid)
+
+
+def test_compute_grid_sizes_conserve_delta_x():
+    """Soma dos sizes (sem hedge_ratio) deve igualar x_at_tick_lower
+    (porque ticks vão de tick_lower a tick_upper cobrindo toda a curva).
+    """
+    from engine.curve import compute_x
+    L = 1e15
+    tick_lower, tick_upper = -296200, -296000
+    decimals0, decimals1 = 18, 6
+    grid = compute_grid_from_pool_ticks(
+        L=L, tick_lower=tick_lower, tick_upper=tick_upper,
+        tick_spacing=10, tick_now=-296100,
+        decimals0=decimals0, decimals1=decimals1, hedge_ratio=1.0,
+        lighter_price_decimals=5, lighter_size_decimals=1,
+    )
+    price_lower = tick_to_human_price(
+        tick=tick_lower, decimals0=decimals0, decimals1=decimals1,
+    )
+    price_upper = tick_to_human_price(
+        tick=tick_upper, decimals0=decimals0, decimals1=decimals1,
+    )
+    expected_total_x = compute_x(L, price_lower, price_upper)
+    actual_total_x = sum(lv.size for lv in grid)
+    # Tolerância por rounding step da Lighter:
+    assert abs(actual_total_x - expected_total_x) / expected_total_x < 0.05
