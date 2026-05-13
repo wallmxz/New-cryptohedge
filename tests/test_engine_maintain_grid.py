@@ -4,6 +4,83 @@ from unittest.mock import AsyncMock, MagicMock
 
 
 @pytest.mark.asyncio
+async def test_maintain_grid_scales_raw_L_by_decimal_factor_and_share():
+    """Regression: cache.L_main stores RAW V3 strategy-total liquidity
+    (e.g. 2.74e17 for ARB/USDC.e). Passing it raw to compute_x produces
+    per-level sizes in raw token0 units (~10^15), which exceed Lighter's
+    2^48 BaseAmount limit and crash place_stop_limit_order on every level.
+
+    Correct scaling: L_eff = L_raw / 10^((d0+d1)/2) * share. For ARB/USDC.e
+    (d0=18, d1=6, share=0.79%): L_eff = 2.74e17 / 10^12 * 0.0079 ≈ 2180,
+    which yields per-level sizes ~1-3 ARB (well within Lighter limits).
+
+    Validated live 2026-05-13 op #29 smoke v2.
+    """
+    from engine import GridMakerEngine
+    from engine.hedge_model import HedgeModelCache
+    import time as time_mod
+
+    engine = GridMakerEngine.__new__(GridMakerEngine)
+    engine._settings = MagicMock()
+    engine._settings.predictive_grid_v2 = True
+    engine._settings.dydx_symbol_token0 = "ARB-USD"
+    engine._settings.token0_decimals = 18
+    engine._settings.token1_decimals = 6
+    engine._settings.hedge_ratio = 1.0
+    engine._settings.uniswap_v3_pool_fee = 500
+    engine._exchange = AsyncMock()
+    engine._exchange.place_stop_limit_order = AsyncMock()
+    engine._db = AsyncMock()
+    engine._db.get_active_grid_orders = AsyncMock(return_value=[])
+    engine._db.mark_grid_order_cancelled = AsyncMock()
+    engine._db.insert_grid_order = AsyncMock()
+    engine._hub = MagicMock()
+    engine._hub.current_operation_id = 42
+    engine._hub.hedge_ratio = 1.0
+    engine._next_cloid_for_leg = MagicMock(return_value=1)
+    engine._posted_grid_signature = None
+
+    # Realistic ARB/USDC.e shape (from live op #29):
+    tick_lo, tick_hi = -297890, -294890
+    L_raw_strategy = int(2.74e17)
+    user_share = 0.0079
+
+    cache = HedgeModelCache(
+        L_main=L_raw_strategy,
+        p_a_main=math.pow(1.0001, tick_lo),
+        p_b_main=math.pow(1.0001, tick_hi),
+        L_alt=None, p_a_alt=None, p_b_alt=None,
+        refreshed_at=time_mod.monotonic(),
+        tick_lower_main=tick_lo,
+        tick_upper_main=tick_hi,
+    )
+    hm = MagicMock()
+    hm._cache = cache
+    engine._hedge_model = hm
+
+    beefy_pos = MagicMock()
+    beefy_pos.share = user_share
+
+    await engine._maintain_grid(
+        beefy_pos=beefy_pos,
+        p_now=0.132,
+        oracle_prices={"ARB-USD": 0.132},
+    )
+
+    # Per-level size should be on the order of 1-10 ARB (NOT 10^15).
+    # The Lighter SDK's BaseAmount limit is 2^48 = 2.81e14; with
+    # size_decimals=1, that means human size < 2.81e13.
+    calls = engine._exchange.place_stop_limit_order.call_args_list
+    assert len(calls) > 0, "no levels placed at all"
+    for call in calls:
+        size = call.kwargs.get("size", 0)
+        assert 0 < size < 1000, (
+            f"size {size} out of plausible range (per-level should be a "
+            f"small ARB amount, not raw V3 units)"
+        )
+
+
+@pytest.mark.asyncio
 async def test_maintain_grid_uses_real_pool_ticks_not_log_of_raw_price():
     """Regression: HedgeModel.refresh_cache stores p_a_main / p_b_main as
     RAW V3 ratios (= 1.0001^tick, e.g. 1.15e-13 for ARB-USDC.e at tick
