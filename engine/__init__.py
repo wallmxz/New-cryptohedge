@@ -1361,8 +1361,25 @@ class GridMakerEngine:
             getattr(self._hub, "hedge_ratio", None)
             or self._settings.hedge_ratio
         )
+        # Convert RAW V3 strategy-total L to OUR position's effective L in
+        # human units.
+        #
+        # cache.L_main is the strategy's full V3 liquidity in raw units
+        # (e.g. 2.74e17 for ARB/USDC.e). For `compute_x(L, p, p_b)` to
+        # return ARB amounts in HUMAN units when called with HUMAN prices,
+        # L must be scaled by 1/10^((d0+d1)/2) (the V3 raw-vs-human L
+        # conversion factor). Then multiply by our share to get OUR
+        # position's L rather than the whole vault.
+        #
+        # Without this scaling, the grid passed L=2.74e17 directly and
+        # produced per-level sizes ~10^15 — far above the Lighter SDK's
+        # 2^48 BaseAmount limit — every place_stop_limit_order failed.
+        # Validated live 2026-05-13 op #29 smoke v2.
+        l_decimal_factor = 10 ** ((decimals0 + decimals1) / 2)
+        share = float(getattr(beefy_pos, "share", 1.0) or 1.0)
+        L_for_grid = float(cache.L_main) / l_decimal_factor * share
         new_grid = compute_grid_from_pool_ticks(
-            L=float(cache.L_main),
+            L=L_for_grid,
             tick_lower=tick_lower,
             tick_upper=tick_upper,
             tick_spacing=tick_spacing,
