@@ -55,6 +55,11 @@ class Settings:
     lighter_api_private_key: str = ""
     lighter_api_key_index: int = 0
 
+    # Feature flag pra ativar o novo predictive grid v2.
+    # False (default): mantém path legacy taker chase (_maybe_rebalance_leg).
+    # True: usa _maintain_grid com stop-limit orders alinhadas aos ticks da pool.
+    predictive_grid_v2: bool = False
+
     @property
     def dydx_symbol(self) -> str:
         """Legacy alias for dydx_symbol_token0. Use the typed field directly
@@ -119,4 +124,7 @@ class Settings:
             lighter_account_index=int(os.environ.get("LIGHTER_ACCOUNT_INDEX", "0")),
             lighter_api_private_key=os.environ.get("LIGHTER_API_PRIVATE_KEY", ""),
             lighter_api_key_index=int(os.environ.get("LIGHTER_API_KEY_INDEX", "0")),
+            predictive_grid_v2=os.environ.get(
+                "PREDICTIVE_GRID_V2", "false",
+            ).lower() in ("true", "1", "yes"),
         )
