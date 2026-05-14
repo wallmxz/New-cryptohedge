@@ -2,6 +2,37 @@ from engine.pnl import compute_operation_pnl
 from engine.operation import Operation, OperationState
 
 
+def test_pool_dollar_uses_baseline_pool_value_when_deposit_usd_null():
+    """Regression 2026-05-14: 'Pool $' label deveria mostrar 'how much
+    LP value changed since op start' (intuitivo). Antes usava HODL
+    divergence (= apenas IL natural), que pra LPs bem-balanceadas resulta
+    em valores muito pequenos (-$0.05) mesmo quando a posição perdeu $1.17.
+    Fix: usar baseline_pool_value_usd como fallback quando
+    baseline_deposit_usd é null. il_natural fica separado pra métrica
+    técnica.
+    """
+    op = Operation(
+        id=1, started_at=1000.0, state=OperationState.ACTIVE,
+        baseline_eth_price=0.131, baseline_pool_value_usd=199.76,
+        baseline_amount0=498.09, baseline_amount1=134.30,
+        baseline_collateral=130.0,
+        baseline_deposit_usd=None,  # hedge-existing path didn't set
+    )
+    breakdown = compute_operation_pnl(
+        op,
+        current_pool_value_usd=198.59,
+        current_eth_price=0.129,
+        hedge_realized_since_baseline=0.0, hedge_unrealized_since_baseline=0.0,
+    )
+    # Pool $: simple delta vs baseline pool value
+    # = 198.59 - 199.76 = -1.17
+    assert abs(breakdown["pool_dollar"] - (-1.17)) < 0.01
+    # IL natural: vs HODL@p_now
+    # HODL = 498.09 × 0.129 + 134.30 = 64.2536 + 134.30 = 198.5536
+    # IL = 198.59 - 198.5536 = +0.0364 (LP slightly above HODL)
+    assert abs(breakdown["il_natural"] - 0.0364) < 0.001
+
+
 def test_single_leg_funding_reads_funding_paid_token0_not_legacy():
     """Regression 2026-05-14: funding poller writes per-leg fields
     (`funding_paid_token0`), not the legacy `funding_paid`. The single-leg

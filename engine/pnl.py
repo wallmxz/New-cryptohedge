@@ -62,17 +62,41 @@ def compute_operation_pnl(
         p0_now = current_eth_price
         p1_now = 1.0
 
-    # Pool $ — primary metric. When the user has set a baseline_deposit_usd
-    # (via POST /operations/<id>/baseline), use it as the cost basis; the
-    # row in the panel reads "Pool $ = pool_now - what_user_invested".
-    # Otherwise fall back to the HODL divergence formula (legacy IL natural)
-    # so ops created before the user has clicked Editar still show
-    # something sensible — the panel labels this state explicitly.
+    # Pool $ — user-facing "how much did my LP value change since op start".
+    # Priority order for the cost basis:
+    #   1. baseline_deposit_usd (set via POST /operations/<id>/baseline) —
+    #      what the user explicitly invested at op start
+    #   2. baseline_pool_value_usd (snapshot taken automatically by
+    #      start_operation / open_shorts_for_existing_position) — the LP
+    #      value at the moment the op was opened
+    #   3. HODL divergence (LP - HODL@p_now) as last resort, just so the
+    #      number isn't None
+    #
+    # Validated live 2026-05-14 op #29: baseline_deposit_usd was None
+    # (hedge-existing path doesn't set it), so pool_dollar fell back to
+    # the HODL formula which only captures the V3 vs hold delta (IL
+    # natural) — for the user this was confusing: LP value actually
+    # dropped from $199.76 to $198.59 (= -$1.17), but Pool $ showed -$0.05.
+    # Switching priority to use baseline_pool_value_usd surfaces the
+    # intuitive "money in LP now vs money in LP at start" view.
+    #
+    # `il_natural` (below) stays on the HODL formula for callers who
+    # want the technical IL metric.
     if op.baseline_deposit_usd is not None and op.baseline_deposit_usd > 0:
         pool_dollar = current_pool_value_usd - op.baseline_deposit_usd
+    elif op.baseline_pool_value_usd is not None and op.baseline_pool_value_usd > 0:
+        pool_dollar = current_pool_value_usd - op.baseline_pool_value_usd
     else:
         hodl_value = op.baseline_amount0 * p0_now + op.baseline_amount1 * p1_now
         pool_dollar = current_pool_value_usd - hodl_value
+
+    # IL natural (alias): always the HODL divergence — the V3 vs hold
+    # comparison that captures impermanent loss specifically. Kept
+    # separate from `pool_dollar` since 2026-05-14 (they used to be
+    # identical; now pool_dollar is value-change-since-start and
+    # il_natural is the technical IL).
+    hodl_value = op.baseline_amount0 * p0_now + op.baseline_amount1 * p1_now
+    il_natural = current_pool_value_usd - hodl_value
 
     # Hedge PnL.
     if hedge_pnl_aggregate_override is not None:
@@ -155,7 +179,7 @@ def compute_operation_pnl(
         "pnl_window_since_ts": op.pnl_window_since_ts,
         # Alias for back-compat with any external consumer of the
         # breakdown (analytics scripts, older test fixtures).
-        "il_natural": round(pool_dollar, 4),
+        "il_natural": round(il_natural, 4),
         "hedge_pnl": hedge_pnl,
         "hedge_pnl_token0": hedge_pnl_t0,
         "hedge_pnl_token1": hedge_pnl_t1,

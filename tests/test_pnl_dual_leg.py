@@ -136,8 +136,8 @@ def test_compute_operation_pnl_keeps_per_leg_when_no_override():
 
 
 def test_compute_operation_pnl_uses_baseline_deposit_usd_when_set():
-    """When op.baseline_deposit_usd > 0, pool_dollar = pool_now - baseline,
-    overriding the HODL formula. il_natural alias mirrors the same value."""
+    """When op.baseline_deposit_usd > 0, pool_dollar = pool_now - baseline_deposit_usd.
+    Spec 2026-05-14: il_natural is now a SEPARATE metric (HODL-based)."""
     op = _op(baseline_deposit_usd=50.03)
     bd = compute_operation_pnl(
         op,
@@ -148,12 +148,15 @@ def test_compute_operation_pnl_uses_baseline_deposit_usd_when_set():
         hedge_unrealized_per_symbol={},
     )
     assert bd["pool_dollar"] == 1.55  # 51.58 - 50.03
-    assert bd["il_natural"] == 1.55  # alias = same
+    # il_natural = HODL formula = 51.58 - (100*1.75 + 0.0375*4200) = 51.58 - 332.5 = -280.92
+    assert abs(bd["il_natural"] - (-280.92)) < 0.01
     assert bd["baseline_deposit_usd"] == 50.03
 
 
-def test_compute_operation_pnl_falls_back_to_hodl_when_baseline_deposit_null():
-    """Without baseline set, pool_dollar uses the HODL formula (legacy)."""
+def test_compute_operation_pnl_falls_back_to_baseline_pool_value_when_deposit_usd_null():
+    """Spec 2026-05-14: when baseline_deposit_usd is null, pool_dollar uses
+    baseline_pool_value_usd (snapshot at op start) — intuitive 'value
+    changed since open' view. il_natural still uses HODL (technical IL)."""
     op = _op(baseline_deposit_usd=None)
     bd = compute_operation_pnl(
         op,
@@ -163,15 +166,17 @@ def test_compute_operation_pnl_falls_back_to_hodl_when_baseline_deposit_null():
         hedge_realized_per_symbol={},
         hedge_unrealized_per_symbol={},
     )
+    # baseline_pool_value_usd = 300.0 (from _op default)
+    # pool_dollar = 326.20 - 300.0 = +26.20
+    assert abs(bd["pool_dollar"] - 26.20) < 0.01
     # HODL: 100 * 1.75 + 0.0375 * 4200 = 175.0 + 157.5 = 332.5
-    # pool_dollar = 326.20 - 332.5 = -6.30
-    assert bd["pool_dollar"] == -6.3
+    # il_natural = 326.20 - 332.5 = -6.30 (still HODL-based)
     assert bd["il_natural"] == -6.3
     assert bd["baseline_deposit_usd"] is None
 
 
-def test_compute_operation_pnl_falls_back_to_hodl_when_baseline_deposit_zero():
-    """Defensive: 0 or negative values fall back to HODL too."""
+def test_compute_operation_pnl_falls_back_to_baseline_pool_value_when_deposit_zero():
+    """Defensive: 0 or negative deposit_usd → use baseline_pool_value."""
     op = _op(baseline_deposit_usd=0.0)
     bd = compute_operation_pnl(
         op,
@@ -181,8 +186,8 @@ def test_compute_operation_pnl_falls_back_to_hodl_when_baseline_deposit_zero():
         hedge_realized_per_symbol={},
         hedge_unrealized_per_symbol={},
     )
-    # Same HODL fallback as the null case: -6.30
-    assert bd["pool_dollar"] == -6.3
+    # Falls through to baseline_pool_value: 326.20 - 300.0 = +26.20
+    assert abs(bd["pool_dollar"] - 26.20) < 0.01
 
 
 def test_compute_operation_pnl_uses_funding_override_when_provided():
