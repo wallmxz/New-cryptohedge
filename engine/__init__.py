@@ -1519,12 +1519,33 @@ class GridMakerEngine:
                 logger.warning(f"reconcile cancel failed: {e}")
 
         # Post missing (desired mas não live)
+        # CRITICAL guard 2026-05-14: o buffer pode empurrar o trigger PRA
+        # ALÉM do market quando o tick está muito próximo (within ~1 V3
+        # spacing). Resultado: SL_SELL com trigger > market → Lighter
+        # aceita o tx mas rejeita silenciosamente no settlement zk-rollup
+        # (sells "somem" depois de 200ms). Validado live 2026-05-14:
+        # buffer $0.00005 → 4 sells closest dead; $0.00010 → 8 sells dead.
+        # Solution: dynamic clamp do trigger pra ficar do lado correto do
+        # market (com safety margin ~1 V3 tick = 0.01%).
+        safety_frac = 0.0001  # 0.01% safety margin (~1 V3 tick em 0.05% pool)
         posted_count = 0
+        skipped_too_close = 0
         for lv in desired:
             key = (lv.side, round(lv.price, price_decimals))
             if key in live_by_key:
                 continue  # já no book
-            trigger = lv.price + buffer if lv.side == "sell" else lv.price - buffer
+            if lv.side == "sell":
+                max_trigger = p_now * (1 - safety_frac)
+                if lv.price >= max_trigger:
+                    skipped_too_close += 1
+                    continue  # tick mesmo já tá em ou acima da safety bound
+                trigger = min(lv.price + buffer, max_trigger)
+            else:  # buy
+                min_trigger = p_now * (1 + safety_frac)
+                if lv.price <= min_trigger:
+                    skipped_too_close += 1
+                    continue
+                trigger = max(lv.price - buffer, min_trigger)
             cloid = self._next_cloid_for_leg(symbol)
             try:
                 await self._exchange.place_stop_market(

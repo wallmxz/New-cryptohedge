@@ -149,12 +149,19 @@ async def test_maintain_grid_applies_anticipation_buffer_to_triggers():
         target = kw["target_price"]
         trigger = kw["trigger_price"]
         side = kw["side"]
+        # Buffer applied in correct direction; effective buffer may be
+        # clamped down (≤ requested) if level is too close to market —
+        # safety guard from 2026-05-14 (avoid trigger crossing market).
         if side == "sell":
             assert trigger > target, f"sell trigger {trigger} should be > tick {target}"
-            assert abs(trigger - target - 0.00005) < 1e-9
+            assert 0 < trigger - target <= 0.00005 + 1e-9, (
+                f"sell buffer out of bounds: trigger-target = {trigger-target}"
+            )
         else:
             assert trigger < target, f"buy trigger {trigger} should be < tick {target}"
-            assert abs(target - trigger - 0.00005) < 1e-9
+            assert 0 < target - trigger <= 0.00005 + 1e-9, (
+                f"buy buffer out of bounds: target-trigger = {target-trigger}"
+            )
 
 
 @pytest.mark.asyncio
@@ -652,6 +659,78 @@ async def test_reconcile_posts_missing_levels_when_grid_has_gaps():
     assert posted_sides.count("buy") == 0
     # E nada cancelado (todos os buys live estão dentro do desired)
     engine._exchange.cancel_stop_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_clamps_trigger_to_safety_margin_from_market():
+    """Spec 2026-05-14: o anticipation buffer pode empurrar trigger pra além
+    do market quando o tick é too-close. Lighter rejeita silenciosamente
+    no settlement. Reconcile deve clampar OU pular esses levels."""
+    from engine import GridMakerEngine
+    from engine.hedge_model import HedgeModelCache
+    import time as time_mod
+
+    engine = GridMakerEngine.__new__(GridMakerEngine)
+    engine._settings = MagicMock()
+    engine._settings.grid_anticipation_buffer = 0.00010  # might cross
+    engine._settings.max_open_orders = 16
+    engine._settings.min_rebalance_notional_usd = 1.0
+    engine._settings.predictive_grid_v2 = True
+    engine._settings.token0_decimals = 18
+    engine._settings.token1_decimals = 6
+    engine._settings.dydx_symbol_token0 = "ARB-USD"
+    engine._settings.hedge_ratio = 1.0
+    engine._settings.uniswap_v3_pool_fee = 500
+    engine._db = AsyncMock()
+    engine._db.get_active_grid_orders = AsyncMock(return_value=[])
+    engine._hub = MagicMock()
+    engine._hub.current_operation_id = 1
+    engine._hub.hedge_ratio = 1.0
+    engine._next_cloid_for_leg = MagicMock(side_effect=range(100, 200))
+
+    tick_lo, tick_hi = -299580, -292650
+    cache = HedgeModelCache(
+        L_main=int(2.74e17),
+        p_a_main=math.pow(1.0001, tick_lo),
+        p_b_main=math.pow(1.0001, tick_hi),
+        L_alt=None, p_a_alt=None, p_b_alt=None,
+        refreshed_at=time_mod.monotonic(),
+        tick_lower_main=tick_lo, tick_upper_main=tick_hi,
+    )
+    hm = MagicMock()
+    hm._cache = cache
+    engine._hedge_model = hm
+
+    # Nothing live — full reconcile from scratch
+    engine._exchange = AsyncMock()
+    engine._exchange.place_stop_market = AsyncMock()
+    engine._exchange.cancel_stop_order = AsyncMock()
+    engine._exchange.cancel_all_stops = AsyncMock()
+    engine._exchange.get_open_orders = AsyncMock(return_value=[])
+
+    engine._posted_grid_signature = (int(2.74e17), tick_lo, tick_hi)
+    beefy_pos = MagicMock()
+    beefy_pos.share = 0.0079
+    p_now = 0.14
+    await engine._maintain_grid(
+        beefy_pos=beefy_pos, p_now=p_now,
+        oracle_prices={"ARB-USD": p_now},
+    )
+
+    # Cada trigger posted DEVE ficar do lado correto do market:
+    #   SELL trigger < p_now * (1 - 0.0001) = 0.13986
+    #   BUY  trigger > p_now * (1 + 0.0001) = 0.14014
+    calls = engine._exchange.place_stop_market.call_args_list
+    assert len(calls) > 0
+    max_sell = p_now * (1 - 0.0001)
+    min_buy = p_now * (1 + 0.0001)
+    for c in calls:
+        side = c.kwargs["side"]
+        trig = c.kwargs["trigger_price"]
+        if side == "sell":
+            assert trig <= max_sell, f"SELL trigger {trig} > max_safe {max_sell}"
+        else:
+            assert trig >= min_buy, f"BUY trigger {trig} < min_safe {min_buy}"
 
 
 @pytest.mark.asyncio
