@@ -1047,6 +1047,9 @@ class LighterAdapter(ExchangeAdapter):
         trigger, sem slippage por design). Fill exato no nível ou rest no book.
 
         TIF: GTT 28-day expiry (default da SDK pra non-IOC).
+
+        NOTA: SL_LIMIT na Lighter exige notional >= min_quote_amount ($10) por
+        ordem. Para grade densa de baixo capital, use `place_stop_market`.
         """
         meta = self._market_meta_or_raise(symbol)
         is_ask = (side == "sell")
@@ -1074,6 +1077,61 @@ class LighterAdapter(ExchangeAdapter):
         )
         if err is not None:
             raise RuntimeError(f"place_stop_limit_order failed: {err}")
+
+    async def place_stop_market(
+        self, *,
+        symbol: str,
+        side: str,
+        size: float,
+        trigger_price: float,
+        cloid_int: int,
+        reduce_only: bool = False,
+    ) -> None:
+        """Place a STOP_LOSS (market) order — fires market order when mark
+        crosses `trigger_price`.
+
+        Diferenças vs `place_stop_limit_order`:
+          - Sem mínimo de $10 (`min_quote_amount` só aplica ao SL_LIMIT).
+            Validado live 2026-05-13 via probe.
+          - Direção do trigger é livre: aceita BUY com trigger > ou < market,
+            SELL idem. Lighter decide pela direção do trigger automaticamente.
+          - Quando dispara, executa market order: fill imediato no melhor
+            bid/ask disponível. Em Lighter (taker_fee=0, maker_fee=0,
+            spread efetivo ~0) o slippage é mínimo.
+
+        Pra grade densa de baixo capital ($200 LP), esse é o tipo correto:
+        sem min de $10, pode-se postar 300+ levels de 1-3 ARB.
+
+        SDK call: `create_sl_order` (STOP_LOSS, time-in-force IOC at trigger).
+        """
+        meta = self._market_meta_or_raise(symbol)
+        is_ask = (side == "sell")
+        base_amount_raw = self._size_to_int(size, meta)
+        if base_amount_raw <= 0:
+            raise ValueError(
+                f"Size {size} below market step {meta.step_size}",
+            )
+        trigger_raw = int(round(trigger_price * (10 ** meta.price_decimals)))
+        if trigger_raw <= 0:
+            raise ValueError(
+                f"trigger_price {trigger_price} rounds to zero ticks",
+            )
+
+        # create_sl_order assina (CreateOrder, RespSendTx, err_or_None).
+        # O `price` em SL market vira o avg_execution_price (passed-through
+        # mas não tem efeito de limit — Lighter faz market on trigger).
+        # Usamos trigger_price como aproximação.
+        _, _, err = await self._signer.create_sl_order(
+            market_index=meta.market_index,
+            client_order_index=int(cloid_int) & 0xFFFFFFFF,
+            base_amount=base_amount_raw,
+            trigger_price=trigger_raw,
+            price=trigger_raw,  # avg_execution_price (informational)
+            is_ask=is_ask,
+            reduce_only=reduce_only,
+        )
+        if err is not None:
+            raise RuntimeError(f"place_stop_market failed: {err}")
 
     async def cancel_stop_order(
         self, *, symbol: str, order_index: int,

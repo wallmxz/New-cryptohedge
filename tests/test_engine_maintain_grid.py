@@ -4,11 +4,85 @@ from unittest.mock import AsyncMock, MagicMock
 
 
 @pytest.mark.asyncio
+async def test_maintain_grid_applies_anticipation_buffer_to_triggers():
+    """Per user spec 2026-05-13: anticipation buffer shifts each level's
+    trigger so the SL_MARKET fires slightly before reaching the V3 tick,
+    capturing the implicit spread (~$0.00005 on Lighter ARB-USD).
+
+    SELL trigger = tick_price + buffer  (fires earlier as price drops)
+    BUY  trigger = tick_price - buffer  (fires earlier as price rises)
+    """
+    from engine import GridMakerEngine
+    from engine.hedge_model import HedgeModelCache
+    import time as time_mod
+
+    engine = GridMakerEngine.__new__(GridMakerEngine)
+    engine._settings = MagicMock()
+    engine._settings.grid_anticipation_buffer = 0.00005
+    engine._settings.predictive_grid_v2 = True
+    engine._settings.dydx_symbol_token0 = "ARB-USD"
+    engine._settings.token0_decimals = 18
+    engine._settings.token1_decimals = 6
+    engine._settings.hedge_ratio = 1.0
+    engine._settings.uniswap_v3_pool_fee = 500
+    engine._exchange = AsyncMock()
+    engine._exchange.place_stop_market = AsyncMock()
+    engine._db = AsyncMock()
+    engine._db.get_active_grid_orders = AsyncMock(return_value=[])
+    engine._db.mark_grid_order_cancelled = AsyncMock()
+    engine._db.insert_grid_order = AsyncMock()
+    engine._hub = MagicMock()
+    engine._hub.current_operation_id = 1
+    engine._hub.hedge_ratio = 1.0
+    engine._next_cloid_for_leg = MagicMock(return_value=1)
+    engine._posted_grid_signature = None
+
+    tick_lo, tick_hi = -297890, -294890
+    cache = HedgeModelCache(
+        L_main=int(2.74e17),
+        p_a_main=math.pow(1.0001, tick_lo),
+        p_b_main=math.pow(1.0001, tick_hi),
+        L_alt=None, p_a_alt=None, p_b_alt=None,
+        refreshed_at=time_mod.monotonic(),
+        tick_lower_main=tick_lo, tick_upper_main=tick_hi,
+    )
+    hm = MagicMock()
+    hm._cache = cache
+    engine._hedge_model = hm
+
+    beefy_pos = MagicMock()
+    beefy_pos.share = 0.0079
+
+    await engine._maintain_grid(
+        beefy_pos=beefy_pos, p_now=0.132,
+        oracle_prices={"ARB-USD": 0.132},
+    )
+
+    # For each posted level, verify trigger reflects the buffer offset.
+    # The DB insert receives both target_price (tick) and trigger (shifted).
+    calls = engine._exchange.place_stop_market.call_args_list
+    db_calls = engine._db.insert_grid_order.call_args_list
+    assert len(calls) > 0, "no levels posted"
+    assert len(db_calls) == len(calls)
+    for db_call in db_calls:
+        kw = db_call.kwargs
+        target = kw["target_price"]
+        trigger = kw["trigger_price"]
+        side = kw["side"]
+        if side == "sell":
+            assert trigger > target, f"sell trigger {trigger} should be > tick {target}"
+            assert abs(trigger - target - 0.00005) < 1e-9
+        else:
+            assert trigger < target, f"buy trigger {trigger} should be < tick {target}"
+            assert abs(target - trigger - 0.00005) < 1e-9
+
+
+@pytest.mark.asyncio
 async def test_maintain_grid_scales_raw_L_by_decimal_factor_and_share():
     """Regression: cache.L_main stores RAW V3 strategy-total liquidity
     (e.g. 2.74e17 for ARB/USDC.e). Passing it raw to compute_x produces
     per-level sizes in raw token0 units (~10^15), which exceed Lighter's
-    2^48 BaseAmount limit and crash place_stop_limit_order on every level.
+    2^48 BaseAmount limit and crash place_stop_market on every level.
 
     Correct scaling: L_eff = L_raw / 10^((d0+d1)/2) * share. For ARB/USDC.e
     (d0=18, d1=6, share=0.79%): L_eff = 2.74e17 / 10^12 * 0.0079 ≈ 2180,
@@ -22,6 +96,7 @@ async def test_maintain_grid_scales_raw_L_by_decimal_factor_and_share():
 
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
+    engine._settings.grid_anticipation_buffer = 0.0
     engine._settings.predictive_grid_v2 = True
     engine._settings.dydx_symbol_token0 = "ARB-USD"
     engine._settings.token0_decimals = 18
@@ -29,7 +104,7 @@ async def test_maintain_grid_scales_raw_L_by_decimal_factor_and_share():
     engine._settings.hedge_ratio = 1.0
     engine._settings.uniswap_v3_pool_fee = 500
     engine._exchange = AsyncMock()
-    engine._exchange.place_stop_limit_order = AsyncMock()
+    engine._exchange.place_stop_market = AsyncMock()
     engine._db = AsyncMock()
     engine._db.get_active_grid_orders = AsyncMock(return_value=[])
     engine._db.mark_grid_order_cancelled = AsyncMock()
@@ -70,7 +145,7 @@ async def test_maintain_grid_scales_raw_L_by_decimal_factor_and_share():
     # Per-level size should be on the order of 1-10 ARB (NOT 10^15).
     # The Lighter SDK's BaseAmount limit is 2^48 = 2.81e14; with
     # size_decimals=1, that means human size < 2.81e13.
-    calls = engine._exchange.place_stop_limit_order.call_args_list
+    calls = engine._exchange.place_stop_market.call_args_list
     assert len(calls) > 0, "no levels placed at all"
     for call in calls:
         size = call.kwargs.get("size", 0)
@@ -101,6 +176,7 @@ async def test_maintain_grid_uses_real_pool_ticks_not_log_of_raw_price():
 
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
+    engine._settings.grid_anticipation_buffer = 0.0
     engine._settings.predictive_grid_v2 = True
     engine._settings.dydx_symbol_token0 = "ARB-USD"
     engine._settings.token0_decimals = 18
@@ -108,7 +184,7 @@ async def test_maintain_grid_uses_real_pool_ticks_not_log_of_raw_price():
     engine._settings.hedge_ratio = 1.0
     engine._settings.uniswap_v3_pool_fee = 500
     engine._exchange = AsyncMock()
-    engine._exchange.place_stop_limit_order = AsyncMock()
+    engine._exchange.place_stop_market = AsyncMock()
     engine._db = AsyncMock()
     engine._db.get_active_grid_orders = AsyncMock(return_value=[])
     engine._db.mark_grid_order_cancelled = AsyncMock()
@@ -144,7 +220,7 @@ async def test_maintain_grid_uses_real_pool_ticks_not_log_of_raw_price():
     # The grid must have been built using the REAL ticks (-297890 / -294890),
     # not the bogus ~-574215 produced by double-decimal-factor math.
     # That means at least some stop orders must have been placed.
-    assert engine._exchange.place_stop_limit_order.call_count > 0, (
+    assert engine._exchange.place_stop_market.call_count > 0, (
         "Grid rebuild produced zero levels — tick math is off"
     )
 
@@ -152,7 +228,7 @@ async def test_maintain_grid_uses_real_pool_ticks_not_log_of_raw_price():
     # [0.10, 0.20] roughly. (Strict: between price at tick_lo and tick_hi.)
     lo_human = math.pow(1.0001, tick_lo) * (10 ** (18 - 6))
     hi_human = math.pow(1.0001, tick_hi) * (10 ** (18 - 6))
-    for call in engine._exchange.place_stop_limit_order.call_args_list:
+    for call in engine._exchange.place_stop_market.call_args_list:
         trigger = call.kwargs.get("trigger_price", 0)
         assert lo_human * 0.95 <= trigger <= hi_human * 1.05, (
             f"trigger {trigger} outside pool range [{lo_human:.4f}, {hi_human:.4f}]"
@@ -165,6 +241,7 @@ async def test_maintain_grid_no_op_when_flag_disabled():
     from engine import GridMakerEngine
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
+    engine._settings.grid_anticipation_buffer = 0.0
     engine._settings.predictive_grid_v2 = False
     engine._exchange = AsyncMock()
     # _maintain_grid existe e é safe-no-op
@@ -172,7 +249,7 @@ async def test_maintain_grid_no_op_when_flag_disabled():
         beefy_pos=MagicMock(), p_now=0.14, oracle_prices={"ARB-USD": 0.14},
     )
     # Não chamou nada do exchange
-    engine._exchange.place_stop_limit_order.assert_not_called()
+    engine._exchange.place_stop_market.assert_not_called()
     if hasattr(engine._exchange, 'cancel_stop_order'):
         engine._exchange.cancel_stop_order.assert_not_called()
 
@@ -187,6 +264,7 @@ async def test_maintain_grid_rebuilds_when_no_grid_posted():
 
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
+    engine._settings.grid_anticipation_buffer = 0.0
     engine._settings.predictive_grid_v2 = True
     engine._settings.dydx_symbol_token0 = "ARB-USD"
     engine._settings.token0_decimals = 18
@@ -233,7 +311,7 @@ async def test_maintain_grid_rebuilds_when_no_grid_posted():
     )
 
     # Deve ter postado alguma quantidade de stops
-    assert engine._exchange.place_stop_limit_order.call_count > 0
+    assert engine._exchange.place_stop_market.call_count > 0
     # E signature foi atualizada (agora armazena ticks, não p_a/p_b)
     assert engine._posted_grid_signature == (int(1e15), tick_lo, tick_hi)
 
@@ -247,6 +325,7 @@ async def test_maintain_grid_no_op_when_signature_unchanged():
 
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
+    engine._settings.grid_anticipation_buffer = 0.0
     engine._settings.predictive_grid_v2 = True
     engine._exchange = AsyncMock()
     engine._db = AsyncMock()
@@ -276,7 +355,7 @@ async def test_maintain_grid_no_op_when_signature_unchanged():
     )
 
     # Sem chamadas pro exchange
-    engine._exchange.place_stop_limit_order.assert_not_called()
+    engine._exchange.place_stop_market.assert_not_called()
     engine._exchange.cancel_all_stops.assert_not_called()
 
 
@@ -286,6 +365,7 @@ async def test_maintain_grid_no_op_when_cache_cold():
     from engine import GridMakerEngine
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
+    engine._settings.grid_anticipation_buffer = 0.0
     engine._settings.predictive_grid_v2 = True
     engine._exchange = AsyncMock()
 
@@ -297,7 +377,7 @@ async def test_maintain_grid_no_op_when_cache_cold():
         beefy_pos=MagicMock(), p_now=0.14, oracle_prices={"ARB-USD": 0.14},
     )
 
-    engine._exchange.place_stop_limit_order.assert_not_called()
+    engine._exchange.place_stop_market.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -306,6 +386,7 @@ async def test_on_grid_fill_no_op_when_flag_disabled():
     from engine import GridMakerEngine
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
+    engine._settings.grid_anticipation_buffer = 0.0
     engine._settings.predictive_grid_v2 = False
     engine._exchange = AsyncMock()
     engine._db = AsyncMock()
@@ -313,7 +394,7 @@ async def test_on_grid_fill_no_op_when_flag_disabled():
     await engine._on_grid_fill(
         cloid=42, fill_price=0.135, fill_size=3.5, side="sell",
     )
-    engine._exchange.place_stop_limit_order.assert_not_called()
+    engine._exchange.place_stop_market.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -322,6 +403,7 @@ async def test_on_grid_fill_no_op_when_cloid_not_a_grid_stop():
     from engine import GridMakerEngine
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
+    engine._settings.grid_anticipation_buffer = 0.0
     engine._settings.predictive_grid_v2 = True
     engine._exchange = AsyncMock()
     engine._db = AsyncMock()
@@ -331,7 +413,7 @@ async def test_on_grid_fill_no_op_when_cloid_not_a_grid_stop():
     await engine._on_grid_fill(
         cloid=42, fill_price=0.135, fill_size=3.5, side="sell",
     )
-    engine._exchange.place_stop_limit_order.assert_not_called()
+    engine._exchange.place_stop_market.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -341,6 +423,7 @@ async def test_on_grid_fill_posts_next_tick_level_for_sell():
 
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
+    engine._settings.grid_anticipation_buffer = 0.0
     engine._settings.predictive_grid_v2 = True
     engine._settings.dydx_symbol_token0 = "ARB-USD"
     engine._settings.token0_decimals = 18
@@ -367,8 +450,8 @@ async def test_on_grid_fill_posts_next_tick_level_for_sell():
         cloid=42, fill_price=0.135, fill_size=3.5, side="sell",
     )
 
-    engine._exchange.place_stop_limit_order.assert_called_once()
-    kwargs = engine._exchange.place_stop_limit_order.call_args.kwargs
+    engine._exchange.place_stop_market.assert_called_once()
+    kwargs = engine._exchange.place_stop_market.call_args.kwargs
     assert kwargs["side"] == "sell"
     assert kwargs["size"] == 3.5
     assert kwargs["trigger_price"] < 0.135
@@ -381,6 +464,7 @@ async def test_on_grid_fill_posts_next_tick_level_for_buy():
 
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
+    engine._settings.grid_anticipation_buffer = 0.0
     engine._settings.predictive_grid_v2 = True
     engine._settings.dydx_symbol_token0 = "ARB-USD"
     engine._settings.token0_decimals = 18
@@ -404,7 +488,7 @@ async def test_on_grid_fill_posts_next_tick_level_for_buy():
         cloid=43, fill_price=0.145, fill_size=3.5, side="buy",
     )
 
-    kwargs = engine._exchange.place_stop_limit_order.call_args.kwargs
+    kwargs = engine._exchange.place_stop_market.call_args.kwargs
     assert kwargs["side"] == "buy"
     assert kwargs["trigger_price"] > 0.145
 
@@ -416,6 +500,7 @@ async def test_on_grid_fill_skips_when_next_tick_outside_range():
 
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
+    engine._settings.grid_anticipation_buffer = 0.0
     engine._settings.predictive_grid_v2 = True
     engine._settings.dydx_symbol_token0 = "ARB-USD"
     engine._settings.token0_decimals = 18
@@ -439,6 +524,6 @@ async def test_on_grid_fill_skips_when_next_tick_outside_range():
         cloid=42, fill_price=0.142, fill_size=3.5, side="sell",
     )
 
-    if engine._exchange.place_stop_limit_order.called:
-        kwargs = engine._exchange.place_stop_limit_order.call_args.kwargs
+    if engine._exchange.place_stop_market.called:
+        kwargs = engine._exchange.place_stop_market.call_args.kwargs
         assert 0.10 <= kwargs["trigger_price"] <= 0.20

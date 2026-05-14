@@ -243,3 +243,100 @@ async def test_cancel_all_stops_sdk_error_raises():
 
     with pytest.raises(RuntimeError, match="rate limited"):
         await adapter.cancel_all_stops(symbol="ARB-USD")
+
+
+# ---------------------------------------------------------------------------
+# place_stop_market — SL_MARKET via SDK create_sl_order.
+# Confirmed live 2026-05-13: no $10 min_quote requirement, direction free.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_place_stop_market_calls_create_sl_order():
+    """SDK receives base_amount/trigger_price in raw int units, is_ask reflects
+    side, no `price` distinction (SL market doesn't enforce limit). Confirmed
+    live 2026-05-13 op #29 smoke probe — accepts 1 ARB, no $10 min."""
+    meta = _MarketMeta(
+        symbol_user="ARB-USD", symbol_lighter="ARB", market_index=50,
+        price_decimals=5, size_decimals=1, tick_size=0.00001,
+        step_size=0.1, min_base_amount=0.1, min_quote_amount=1.0,
+    )
+    adapter = _make_adapter_with_meta(meta, "ARB-USD")
+    adapter._signer.create_sl_order = AsyncMock(
+        return_value=(MagicMock(), MagicMock(), None),
+    )
+
+    await adapter.place_stop_market(
+        symbol="ARB-USD",
+        side="sell",
+        size=1.0,  # 1 ARB — below the SL_LIMIT $10 min, must still work for SL_MARKET
+        trigger_price=0.12,
+        cloid_int=999,
+    )
+
+    adapter._signer.create_sl_order.assert_called_once()
+    call = adapter._signer.create_sl_order.call_args
+    assert call.kwargs["market_index"] == 50
+    assert call.kwargs["base_amount"] == 10           # 1.0 * 10^1
+    assert call.kwargs["trigger_price"] == 12000      # 0.12 * 10^5
+    assert call.kwargs["price"] == 12000              # same — informational only
+    assert call.kwargs["is_ask"] is True              # sell
+    assert call.kwargs["reduce_only"] is False
+
+
+@pytest.mark.asyncio
+async def test_place_stop_market_buy_side():
+    meta = _MarketMeta(
+        symbol_user="ARB-USD", symbol_lighter="ARB", market_index=50,
+        price_decimals=5, size_decimals=1, tick_size=0.00001,
+        step_size=0.1, min_base_amount=0.1, min_quote_amount=1.0,
+    )
+    adapter = _make_adapter_with_meta(meta, "ARB-USD")
+    adapter._signer.create_sl_order = AsyncMock(
+        return_value=(MagicMock(), MagicMock(), None),
+    )
+
+    await adapter.place_stop_market(
+        symbol="ARB-USD", side="buy", size=2.5,
+        trigger_price=0.145, cloid_int=42,
+    )
+
+    call = adapter._signer.create_sl_order.call_args
+    assert call.kwargs["is_ask"] is False
+    assert call.kwargs["base_amount"] == 25
+    assert call.kwargs["trigger_price"] == 14500
+
+
+@pytest.mark.asyncio
+async def test_place_stop_market_zero_size_raises():
+    meta = _MarketMeta(
+        symbol_user="ARB-USD", symbol_lighter="ARB", market_index=50,
+        price_decimals=5, size_decimals=1, tick_size=0.00001,
+        step_size=0.1, min_base_amount=0.1, min_quote_amount=1.0,
+    )
+    adapter = _make_adapter_with_meta(meta, "ARB-USD")
+    adapter._signer.create_sl_order = AsyncMock()
+    with pytest.raises(ValueError, match="below market step"):
+        await adapter.place_stop_market(
+            symbol="ARB-USD", side="sell", size=0.01,
+            trigger_price=0.12, cloid_int=1,
+        )
+    adapter._signer.create_sl_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_place_stop_market_sdk_error_raises():
+    meta = _MarketMeta(
+        symbol_user="ARB-USD", symbol_lighter="ARB", market_index=50,
+        price_decimals=5, size_decimals=1, tick_size=0.00001,
+        step_size=0.1, min_base_amount=0.1, min_quote_amount=1.0,
+    )
+    adapter = _make_adapter_with_meta(meta, "ARB-USD")
+    adapter._signer.create_sl_order = AsyncMock(
+        return_value=(None, None, "invalid market"),
+    )
+    with pytest.raises(RuntimeError, match="invalid market"):
+        await adapter.place_stop_market(
+            symbol="ARB-USD", side="buy", size=1.0,
+            trigger_price=0.145, cloid_int=1,
+        )
