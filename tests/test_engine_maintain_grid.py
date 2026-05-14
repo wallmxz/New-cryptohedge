@@ -4,6 +4,82 @@ from unittest.mock import AsyncMock, MagicMock
 
 
 @pytest.mark.asyncio
+async def test_maintain_grid_caps_at_max_open_orders_centered_on_tick_now():
+    """Lighter has a max_pending_orders_per_market limit (=16 for ARB-USD,
+    code=21720). When the full V3-tick-by-tick grid exceeds max_open_orders,
+    `_maintain_grid` must keep the N levels CLOSEST to tick_now and drop the
+    rest (so the bot reacts to near-term price moves first).
+
+    Validated live 2026-05-13 op #29 smoke: without this cap, the 300+
+    generated levels filled the 16-order slot with extreme-edge sells only,
+    leaving the bot blind to nearby moves.
+    """
+    from engine import GridMakerEngine
+    from engine.hedge_model import HedgeModelCache
+    import time as time_mod
+
+    engine = GridMakerEngine.__new__(GridMakerEngine)
+    engine._settings = MagicMock()
+    engine._settings.grid_anticipation_buffer = 0.0
+    engine._settings.predictive_grid_v2 = True
+    engine._settings.dydx_symbol_token0 = "ARB-USD"
+    engine._settings.token0_decimals = 18
+    engine._settings.token1_decimals = 6
+    engine._settings.hedge_ratio = 1.0
+    engine._settings.uniswap_v3_pool_fee = 500
+    engine._settings.max_open_orders = 16
+    engine._exchange = AsyncMock()
+    engine._exchange.place_stop_market = AsyncMock()
+    engine._db = AsyncMock()
+    engine._db.get_active_grid_orders = AsyncMock(return_value=[])
+    engine._db.mark_grid_order_cancelled = AsyncMock()
+    engine._db.insert_grid_order = AsyncMock()
+    engine._hub = MagicMock()
+    engine._hub.current_operation_id = 1
+    engine._hub.hedge_ratio = 1.0
+    engine._next_cloid_for_leg = MagicMock(side_effect=lambda sym: 1)
+    engine._posted_grid_signature = None
+
+    tick_lo, tick_hi = -297890, -294890  # 3000-tick range, spacing 10 → 300 levels
+    cache = HedgeModelCache(
+        L_main=int(2.74e17),
+        p_a_main=math.pow(1.0001, tick_lo),
+        p_b_main=math.pow(1.0001, tick_hi),
+        L_alt=None, p_a_alt=None, p_b_alt=None,
+        refreshed_at=time_mod.monotonic(),
+        tick_lower_main=tick_lo, tick_upper_main=tick_hi,
+    )
+    hm = MagicMock()
+    hm._cache = cache
+    engine._hedge_model = hm
+
+    beefy_pos = MagicMock()
+    beefy_pos.share = 0.0079
+
+    p_now = 0.132  # close to middle of human range $0.116-$0.156
+    await engine._maintain_grid(
+        beefy_pos=beefy_pos, p_now=p_now,
+        oracle_prices={"ARB-USD": p_now},
+    )
+
+    # Engine should post AT MOST max_open_orders (16) levels, all close to p_now.
+    calls = engine._exchange.place_stop_market.call_args_list
+    assert len(calls) <= 16
+    assert len(calls) > 0
+    prices = sorted([c.kwargs["trigger_price"] for c in calls])
+    # All posted levels must be within ~$0.01 of p_now (we expect tight density)
+    for p in prices:
+        assert abs(p - p_now) < 0.01, (
+            f"posted level {p} too far from p_now {p_now} — cap should center"
+        )
+    # And both sides represented (we want mix of sells below + buys above)
+    sides = {c.kwargs["side"] for c in calls}
+    assert sides == {"sell", "buy"}, (
+        f"expected both sides centered, got only {sides}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_maintain_grid_applies_anticipation_buffer_to_triggers():
     """Per user spec 2026-05-13: anticipation buffer shifts each level's
     trigger so the SL_MARKET fires slightly before reaching the V3 tick,
