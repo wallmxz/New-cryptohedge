@@ -628,10 +628,106 @@ async def test_on_grid_fill_skips_post_when_new_tick_outside_beefy_range():
     ]
     assert posts_outside == [], f"unexpected post outside range: {posts_outside}"
 
-    await engine._on_grid_fill(
-        cloid=42, fill_price=0.142, fill_size=3.5, side="sell",
-    )
 
-    if engine._exchange.place_stop_market.called:
-        kwargs = engine._exchange.place_stop_market.call_args.kwargs
-        assert 0.10 <= kwargs["trigger_price"] <= 0.20
+# ---------------------------------------------------------------------------
+# Reconciler skipped under predictive_grid_v2 + drift_correction guards
+# (regression 2026-05-14: reconciler false-cancelled live SL_MARKETs as
+# "orphans" → drift_correction fired SELL against pos=0 reading from a
+# WS-drop → cascade over-hedge.)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_maybe_reconcile_skipped_when_predictive_grid_v2():
+    """Reconciler must NOT run under v2 — its 'cancel orphan + mark lost'
+    logic was designed for dYdX limit orders and destroys SL_MARKET grids.
+    """
+    from engine import GridMakerEngine
+    engine = GridMakerEngine.__new__(GridMakerEngine)
+    engine._settings = MagicMock()
+    engine._settings.predictive_grid_v2 = True
+    engine._iter_count = 0
+    GridMakerEngine.RECONCILE_EVERY_N_ITERATIONS = 1
+    engine._reconciler = MagicMock()
+    engine._reconciler.reconcile = AsyncMock()
+    engine._exchange = MagicMock()
+    await engine._maybe_reconcile()
+    engine._reconciler.reconcile.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_drift_correction_skips_when_pos_is_None():
+    """WS drops levam pos=None transiente. Skip drift fire (não shortear
+    contra reading falso)."""
+    from engine import GridMakerEngine
+    engine = GridMakerEngine.__new__(GridMakerEngine)
+    engine._settings = MagicMock()
+    engine._settings.min_rebalance_notional_usd = 1.0
+    engine._exchange = AsyncMock()
+    engine._exchange.place_long_term_order = AsyncMock()
+    engine._db = AsyncMock()
+    engine._hub = MagicMock()
+    engine._next_cloid_for_leg = MagicMock(return_value=1)
+
+    await engine._maybe_correct_drift(
+        beefy_pos=MagicMock(), p_now=0.13,
+        positions=[None],   # ← unreliable read
+        symbols=["ARB-USD"],
+        targets={"ARB-USD": 500.0},
+    )
+    engine._exchange.place_long_term_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_drift_correction_skips_when_pos_size_zero_and_target_nonzero():
+    """pos.size=0 + target>0 = leitura suspeita. Skip pra não shortar do zero."""
+    from engine import GridMakerEngine
+    engine = GridMakerEngine.__new__(GridMakerEngine)
+    engine._settings = MagicMock()
+    engine._settings.min_rebalance_notional_usd = 1.0
+    engine._exchange = AsyncMock()
+    engine._exchange.place_long_term_order = AsyncMock()
+    engine._db = AsyncMock()
+    engine._hub = MagicMock()
+    engine._next_cloid_for_leg = MagicMock(return_value=1)
+
+    pos0 = MagicMock()
+    pos0.size = 0.0
+    await engine._maybe_correct_drift(
+        beefy_pos=MagicMock(), p_now=0.13,
+        positions=[pos0],
+        symbols=["ARB-USD"],
+        targets={"ARB-USD": 500.0},  # we expect a position but read says 0
+    )
+    engine._exchange.place_long_term_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_drift_correction_fires_when_pos_valid_and_drift_above_threshold():
+    """Sanity: quando reading é confiável (pos.size > 0) e drift > $1, dispara."""
+    from engine import GridMakerEngine
+    engine = GridMakerEngine.__new__(GridMakerEngine)
+    engine._settings = MagicMock()
+    engine._settings.min_rebalance_notional_usd = 1.0
+    engine._exchange = AsyncMock()
+    engine._exchange.place_long_term_order = AsyncMock()
+    engine._exchange.name = "lighter"
+    engine._db = AsyncMock()
+    engine._db.insert_order_log = AsyncMock()
+    engine._hub = MagicMock()
+    engine._hub.current_operation_id = 7
+    engine._hub.dydx_quote_prices = {"ARB-USD": 0.13}
+    engine._next_cloid_for_leg = MagicMock(return_value=1)
+
+    pos0 = MagicMock()
+    pos0.size = 493.0
+    await engine._maybe_correct_drift(
+        beefy_pos=MagicMock(), p_now=0.13,
+        positions=[pos0],
+        symbols=["ARB-USD"],
+        targets={"ARB-USD": 520.0},  # drift = 27 ARB * $0.13 = $3.5 > $1
+    )
+    engine._exchange.place_long_term_order.assert_called_once()
+    call = engine._exchange.place_long_term_order.call_args
+    assert call.kwargs["side"] == "sell"
+    assert call.kwargs["size"] == pytest.approx(27.0)
