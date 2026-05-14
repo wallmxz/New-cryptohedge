@@ -652,6 +652,19 @@ class GridMakerEngine:
             self._last_alert_level = None
 
     async def _maybe_reconcile(self):
+        # Skip reconciler under predictive_grid_v2 — the trailing grid
+        # handler (`_on_grid_fill`) + drift correction (`_maybe_correct_drift`)
+        # own the order-state sync for v2 ops. The legacy Reconciler was
+        # designed for dYdX limit-order maker grids (Phase 1.1) and:
+        #   (a) marks live SL_MARKET stops as "lost" in DB if its
+        #       authenticated active-orders query returns stale,
+        #   (b) then on the NEXT cycle, sees those same orders live on
+        #       Lighter but no longer in DB → considers them ORPHANS and
+        #       cancels them on the exchange → DESTROYS the entire grade.
+        # Validated live 2026-05-14 op #29 smoke (cancelled_orphan logs
+        # taking 5+ stops off Lighter, drift_correction firing to recover).
+        if getattr(self._settings, "predictive_grid_v2", False):
+            return
         if self._iter_count % self.RECONCILE_EVERY_N_ITERATIONS == 0:
             rec = self._ensure_reconciler()
             if rec is not None:
@@ -710,13 +723,16 @@ class GridMakerEngine:
         # Initial reconciliation on startup, BEFORE main loop begins.
         # Recovers from crashes: cancels orphan orders on exchange, marks
         # lost DB orders as cancelled.
-        rec = self._ensure_reconciler()
-        if rec is not None:
-            try:
-                await rec.reconcile()
-                logger.info("Initial reconciliation complete")
-            except Exception as e:
-                logger.error(f"Initial reconciliation failed: {e}")
+        # NOTA: skip under predictive_grid_v2 (trailing handles state — see
+        # _maybe_reconcile docstring for the destructive interaction).
+        if not getattr(self._settings, "predictive_grid_v2", False):
+            rec = self._ensure_reconciler()
+            if rec is not None:
+                try:
+                    await rec.reconcile()
+                    logger.info("Initial reconciliation complete")
+                except Exception as e:
+                    logger.error(f"Initial reconciliation failed: {e}")
 
         # Restore active operation, if any
         active_op = await self._db.get_active_operation()
@@ -1690,8 +1706,27 @@ class GridMakerEngine:
         )
         for idx, sym in enumerate(symbols):
             pos = positions[idx] if idx < len(positions) else None
-            current = abs(pos.size) if pos else 0.0
             target = float(targets.get(sym, 0.0))
+            # CRITICAL guard 2026-05-14: WS drops na Lighter levam o adapter
+            # a logar "preserving" mas o get_position downstream pode retornar
+            # None ou size=0 transiente. Se isso acontecer e o `target` é
+            # significativamente não-zero, NÃO confiar — pular a iteration.
+            # Sem essa guarda, drift_correction fires SELL `target` partindo
+            # de zero → posição explode catastroficamente quando a leitura
+            # for falsa. Validado live 2026-05-14: drift fired SELL 516 ARB
+            # com pos=0 enquanto position real era ~493 ARB.
+            if pos is None:
+                logger.warning(
+                    f"drift_correction: skip {sym} — pos is None (WS drop?)"
+                )
+                continue
+            current = abs(pos.size)
+            if current == 0 and target > 0:
+                logger.warning(
+                    f"drift_correction: skip {sym} — pos.size=0 but target={target:.3f} "
+                    f"(WS drop suspected; refusing to short into a stale 0 reading)"
+                )
+                continue
             ref_price = float(self._hub.dydx_quote_prices.get(sym, 0.0)) if hasattr(self._hub, "dydx_quote_prices") else 0.0
             if ref_price <= 0:
                 # Fallback: usar p_now pra token0 (USD-pair). Cross-pair seria

@@ -182,6 +182,7 @@ async def test_engine_reconcile_runs_periodically():
     settings.pool_token0_symbol = "WETH"
     settings.pool_token1_symbol = "USDC"
     settings.alert_webhook_url = ""
+    settings.predictive_grid_v2 = False  # legacy path runs reconciler
 
     db = MagicMock()
     db.get_active_grid_orders = AsyncMock(return_value=[])
@@ -390,6 +391,7 @@ async def test_engine_recovery_reconciles_on_start():
     state = StateHub()
     settings = MagicMock()
     settings.dydx_symbol = "ETH-USD"
+    settings.predictive_grid_v2 = False  # legacy path runs initial reconcile
 
     db = MagicMock()
     db.get_active_grid_orders = AsyncMock(return_value=[
