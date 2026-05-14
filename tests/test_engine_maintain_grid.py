@@ -405,11 +405,15 @@ async def test_maintain_grid_rebuilds_when_no_grid_posted():
 
 
 @pytest.mark.asyncio
-async def test_maintain_grid_no_op_when_signature_unchanged():
-    """Se HedgeModel cache não mudou, _maintain_grid não recompila grade."""
+async def test_maintain_grid_no_post_when_signature_unchanged_and_live_matches():
+    """Sig unchanged + live na Lighter já bate com desired: zero ações.
+    (Spec 2026-05-14: reconcile sempre roda, mas é idempotente quando nada
+    mudou — sem posts, sem cancels.)"""
     from engine import GridMakerEngine
     from engine.hedge_model import HedgeModelCache
+    from engine.curve import compute_grid_from_pool_ticks
     import time as time_mod
+    from math import log, floor
 
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
@@ -420,13 +424,20 @@ async def test_maintain_grid_no_op_when_signature_unchanged():
     engine._settings.token0_decimals = 18
     engine._settings.token1_decimals = 6
     engine._settings.dydx_symbol_token0 = "ARB-USD"
-    engine._exchange = AsyncMock()
+    engine._settings.hedge_ratio = 1.0
+    engine._settings.uniswap_v3_pool_fee = 500
     engine._db = AsyncMock()
+    engine._db.get_active_grid_orders = AsyncMock(return_value=[])
     engine._hub = MagicMock()
+    engine._hub.current_operation_id = 1
+    engine._hub.hedge_ratio = 1.0
+    engine._next_cloid_for_leg = MagicMock(return_value=1)
 
     tick_lo, tick_hi = -299580, -292650
+    L_raw_strategy = int(2.74e17)
+    user_share = 0.0079
     cache = HedgeModelCache(
-        L_main=int(1e15),
+        L_main=L_raw_strategy,
         p_a_main=math.pow(1.0001, tick_lo),
         p_b_main=math.pow(1.0001, tick_hi),
         L_alt=None, p_a_alt=None, p_b_alt=None,
@@ -438,17 +449,45 @@ async def test_maintain_grid_no_op_when_signature_unchanged():
     hm._cache = cache
     engine._hedge_model = hm
 
-    # Signature já matches o cache (agora stored as L + ticks)
-    engine._posted_grid_signature = (int(1e15), tick_lo, tick_hi)
+    # Build live orders matching the desired grid (so reconcile is no-op)
+    p_now = 0.14
+    decimal_factor = 10 ** (18 - 6)
+    l_decimal_factor = 10 ** ((18 + 6) / 2)
+    L_for_grid = float(L_raw_strategy) / l_decimal_factor * user_share
+    tick_now = floor(log(p_now / decimal_factor) / log(1.0001))
+    full = compute_grid_from_pool_ticks(
+        L=L_for_grid, tick_lower=tick_lo, tick_upper=tick_hi,
+        tick_spacing=10, tick_now=tick_now,
+        decimals0=18, decimals1=6, hedge_ratio=1.0,
+        lighter_price_decimals=5, lighter_size_decimals=1,
+    )
+    sells = sorted([lv for lv in full if lv.side == "sell"], key=lambda lv: -lv.price)[:8]
+    buys = sorted([lv for lv in full if lv.side == "buy"], key=lambda lv: lv.price)[:8]
+    desired = sells + buys
+    live_orders = [
+        {"side": lv.side, "cloid": f"c{i}", "order_index": 100 + i,
+         "trigger_price": lv.price, "size": lv.size, "type": "stop-loss"}
+        for i, lv in enumerate(desired)
+    ]
+    engine._exchange = AsyncMock()
+    engine._exchange.place_stop_market = AsyncMock()
+    engine._exchange.cancel_stop_order = AsyncMock()
+    engine._exchange.cancel_all_stops = AsyncMock()
+    engine._exchange.get_open_orders = AsyncMock(return_value=live_orders)
 
+    # Signature já matches o cache → no range_change cancel-all
+    engine._posted_grid_signature = (L_raw_strategy, tick_lo, tick_hi)
+
+    beefy_pos = MagicMock()
+    beefy_pos.share = user_share
     await engine._maintain_grid(
-        beefy_pos=MagicMock(),
-        p_now=0.14,
-        oracle_prices={"ARB-USD": 0.14},
+        beefy_pos=beefy_pos, p_now=p_now,
+        oracle_prices={"ARB-USD": p_now},
     )
 
-    # Sem chamadas pro exchange
+    # Idempotente: nada postado, nada cancelado
     engine._exchange.place_stop_market.assert_not_called()
+    engine._exchange.cancel_stop_order.assert_not_called()
     engine._exchange.cancel_all_stops.assert_not_called()
 
 
@@ -526,107 +565,157 @@ def _trailing_engine(side: str, *, live_orders: list[dict],
 
 
 @pytest.mark.asyncio
-async def test_on_grid_fill_buy_extends_buy_band_and_trails_sell_band_up():
-    """User spec 2026-05-14: depois de BUY fillar, a banda inteira anda pra cima.
-    - Extend buy: nova BUY 1 tick acima do highest existing buy.
-    - Trail sell: cancela lowest sell, nova SELL 1 tick acima do highest sell.
-    """
-    # Setup: 7 buys (one already filled) + 8 sells alive on Lighter
-    live_buys = [
-        {"side":"buy","cloid":f"b{i}","order_index":100+i,"trigger_price":0.13200+i*0.00013,"size":3.0,"type":"stop-loss"}
-        for i in range(7)
-    ]
-    live_sells = [
-        {"side":"sell","cloid":f"s{i}","order_index":200+i,"trigger_price":0.13100-i*0.00013,"size":3.0,"type":"stop-loss"}
-        for i in range(8)
-    ]
-    live = live_buys + live_sells
-    engine = _trailing_engine("buy", live_orders=live)
+async def test_reconcile_posts_missing_levels_when_grid_has_gaps():
+    """Quando alguns levels do desired estão missing no live (ex: sells
+    fillaram async sem callback), reconcile detecta + posta. Self-healing.
 
-    await engine._on_grid_fill(cloid=42, fill_price=0.132, fill_size=3.0, side="buy")
+    Spec 2026-05-14: substitui o fill-callback trailing — agora trailing
+    emerge da reconciliação cada iter."""
+    from engine import GridMakerEngine
+    from engine.hedge_model import HedgeModelCache
+    from engine.curve import compute_grid_from_pool_ticks
+    import time as time_mod
+    from math import log, floor
 
-    # Expect 2 new place_stop_market calls (one buy, one sell)
+    engine = GridMakerEngine.__new__(GridMakerEngine)
+    engine._settings = MagicMock()
+    engine._settings.grid_anticipation_buffer = 0.0
+    engine._settings.max_open_orders = 16
+    engine._settings.min_rebalance_notional_usd = 1.0
+    engine._settings.predictive_grid_v2 = True
+    engine._settings.token0_decimals = 18
+    engine._settings.token1_decimals = 6
+    engine._settings.dydx_symbol_token0 = "ARB-USD"
+    engine._settings.hedge_ratio = 1.0
+    engine._settings.uniswap_v3_pool_fee = 500
+    engine._db = AsyncMock()
+    engine._db.get_active_grid_orders = AsyncMock(return_value=[])
+    engine._hub = MagicMock()
+    engine._hub.current_operation_id = 1
+    engine._hub.hedge_ratio = 1.0
+    engine._next_cloid_for_leg = MagicMock(side_effect=range(100, 200))
+
+    tick_lo, tick_hi = -299580, -292650
+    cache = HedgeModelCache(
+        L_main=int(2.74e17),
+        p_a_main=math.pow(1.0001, tick_lo),
+        p_b_main=math.pow(1.0001, tick_hi),
+        L_alt=None, p_a_alt=None, p_b_alt=None,
+        refreshed_at=time_mod.monotonic(),
+        tick_lower_main=tick_lo, tick_upper_main=tick_hi,
+    )
+    hm = MagicMock()
+    hm._cache = cache
+    engine._hedge_model = hm
+
+    # Compute the desired grid, then simulate "only buys live, sells fillaram"
+    p_now = 0.14
+    decimal_factor = 10 ** 12
+    l_factor = 10 ** 12
+    L_for_grid = float(int(2.74e17)) / l_factor * 0.0079
+    tick_now = floor(log(p_now / decimal_factor) / log(1.0001))
+    full = compute_grid_from_pool_ticks(
+        L=L_for_grid, tick_lower=tick_lo, tick_upper=tick_hi,
+        tick_spacing=10, tick_now=tick_now,
+        decimals0=18, decimals1=6, hedge_ratio=1.0,
+        lighter_price_decimals=5, lighter_size_decimals=1,
+    )
+    sells = sorted([lv for lv in full if lv.side == "sell"], key=lambda lv: -lv.price)[:8]
+    buys = sorted([lv for lv in full if lv.side == "buy"], key=lambda lv: lv.price)[:8]
+    # Live: somente os 8 buys (sells fillaram fora do nosso conhecimento)
+    live_orders = [
+        {"side": "buy", "cloid": f"b{i}", "order_index": 100 + i,
+         "trigger_price": lv.price, "size": lv.size, "type": "stop-loss"}
+        for i, lv in enumerate(buys)
+    ]
+    engine._exchange = AsyncMock()
+    engine._exchange.place_stop_market = AsyncMock()
+    engine._exchange.cancel_stop_order = AsyncMock()
+    engine._exchange.cancel_all_stops = AsyncMock()
+    engine._exchange.get_open_orders = AsyncMock(return_value=live_orders)
+
+    engine._posted_grid_signature = (int(2.74e17), tick_lo, tick_hi)
+    beefy_pos = MagicMock()
+    beefy_pos.share = 0.0079
+
+    await engine._maintain_grid(
+        beefy_pos=beefy_pos, p_now=p_now,
+        oracle_prices={"ARB-USD": p_now},
+    )
+
+    # Deve postar exatamente os 8 sells faltantes (buys já estão live).
     calls = engine._exchange.place_stop_market.call_args_list
-    sides = [c.kwargs["side"] for c in calls]
-    assert sides.count("buy") == 1
-    assert sides.count("sell") == 1
-    # Buy posted ABOVE existing highest buy (= 0.13200 + 6*0.00013 ≈ 0.13278)
-    new_buy = next(c for c in calls if c.kwargs["side"] == "buy")
-    highest_buy = max(b["trigger_price"] for b in live_buys)
-    assert new_buy.kwargs["trigger_price"] > highest_buy
-    # Sell posted ABOVE existing highest sell (= 0.13100 = closest-to-mid)
-    new_sell = next(c for c in calls if c.kwargs["side"] == "sell")
-    highest_sell = max(s["trigger_price"] for s in live_sells)
-    assert new_sell.kwargs["trigger_price"] > highest_sell
-    # Lowest sell cancelled
-    lowest_sell = min(live_sells, key=lambda o: o["trigger_price"])
-    engine._exchange.cancel_stop_order.assert_called_once()
-    cc = engine._exchange.cancel_stop_order.call_args
-    assert cc.kwargs["order_index"] == lowest_sell["order_index"]
+    posted_sides = [c.kwargs["side"] for c in calls]
+    assert posted_sides.count("sell") == 8, (
+        f"expected 8 sells posted, got {posted_sides.count('sell')}; full={posted_sides}"
+    )
+    assert posted_sides.count("buy") == 0
+    # E nada cancelado (todos os buys live estão dentro do desired)
+    engine._exchange.cancel_stop_order.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_on_grid_fill_sell_extends_sell_band_and_trails_buy_band_down():
-    """Symmetric: SELL fills → extend sell band DOWN + trail buy band DOWN."""
-    live_buys = [
-        {"side":"buy","cloid":f"b{i}","order_index":100+i,"trigger_price":0.13200+i*0.00013,"size":3.0,"type":"stop-loss"}
-        for i in range(8)
-    ]
-    live_sells = [
-        {"side":"sell","cloid":f"s{i}","order_index":200+i,"trigger_price":0.13100-i*0.00013,"size":3.0,"type":"stop-loss"}
-        for i in range(7)
-    ]
-    live = live_buys + live_sells
-    engine = _trailing_engine("sell", live_orders=live)
+async def test_reconcile_cancels_live_orders_outside_desired_set():
+    """Live tem ordens em ticks fora da faixa desired (ex: tick_now moveu
+    e as antigas viraram extras). Reconcile cancela."""
+    from engine import GridMakerEngine
+    from engine.hedge_model import HedgeModelCache
+    import time as time_mod
 
-    await engine._on_grid_fill(cloid=42, fill_price=0.131, fill_size=3.0, side="sell")
+    engine = GridMakerEngine.__new__(GridMakerEngine)
+    engine._settings = MagicMock()
+    engine._settings.grid_anticipation_buffer = 0.0
+    engine._settings.max_open_orders = 16
+    engine._settings.min_rebalance_notional_usd = 1.0
+    engine._settings.predictive_grid_v2 = True
+    engine._settings.token0_decimals = 18
+    engine._settings.token1_decimals = 6
+    engine._settings.dydx_symbol_token0 = "ARB-USD"
+    engine._settings.hedge_ratio = 1.0
+    engine._settings.uniswap_v3_pool_fee = 500
+    engine._db = AsyncMock()
+    engine._db.get_active_grid_orders = AsyncMock(return_value=[])
+    engine._hub = MagicMock()
+    engine._hub.current_operation_id = 1
+    engine._hub.hedge_ratio = 1.0
+    engine._next_cloid_for_leg = MagicMock(side_effect=range(100, 200))
 
-    calls = engine._exchange.place_stop_market.call_args_list
-    sides = [c.kwargs["side"] for c in calls]
-    assert sides.count("sell") == 1
-    assert sides.count("buy") == 1
-    # Sell posted BELOW lowest existing sell
-    new_sell = next(c for c in calls if c.kwargs["side"] == "sell")
-    lowest_sell = min(s["trigger_price"] for s in live_sells)
-    assert new_sell.kwargs["trigger_price"] < lowest_sell
-    # Buy posted BELOW lowest existing buy
-    new_buy = next(c for c in calls if c.kwargs["side"] == "buy")
-    lowest_buy = min(b["trigger_price"] for b in live_buys)
-    assert new_buy.kwargs["trigger_price"] < lowest_buy
-    # Highest buy cancelled
-    highest_buy = max(live_buys, key=lambda o: o["trigger_price"])
+    tick_lo, tick_hi = -299580, -292650
+    cache = HedgeModelCache(
+        L_main=int(2.74e17),
+        p_a_main=math.pow(1.0001, tick_lo),
+        p_b_main=math.pow(1.0001, tick_hi),
+        L_alt=None, p_a_alt=None, p_b_alt=None,
+        refreshed_at=time_mod.monotonic(),
+        tick_lower_main=tick_lo, tick_upper_main=tick_hi,
+    )
+    hm = MagicMock()
+    hm._cache = cache
+    engine._hedge_model = hm
+
+    # Live tem uma ordem em preço $0.05 (longe do desired centrado em ~$0.14)
+    live_orders = [
+        {"side": "sell", "cloid": "x1", "order_index": 999,
+         "trigger_price": 0.05000, "size": 3.0, "type": "stop-loss"},
+    ]
+    engine._exchange = AsyncMock()
+    engine._exchange.place_stop_market = AsyncMock()
+    engine._exchange.cancel_stop_order = AsyncMock()
+    engine._exchange.cancel_all_stops = AsyncMock()
+    engine._exchange.get_open_orders = AsyncMock(return_value=live_orders)
+
+    engine._posted_grid_signature = (int(2.74e17), tick_lo, tick_hi)
+    beefy_pos = MagicMock()
+    beefy_pos.share = 0.0079
+    await engine._maintain_grid(
+        beefy_pos=beefy_pos, p_now=0.14,
+        oracle_prices={"ARB-USD": 0.14},
+    )
+
+    # A ordem em $0.05 deve ter sido cancelada
     engine._exchange.cancel_stop_order.assert_called_once()
     cc = engine._exchange.cancel_stop_order.call_args
-    assert cc.kwargs["order_index"] == highest_buy["order_index"]
-
-
-@pytest.mark.asyncio
-async def test_on_grid_fill_skips_post_when_new_tick_outside_beefy_range():
-    """Trailing pode tentar postar fora do range Beefy ativo. Nesse caso,
-    skipa o post mas continua tentando a outra ação. _maintain_grid full
-    rebuild vai recompor quando Beefy rebalançar."""
-    # Tight signature range; highest buy already AT tick_upper edge
-    sig = (int(1e15), -296000, -295000)  # narrow Beefy range
-    live_buys = [
-        {"side":"buy","cloid":"b0","order_index":100,"trigger_price":0.14185,"size":3.0,"type":"stop-loss"},  # near upper edge
-    ]
-    live_sells = [
-        {"side":"sell","cloid":"s0","order_index":200,"trigger_price":0.13800,"size":3.0,"type":"stop-loss"},
-    ]
-    engine = _trailing_engine("buy", live_orders=live_buys + live_sells, sig=sig)
-
-    await engine._on_grid_fill(cloid=42, fill_price=0.142, fill_size=3.0, side="buy")
-
-    # Extending the buy band upward would post beyond tick_upper=-295000 → skip.
-    # Trailing sell band upward also lands outside range → also skipped.
-    # Net: zero new posts.
-    calls = engine._exchange.place_stop_market.call_args_list
-    posts_outside = [
-        c for c in calls
-        # Both sides would be above tick_upper ≈ -295000 (human ~$0.1505)
-        if c.kwargs.get("trigger_price", 0) > 0.1505
-    ]
-    assert posts_outside == [], f"unexpected post outside range: {posts_outside}"
+    assert cc.kwargs["order_index"] == 999
 
 
 # ---------------------------------------------------------------------------

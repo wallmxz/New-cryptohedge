@@ -66,9 +66,13 @@ class Settings:
     #   BUY  trigger = tick_price - buffer  (anticipa subida de preço)
     # Captura o spread implícito do book Lighter (~$0.00005-$0.0002 observado
     # em ARB-USD) e a latência de input pequena, garantindo execução próxima
-    # ao tick desejado. Default $0.00005 (= 5 Lighter price ticks @
+    # ao tick desejado. Default $0.00010 (= 10 Lighter price ticks @
     # price_decimals=5 pra ARB-USD).
-    grid_anticipation_buffer: float = 0.00005
+    # Validated live 2026-05-14 op #29: $0.00005 era frágil — 4 sells
+    # closest-to-market viraram inválidos durante settlement zk-rollup
+    # (~200ms latency). $0.00010 dá ~0.077% margem, robusto à flutuação
+    # micro do book.
+    grid_anticipation_buffer: float = 0.00010
 
     @property
     def dydx_symbol(self) -> str:
