@@ -1295,7 +1295,7 @@ class GridMakerEngine:
             # próxima iter (com refresh feito) pega.
             return
 
-        from engine.curve import compute_grid_from_pool_ticks
+        from engine.curve import compute_grid_from_pool_ticks, tick_to_human_price
         from math import log, floor
 
         cache = self._hedge_model._cache
@@ -1390,6 +1390,22 @@ class GridMakerEngine:
             lighter_price_decimals=5,  # ARB-USD on Lighter
             lighter_size_decimals=1,
         )
+
+        # Lighter rejeita ordens além do `maximum pending order count per market`
+        # (validado live 2026-05-13: limit = 16 stops por market em ARB-USD,
+        # code=21720). Pra grade larga (300+ levels) precisamos limitar e
+        # priorizar os levels mais próximos do tick_now (onde fills acontecem
+        # primeiro). Sort por distância ascendente, take os N primeiros.
+        # `max_open_orders` config (default 200) é o cap soft global —
+        # cabe usar pra esse propósito.
+        max_orders = int(getattr(self._settings, "max_open_orders", 200) or 200)
+        if len(new_grid) > max_orders:
+            tick_now_price = tick_to_human_price(
+                tick=tick_now, decimals0=decimals0, decimals1=decimals1,
+            )
+            new_grid = sorted(
+                new_grid, key=lambda lv: abs(lv.price - tick_now_price),
+            )[:max_orders]
 
         # Post each level via SL_MARKET (no $10 min — viable pra grade densa
         # baixo capital). Anticipation buffer ajusta trigger pra capturar
