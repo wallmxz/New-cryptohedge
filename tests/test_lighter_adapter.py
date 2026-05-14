@@ -1272,6 +1272,51 @@ async def test_get_funding_total_since_reads_sdk_attributes_not_dict_get():
 
 
 @pytest.mark.asyncio
+async def test_get_open_orders_cloids_passes_auth_token():
+    """Regression 2026-05-14: account_active_orders requires an auth token
+    on Lighter. Without it, the endpoint returns empty and the reconciler
+    mistakenly marks every live stop order as `lost` and cancels them in
+    DB — leaving the bot out of sync with Lighter's actual order state.
+
+    Fix: regenerate per-call auth token (same pattern as
+    _fetch_position_funding) and pass it as `auth=`.
+    """
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._signer = MagicMock()
+    a._signer.create_auth_token_with_expiry = MagicMock(return_value=("AUTHTOK", None))
+    a._account_api = MagicMock()
+    a._order_api = MagicMock()
+    a._order_api.account_active_orders = AsyncMock(
+        return_value=MagicMock(orders=[
+            MagicMock(client_order_index=111),
+            MagicMock(client_order_index=222),
+        ]),
+    )
+    # Mock _market_meta_or_raise to return a meta with market_index
+    meta = MagicMock(); meta.market_index = 50
+    a._market_meta_or_raise = MagicMock(return_value=meta)
+
+    out = await a.get_open_orders_cloids("ARB-USD")
+    assert out == ["111", "222"]
+    call = a._order_api.account_active_orders.await_args
+    assert call.kwargs["auth"] == "AUTHTOK"
+    assert call.kwargs["market_id"] == 50
+
+
+@pytest.mark.asyncio
+async def test_get_open_orders_cloids_returns_empty_when_no_signer():
+    """If signer not yet initialized (engine boot), return empty (safe default)."""
+    _install_lighter_stub()
+    a = _make_adapter()
+    a._signer = None
+    meta = MagicMock(); meta.market_index = 50
+    a._market_meta_or_raise = MagicMock(return_value=meta)
+    out = await a.get_open_orders_cloids("ARB-USD")
+    assert out == []
+
+
+@pytest.mark.asyncio
 async def test_get_funding_total_since_skips_unknown_market():
     """Entries for markets not matching token0/token1 must be ignored."""
     _install_lighter_stub()
