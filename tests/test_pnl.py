@@ -2,6 +2,31 @@ from engine.pnl import compute_operation_pnl
 from engine.operation import Operation, OperationState
 
 
+def test_single_leg_funding_reads_funding_paid_token0_not_legacy():
+    """Regression 2026-05-14: funding poller writes per-leg fields
+    (`funding_paid_token0`), not the legacy `funding_paid`. The single-leg
+    branch of `compute_operation_pnl` was reading the legacy field and
+    showing $0.00 on the dashboard despite real funding accrued.
+    """
+    op = Operation(
+        id=1, started_at=1000.0, state=OperationState.ACTIVE,
+        baseline_eth_price=3000.0, baseline_pool_value_usd=300.0,
+        baseline_amount0=0.05, baseline_amount1=150.0,
+        baseline_collateral=130.0,
+        funding_paid=0.0,             # legacy field (not written by poller)
+        funding_paid_token0=-0.50,    # poller writes here (single-leg too)
+        funding_paid_token1=0.0,
+    )
+    breakdown = compute_operation_pnl(
+        op,
+        current_pool_value_usd=300.0, current_eth_price=3000.0,
+        hedge_realized_since_baseline=0.0, hedge_unrealized_since_baseline=0.0,
+    )
+    # funding_paid_token0 = -0.50 (paid convention) → display = +0.50 (received)
+    assert abs(breakdown["funding"] - 0.50) < 1e-9
+    assert abs(breakdown["funding_token0"] - 0.50) < 1e-9
+
+
 def test_operation_pnl_breakdown():
     op = Operation(
         id=1, started_at=1000.0, state=OperationState.ACTIVE,
@@ -9,7 +34,7 @@ def test_operation_pnl_breakdown():
         baseline_amount0=0.05, baseline_amount1=150.0,
         baseline_collateral=130.0,
         perp_fees_paid=0.5,
-        funding_paid=-1.0,    # bot received +$1 funding
+        funding_paid_token0=-1.0,  # bot received +$1 funding (single-leg writes to token0 col)
         lp_fees_earned=2.1,
         bootstrap_slippage=0.07,
     )

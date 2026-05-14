@@ -123,8 +123,14 @@ def compute_operation_pnl(
         funding_t0 = -op.funding_paid_token0
         funding_t1 = -op.funding_paid_token1
     else:
-        # Legacy: aggregate funding_paid (single-leg field) lives on token0 side.
-        funding_t0 = -op.funding_paid
+        # Single-leg (USD-pair): poller writes to `funding_paid_token0`
+        # (same column used by cross-pair token0 leg). The legacy
+        # `funding_paid` field is no longer written to since the per-leg
+        # split was introduced. Read from the active column.
+        # Validated live 2026-05-14 op #29 (ARB/USDC.e): poller had
+        # accumulated $0.042 in funding_paid_token0 but dashboard showed
+        # $0.00 because this branch read the empty legacy field.
+        funding_t0 = -op.funding_paid_token0
         funding_t1 = 0.0
     funding = funding_t0 + funding_t1
 
