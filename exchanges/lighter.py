@@ -1498,6 +1498,59 @@ class LighterAdapter(ExchangeAdapter):
         # place_long_term_order. Historical fills via /trades is a follow-up.
         return []
 
+    async def get_open_orders(self, symbol: str) -> list[dict]:
+        """Return full info for currently-open orders on this market.
+
+        Each entry: {"cloid": str, "side": "buy"|"sell", "trigger_price": float,
+        "size": float, "order_index": int, "type": str}. Used by the trailing
+        grid handler (`_on_grid_fill`) to know which order is the highest buy
+        / lowest sell so it can extend/shift the band correctly.
+        """
+        meta = self._market_meta_or_raise(symbol)
+        if self._signer is None:
+            return []
+        try:
+            from lighter import SignerClient as _SignerClient
+            token, err = self._signer.create_auth_token_with_expiry(
+                deadline=_SignerClient.DEFAULT_10_MIN_AUTH_EXPIRY,
+            )
+            if err is not None:
+                logger.warning(f"get_open_orders: auth token error: {err}")
+                return []
+        except Exception as e:
+            logger.warning(f"get_open_orders: auth token raised: {e}")
+            return []
+        try:
+            resp = await self._order_api.account_active_orders(
+                account_index=self._account_index,
+                market_id=meta.market_index,
+                auth=token,
+            )
+        except Exception as e:
+            logger.warning(f"get_open_orders HTTP failed: {e}")
+            return []
+        orders = getattr(resp, "orders", None) or []
+        out: list[dict] = []
+        for o in orders:
+            try:
+                cloid = str(o.client_order_index)
+                side = "sell" if bool(getattr(o, "is_ask", False)) else "buy"
+                trig_raw = getattr(o, "trigger_price", None) or getattr(o, "price", 0)
+                # Lighter returns prices as strings or floats; the SDK uses
+                # the display-units convention (i.e. trigger_price is the
+                # human-readable price, not raw int).
+                trig = float(trig_raw)
+                size = float(getattr(o, "initial_base_amount", 0) or 0)
+                order_index = int(getattr(o, "order_index", 0) or 0)
+                otype = str(getattr(o, "type", ""))
+                out.append({
+                    "cloid": cloid, "side": side, "trigger_price": trig,
+                    "size": size, "order_index": order_index, "type": otype,
+                })
+            except Exception as e:
+                logger.warning(f"get_open_orders: parse one order failed: {e}")
+        return out
+
     async def get_open_orders_cloids(self, symbol: str) -> list[str]:
         """List cloids of currently OPEN orders (limit + stop) on this market.
 
