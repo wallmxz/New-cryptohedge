@@ -126,15 +126,27 @@ function dashboard() {
         get op() {
             const b = this.state.operation_pnl_breakdown || {};
             const netPnl = b.net_pnl || 0;
+            // Hedge PnL: when the venue provides decomposition (realized
+            // closed-pnl + open-position unrealized), show all 3 rows so
+            // user can reconcile with Lighter UI's "Unrealized PnL".
+            // Spec 2026-05-14.
             const breakdown = [
                 { label: "LP fees recebidas", value: b.lp_fees_earned || 0 },
                 { label: "Beefy perf fee", value: b.beefy_perf_fee || 0 },
                 { label: "Pool $", value: b.pool_dollar || 0 },
-                { label: "Hedge PnL", value: b.hedge_pnl || 0 },
+                { label: "Hedge PnL (total)", value: b.hedge_pnl || 0 },
+            ];
+            if (b.hedge_pnl_realized != null && b.hedge_pnl_unrealized != null) {
+                breakdown.push(
+                    { label: "  └ realized (closed)", value: b.hedge_pnl_realized },
+                    { label: "  └ unrealized (open)", value: b.hedge_pnl_unrealized },
+                );
+            }
+            breakdown.push(
                 { label: "Funding", value: b.funding || 0 },
                 { label: "Perp fees", value: b.perp_fees_paid || 0 },
                 { label: "Bootstrap slippage", value: b.bootstrap_slippage || 0 },
-            ];
+            );
             return {
                 elapsed: this._formatElapsed(),
                 breakdown: breakdown,

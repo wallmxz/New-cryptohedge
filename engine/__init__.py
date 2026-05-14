@@ -1095,6 +1095,25 @@ class GridMakerEngine:
                                     f"get_trade_pnl_since failed: {e}"
                                 )
 
+                        # Pull current unrealized PnL so we can decompose
+                        # hedge_pnl_override into (realized, unrealized).
+                        # Spec 2026-05-14: user wants to see realized+
+                        # unrealized SEPARATELY (matches Lighter UI's
+                        # "Unrealized PnL" while keeping trade_pnl
+                        # cumulative for "closed" portion).
+                        hedge_unrealized_override = None
+                        try:
+                            symbol_t0 = self._settings.dydx_symbol_token0
+                            pos = await self._safe_get_position(symbol_t0)
+                            if pos is not None:
+                                hedge_unrealized_override = float(
+                                    getattr(pos, "unrealized_pnl", 0.0) or 0.0
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                f"get unrealized_pnl for breakdown failed: {e}"
+                                )
+
                         # Funding window override: when the user picked
                         # a start in the UI, sum funding from Lighter
                         # since that ts instead of the DB cumulative
@@ -1133,6 +1152,7 @@ class GridMakerEngine:
                                 hedge_realized_per_symbol=dict(self._hub.hedge_realized_pnls),
                                 hedge_unrealized_per_symbol=dict(self._hub.hedge_unrealized_pnls),
                                 hedge_pnl_aggregate_override=hedge_pnl_override,
+                                hedge_unrealized_override=hedge_unrealized_override,
                                 funding_override=funding_override,
                             )
                         else:
@@ -1143,6 +1163,7 @@ class GridMakerEngine:
                                 hedge_realized_since_baseline=self._hub.hedge_realized_pnl,
                                 hedge_unrealized_since_baseline=self._hub.hedge_unrealized_pnl,
                                 hedge_pnl_aggregate_override=hedge_pnl_override,
+                                hedge_unrealized_override=hedge_unrealized_override,
                                 funding_override=funding_override,
                             )
                 except Exception as e:

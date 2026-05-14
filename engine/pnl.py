@@ -31,6 +31,15 @@ def compute_operation_pnl(
     # Authoritative hedge_pnl override (used when the venue exposes
     # cumulative trade_pnl since op start — survives uvicorn restarts).
     hedge_pnl_aggregate_override: float | None = None,
+    # Current unrealized PnL on the open position (from Lighter
+    # `position.unrealized_pnl`). When provided AND override is set,
+    # breakdown exposes:
+    #   hedge_pnl_realized   = override - unrealized
+    #   hedge_pnl_unrealized = unrealized
+    #   hedge_pnl            = override (total = realized + unrealized)
+    # User can compare hedge_pnl_unrealized directly against Lighter UI's
+    # "Unrealized PnL" field (spec 2026-05-14).
+    hedge_unrealized_override: float | None = None,
     # Funding override (token0_paid, token1_paid) — caller computed funding
     # for a user-selected window via get_funding_total_since. When provided,
     # bypasses op.funding_paid_token0/1 from the DB.
@@ -183,6 +192,19 @@ def compute_operation_pnl(
         "hedge_pnl": hedge_pnl,
         "hedge_pnl_token0": hedge_pnl_t0,
         "hedge_pnl_token1": hedge_pnl_t1,
+        # Decomposed (spec 2026-05-14): when the venue provides current
+        # position's unrealized PnL, split hedge_pnl into realized + unreal
+        # so dashboard can show "what's closed" vs "what's open".
+        "hedge_pnl_unrealized": (
+            hedge_unrealized_override
+            if hedge_unrealized_override is not None
+            else None
+        ),
+        "hedge_pnl_realized": (
+            (hedge_pnl - hedge_unrealized_override)
+            if hedge_unrealized_override is not None
+            else None
+        ),
         "funding": funding,
         "funding_token0": funding_t0,
         "funding_token1": funding_t1,
@@ -191,15 +213,21 @@ def compute_operation_pnl(
         "perp_fees_paid_token1": -perp_fees_t1,
         "bootstrap_slippage": -op.bootstrap_slippage,
     }
-    # net_pnl sums only the AGGREGATE fields (not per-leg, to avoid double-counting).
-    # Exclude pool_dollar (alias duplicate of il_natural), baseline_deposit_usd
-    # and pnl_window_since_ts (both metadata, can be None — not P&L deltas).
+    # net_pnl sums only the AGGREGATE fields (not per-leg, not duplicates).
+    # Excludes:
+    #   - il_natural: now SEPARATE from pool_dollar (technical IL metric)
+    #   - hedge_pnl_unrealized/realized: decomposition of hedge_pnl, would
+    #     double-count if summed alongside hedge_pnl.
+    #   - baseline_deposit_usd, pnl_window_since_ts: metadata (sometimes None)
     _excluded_from_net = {
-        "pool_dollar", "baseline_deposit_usd", "pnl_window_since_ts",
+        "baseline_deposit_usd", "pnl_window_since_ts",
+        "il_natural",  # not a separate P&L line — pool_dollar is the canonical
+        "hedge_pnl_unrealized", "hedge_pnl_realized",  # decomposition of hedge_pnl
     }
     breakdown["net_pnl"] = sum(
         v for k, v in breakdown.items()
         if not (k.endswith("_token0") or k.endswith("_token1"))
         and k not in _excluded_from_net
+        and v is not None  # None values (e.g., unrealized when no override) skip
     )
     return breakdown
