@@ -1499,13 +1499,39 @@ class LighterAdapter(ExchangeAdapter):
         return []
 
     async def get_open_orders_cloids(self, symbol: str) -> list[str]:
+        """List cloids of currently OPEN orders (limit + stop) on this market.
+
+        Lighter requires an auth token for account-scoped endpoints (returns
+        empty without it, which previously made the reconciler think every
+        live stop order was "lost" and mark them cancelled in DB).
+        Token TTL is 10 min and we regenerate per call.
+        """
         meta = self._market_meta_or_raise(symbol)
+        if self._signer is None:
+            return []
+        try:
+            from lighter import SignerClient as _SignerClient
+            token, err = self._signer.create_auth_token_with_expiry(
+                deadline=_SignerClient.DEFAULT_10_MIN_AUTH_EXPIRY,
+            )
+            if err is not None:
+                logger.warning(
+                    f"get_open_orders_cloids: auth token error: {err}"
+                )
+                return []
+        except Exception as e:
+            logger.warning(
+                f"get_open_orders_cloids: auth token raised: {e}"
+            )
+            return []
         try:
             resp = await self._order_api.account_active_orders(
                 account_index=self._account_index,
                 market_id=meta.market_index,
+                auth=token,
             )
-        except Exception:
+        except Exception as e:
+            logger.warning(f"get_open_orders_cloids HTTP failed: {e}")
             return []
         orders = getattr(resp, "orders", None) or []
         return [str(o.client_order_index) for o in orders]
