@@ -21,6 +21,8 @@ async def test_maintain_grid_caps_at_max_open_orders_centered_on_tick_now():
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
     engine._settings.grid_anticipation_buffer = 0.0
+    engine._settings.max_open_orders = 16
+    engine._settings.min_rebalance_notional_usd = 1.0
     engine._settings.predictive_grid_v2 = True
     engine._settings.dydx_symbol_token0 = "ARB-USD"
     engine._settings.token0_decimals = 18
@@ -95,6 +97,8 @@ async def test_maintain_grid_applies_anticipation_buffer_to_triggers():
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
     engine._settings.grid_anticipation_buffer = 0.00005
+    engine._settings.max_open_orders = 16
+    engine._settings.min_rebalance_notional_usd = 1.0
     engine._settings.predictive_grid_v2 = True
     engine._settings.dydx_symbol_token0 = "ARB-USD"
     engine._settings.token0_decimals = 18
@@ -173,6 +177,8 @@ async def test_maintain_grid_scales_raw_L_by_decimal_factor_and_share():
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
     engine._settings.grid_anticipation_buffer = 0.0
+    engine._settings.max_open_orders = 16
+    engine._settings.min_rebalance_notional_usd = 1.0
     engine._settings.predictive_grid_v2 = True
     engine._settings.dydx_symbol_token0 = "ARB-USD"
     engine._settings.token0_decimals = 18
@@ -253,6 +259,8 @@ async def test_maintain_grid_uses_real_pool_ticks_not_log_of_raw_price():
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
     engine._settings.grid_anticipation_buffer = 0.0
+    engine._settings.max_open_orders = 16
+    engine._settings.min_rebalance_notional_usd = 1.0
     engine._settings.predictive_grid_v2 = True
     engine._settings.dydx_symbol_token0 = "ARB-USD"
     engine._settings.token0_decimals = 18
@@ -318,6 +326,8 @@ async def test_maintain_grid_no_op_when_flag_disabled():
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
     engine._settings.grid_anticipation_buffer = 0.0
+    engine._settings.max_open_orders = 16
+    engine._settings.min_rebalance_notional_usd = 1.0
     engine._settings.predictive_grid_v2 = False
     engine._exchange = AsyncMock()
     # _maintain_grid existe e é safe-no-op
@@ -341,6 +351,8 @@ async def test_maintain_grid_rebuilds_when_no_grid_posted():
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
     engine._settings.grid_anticipation_buffer = 0.0
+    engine._settings.max_open_orders = 16
+    engine._settings.min_rebalance_notional_usd = 1.0
     engine._settings.predictive_grid_v2 = True
     engine._settings.dydx_symbol_token0 = "ARB-USD"
     engine._settings.token0_decimals = 18
@@ -402,7 +414,12 @@ async def test_maintain_grid_no_op_when_signature_unchanged():
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
     engine._settings.grid_anticipation_buffer = 0.0
+    engine._settings.max_open_orders = 16
+    engine._settings.min_rebalance_notional_usd = 1.0
     engine._settings.predictive_grid_v2 = True
+    engine._settings.token0_decimals = 18
+    engine._settings.token1_decimals = 6
+    engine._settings.dydx_symbol_token0 = "ARB-USD"
     engine._exchange = AsyncMock()
     engine._db = AsyncMock()
     engine._hub = MagicMock()
@@ -442,6 +459,8 @@ async def test_maintain_grid_no_op_when_cache_cold():
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
     engine._settings.grid_anticipation_buffer = 0.0
+    engine._settings.max_open_orders = 16
+    engine._settings.min_rebalance_notional_usd = 1.0
     engine._settings.predictive_grid_v2 = True
     engine._exchange = AsyncMock()
 
@@ -463,6 +482,8 @@ async def test_on_grid_fill_no_op_when_flag_disabled():
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
     engine._settings.grid_anticipation_buffer = 0.0
+    engine._settings.max_open_orders = 16
+    engine._settings.min_rebalance_notional_usd = 1.0
     engine._settings.predictive_grid_v2 = False
     engine._exchange = AsyncMock()
     engine._db = AsyncMock()
@@ -474,127 +495,138 @@ async def test_on_grid_fill_no_op_when_flag_disabled():
 
 
 @pytest.mark.asyncio
-async def test_on_grid_fill_no_op_when_cloid_not_a_grid_stop():
-    """Se o cloid nao corresponde a uma stop order da grade no DB, skipa."""
+def _trailing_engine(side: str, *, live_orders: list[dict],
+                     sig=(int(1e15), -299500, -292500), buffer=0.0):
+    """Helper: build a GridMakerEngine pre-wired for _on_grid_fill trailing tests."""
     from engine import GridMakerEngine
     engine = GridMakerEngine.__new__(GridMakerEngine)
     engine._settings = MagicMock()
-    engine._settings.grid_anticipation_buffer = 0.0
-    engine._settings.predictive_grid_v2 = True
-    engine._exchange = AsyncMock()
-    engine._db = AsyncMock()
-    # DB retorna None ou row sem is_stop_order=1 -> nao e da grade
-    engine._db.get_grid_order = AsyncMock(return_value=None)
-
-    await engine._on_grid_fill(
-        cloid=42, fill_price=0.135, fill_size=3.5, side="sell",
-    )
-    engine._exchange.place_stop_market.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_on_grid_fill_posts_next_tick_level_for_sell():
-    """Sell fillou em tick T -> posta novo sell em tick T - tick_spacing (mais abaixo)."""
-    from engine import GridMakerEngine
-
-    engine = GridMakerEngine.__new__(GridMakerEngine)
-    engine._settings = MagicMock()
-    engine._settings.grid_anticipation_buffer = 0.0
+    engine._settings.grid_anticipation_buffer = buffer
+    engine._settings.max_open_orders = 16
+    engine._settings.min_rebalance_notional_usd = 1.0
     engine._settings.predictive_grid_v2 = True
     engine._settings.dydx_symbol_token0 = "ARB-USD"
     engine._settings.token0_decimals = 18
     engine._settings.token1_decimals = 6
     engine._settings.uniswap_v3_pool_fee = 500  # spacing 10
     engine._exchange = AsyncMock()
+    engine._exchange.place_stop_market = AsyncMock()
+    engine._exchange.cancel_stop_order = AsyncMock()
+    engine._exchange.get_open_orders = AsyncMock(return_value=live_orders)
     engine._db = AsyncMock()
     engine._db.mark_grid_order_filled = AsyncMock()
     engine._db.insert_grid_order = AsyncMock()
-    engine._db.get_grid_order = AsyncMock(return_value={
-        "cloid": 42, "side": "sell", "target_price": 0.135, "size": 3.5,
-        "is_stop_order": 1, "trigger_price": 0.135,
-    })
+    engine._db.mark_grid_order_cancelled = AsyncMock()
+    engine._db.get_grid_order = AsyncMock(return_value={"placed_at": 0})
     engine._hub = MagicMock()
     engine._hub.current_operation_id = 7
-    engine._next_cloid_for_leg = MagicMock(return_value=43)
-
-    # Signature ativo. NOW stored as (L, tick_lower_main, tick_upper_main) —
-    # ticks raw V3 ints. For ARB-USDC.e (d0=18, d1=6), price $0.135 maps
-    # to tick ≈ -296461, well inside [-299500, -292500].
-    engine._posted_grid_signature = (int(1e15), -299500, -292500)
-
-    await engine._on_grid_fill(
-        cloid=42, fill_price=0.135, fill_size=3.5, side="sell",
-    )
-
-    engine._exchange.place_stop_market.assert_called_once()
-    kwargs = engine._exchange.place_stop_market.call_args.kwargs
-    assert kwargs["side"] == "sell"
-    assert kwargs["size"] == 3.5
-    assert kwargs["trigger_price"] < 0.135
+    engine._next_cloid_for_leg = MagicMock(side_effect=[44, 45, 46, 47])
+    engine._posted_grid_signature = sig
+    return engine
 
 
 @pytest.mark.asyncio
-async def test_on_grid_fill_posts_next_tick_level_for_buy():
-    """Buy fillou em tick T -> posta novo buy em tick T + tick_spacing (mais acima)."""
-    from engine import GridMakerEngine
+async def test_on_grid_fill_buy_extends_buy_band_and_trails_sell_band_up():
+    """User spec 2026-05-14: depois de BUY fillar, a banda inteira anda pra cima.
+    - Extend buy: nova BUY 1 tick acima do highest existing buy.
+    - Trail sell: cancela lowest sell, nova SELL 1 tick acima do highest sell.
+    """
+    # Setup: 7 buys (one already filled) + 8 sells alive on Lighter
+    live_buys = [
+        {"side":"buy","cloid":f"b{i}","order_index":100+i,"trigger_price":0.13200+i*0.00013,"size":3.0,"type":"stop-loss"}
+        for i in range(7)
+    ]
+    live_sells = [
+        {"side":"sell","cloid":f"s{i}","order_index":200+i,"trigger_price":0.13100-i*0.00013,"size":3.0,"type":"stop-loss"}
+        for i in range(8)
+    ]
+    live = live_buys + live_sells
+    engine = _trailing_engine("buy", live_orders=live)
 
-    engine = GridMakerEngine.__new__(GridMakerEngine)
-    engine._settings = MagicMock()
-    engine._settings.grid_anticipation_buffer = 0.0
-    engine._settings.predictive_grid_v2 = True
-    engine._settings.dydx_symbol_token0 = "ARB-USD"
-    engine._settings.token0_decimals = 18
-    engine._settings.token1_decimals = 6
-    engine._settings.uniswap_v3_pool_fee = 500
-    engine._exchange = AsyncMock()
-    engine._db = AsyncMock()
-    engine._db.mark_grid_order_filled = AsyncMock()
-    engine._db.insert_grid_order = AsyncMock()
-    engine._db.get_grid_order = AsyncMock(return_value={
-        "cloid": 43, "side": "buy", "target_price": 0.145, "size": 3.5,
-        "is_stop_order": 1, "trigger_price": 0.145,
-    })
-    engine._hub = MagicMock()
-    engine._hub.current_operation_id = 7
-    engine._next_cloid_for_leg = MagicMock(return_value=44)
-    # Signature stored as (L, tick_lower_main, tick_upper_main).
-    engine._posted_grid_signature = (int(1e15), -299500, -292500)
+    await engine._on_grid_fill(cloid=42, fill_price=0.132, fill_size=3.0, side="buy")
 
-    await engine._on_grid_fill(
-        cloid=43, fill_price=0.145, fill_size=3.5, side="buy",
-    )
-
-    kwargs = engine._exchange.place_stop_market.call_args.kwargs
-    assert kwargs["side"] == "buy"
-    assert kwargs["trigger_price"] > 0.145
+    # Expect 2 new place_stop_market calls (one buy, one sell)
+    calls = engine._exchange.place_stop_market.call_args_list
+    sides = [c.kwargs["side"] for c in calls]
+    assert sides.count("buy") == 1
+    assert sides.count("sell") == 1
+    # Buy posted ABOVE existing highest buy (= 0.13200 + 6*0.00013 ≈ 0.13278)
+    new_buy = next(c for c in calls if c.kwargs["side"] == "buy")
+    highest_buy = max(b["trigger_price"] for b in live_buys)
+    assert new_buy.kwargs["trigger_price"] > highest_buy
+    # Sell posted ABOVE existing highest sell (= 0.13100 = closest-to-mid)
+    new_sell = next(c for c in calls if c.kwargs["side"] == "sell")
+    highest_sell = max(s["trigger_price"] for s in live_sells)
+    assert new_sell.kwargs["trigger_price"] > highest_sell
+    # Lowest sell cancelled
+    lowest_sell = min(live_sells, key=lambda o: o["trigger_price"])
+    engine._exchange.cancel_stop_order.assert_called_once()
+    cc = engine._exchange.cancel_stop_order.call_args
+    assert cc.kwargs["order_index"] == lowest_sell["order_index"]
 
 
 @pytest.mark.asyncio
-async def test_on_grid_fill_skips_when_next_tick_outside_range():
-    """Se proximo tick cairia fora do range posted, nao posta (espera rebuild)."""
-    from engine import GridMakerEngine
+async def test_on_grid_fill_sell_extends_sell_band_and_trails_buy_band_down():
+    """Symmetric: SELL fills → extend sell band DOWN + trail buy band DOWN."""
+    live_buys = [
+        {"side":"buy","cloid":f"b{i}","order_index":100+i,"trigger_price":0.13200+i*0.00013,"size":3.0,"type":"stop-loss"}
+        for i in range(8)
+    ]
+    live_sells = [
+        {"side":"sell","cloid":f"s{i}","order_index":200+i,"trigger_price":0.13100-i*0.00013,"size":3.0,"type":"stop-loss"}
+        for i in range(7)
+    ]
+    live = live_buys + live_sells
+    engine = _trailing_engine("sell", live_orders=live)
 
-    engine = GridMakerEngine.__new__(GridMakerEngine)
-    engine._settings = MagicMock()
-    engine._settings.grid_anticipation_buffer = 0.0
-    engine._settings.predictive_grid_v2 = True
-    engine._settings.dydx_symbol_token0 = "ARB-USD"
-    engine._settings.token0_decimals = 18
-    engine._settings.token1_decimals = 6
-    engine._settings.uniswap_v3_pool_fee = 500
-    engine._exchange = AsyncMock()
-    engine._db = AsyncMock()
-    engine._db.mark_grid_order_filled = AsyncMock()
-    # Filled price 0.142 maps to tick ≈ -295995 (very close to upper
-    # edge of signature range [-296000, -295000]); next_tick for SELL =
-    # -296005, which falls BELOW tick_lower → out of range, must skip.
-    engine._db.get_grid_order = AsyncMock(return_value={
-        "cloid": 42, "side": "sell", "target_price": 0.142, "size": 3.5,
-        "is_stop_order": 1, "trigger_price": 0.142,
-    })
-    engine._hub = MagicMock()
-    engine._next_cloid_for_leg = MagicMock()
-    engine._posted_grid_signature = (int(1e15), -296000, -295000)
+    await engine._on_grid_fill(cloid=42, fill_price=0.131, fill_size=3.0, side="sell")
+
+    calls = engine._exchange.place_stop_market.call_args_list
+    sides = [c.kwargs["side"] for c in calls]
+    assert sides.count("sell") == 1
+    assert sides.count("buy") == 1
+    # Sell posted BELOW lowest existing sell
+    new_sell = next(c for c in calls if c.kwargs["side"] == "sell")
+    lowest_sell = min(s["trigger_price"] for s in live_sells)
+    assert new_sell.kwargs["trigger_price"] < lowest_sell
+    # Buy posted BELOW lowest existing buy
+    new_buy = next(c for c in calls if c.kwargs["side"] == "buy")
+    lowest_buy = min(b["trigger_price"] for b in live_buys)
+    assert new_buy.kwargs["trigger_price"] < lowest_buy
+    # Highest buy cancelled
+    highest_buy = max(live_buys, key=lambda o: o["trigger_price"])
+    engine._exchange.cancel_stop_order.assert_called_once()
+    cc = engine._exchange.cancel_stop_order.call_args
+    assert cc.kwargs["order_index"] == highest_buy["order_index"]
+
+
+@pytest.mark.asyncio
+async def test_on_grid_fill_skips_post_when_new_tick_outside_beefy_range():
+    """Trailing pode tentar postar fora do range Beefy ativo. Nesse caso,
+    skipa o post mas continua tentando a outra ação. _maintain_grid full
+    rebuild vai recompor quando Beefy rebalançar."""
+    # Tight signature range; highest buy already AT tick_upper edge
+    sig = (int(1e15), -296000, -295000)  # narrow Beefy range
+    live_buys = [
+        {"side":"buy","cloid":"b0","order_index":100,"trigger_price":0.14185,"size":3.0,"type":"stop-loss"},  # near upper edge
+    ]
+    live_sells = [
+        {"side":"sell","cloid":"s0","order_index":200,"trigger_price":0.13800,"size":3.0,"type":"stop-loss"},
+    ]
+    engine = _trailing_engine("buy", live_orders=live_buys + live_sells, sig=sig)
+
+    await engine._on_grid_fill(cloid=42, fill_price=0.142, fill_size=3.0, side="buy")
+
+    # Extending the buy band upward would post beyond tick_upper=-295000 → skip.
+    # Trailing sell band upward also lands outside range → also skipped.
+    # Net: zero new posts.
+    calls = engine._exchange.place_stop_market.call_args_list
+    posts_outside = [
+        c for c in calls
+        # Both sides would be above tick_upper ≈ -295000 (human ~$0.1505)
+        if c.kwargs.get("trigger_price", 0) > 0.1505
+    ]
+    assert posts_outside == [], f"unexpected post outside range: {posts_outside}"
 
     await engine._on_grid_fill(
         cloid=42, fill_price=0.142, fill_size=3.5, side="sell",

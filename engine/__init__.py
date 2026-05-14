@@ -835,6 +835,16 @@ class GridMakerEngine:
         self._vault_readers_cache = (
             selected, pool_reader, beefy_reader, pair_settings, dec0, dec1,
         )
+        # The Reconciler instance was built with a reference to the OLD
+        # `self._settings` (at engine construction time). After a pair
+        # switch via picker, `self._settings` points to a new object but
+        # the reconciler still holds the old one — and queries the WRONG
+        # market (e.g., ETH-USD market_id=0 when active is ARB-USD=50),
+        # which always returns empty active orders and false-cancels every
+        # live stop in the DB. Resync after each rebuild.
+        # Validated live 2026-05-14 op #29 smoke.
+        if self._reconciler is not None:
+            self._reconciler._settings = pair_settings
         # Register the active perp symbols with the exchange adapter so
         # its WS pump subscribes to ONLY those order books. Subscribing
         # to all 170+ Lighter markets at once trips the server's "Too
@@ -1201,6 +1211,15 @@ class GridMakerEngine:
                     beefy_pos=beefy_pos, p_now=p_now,
                     oracle_prices=oracle_prices,
                 )
+                # Drift correction (user spec 2026-05-14): mesmo com a grade
+                # ativa, comparar nossa posição short atual com o predicted
+                # pela V3. Se |diff_usd| > $1, dispara taker pra corrigir
+                # (não mexe nas stops triggers, só ajusta o overall). Cobre
+                # gaps causados por rebalances, fills perdidos, etc.
+                await self._maybe_correct_drift(
+                    beefy_pos=beefy_pos, p_now=p_now,
+                    positions=positions, symbols=symbols, targets=targets,
+                )
             else:
                 # Legacy reactive taker chase (default até cutover Phase D).
                 for sym in symbols:
@@ -1300,6 +1319,31 @@ class GridMakerEngine:
 
         cache = self._hedge_model._cache
 
+        # Out-of-range guard (user spec 2026-05-14): se o preço atual está
+        # fora do range Beefy, "para de mexer" — cancela grade ativa e fica
+        # idle. Próximo rebalance Beefy vai reposicionar e o engine reinicia
+        # a grade quando o preço voltar pro range novo.
+        decimals0 = self._settings.token0_decimals
+        decimals1 = self._settings.token1_decimals
+        p_a_human = tick_to_human_price(
+            tick=cache.tick_lower_main, decimals0=decimals0, decimals1=decimals1,
+        )
+        p_b_human = tick_to_human_price(
+            tick=cache.tick_upper_main, decimals0=decimals0, decimals1=decimals1,
+        )
+        if not (p_a_human <= p_now <= p_b_human):
+            # Fora do range. Cancela grade ativa se existir e sai.
+            if getattr(self, "_posted_grid_signature", None) is not None:
+                try:
+                    await self._exchange.cancel_all_stops(
+                        symbol=self._settings.dydx_symbol_token0,
+                    )
+                except Exception as e:
+                    logger.warning(f"out-of-range cancel_all_stops failed: {e}")
+                self._posted_grid_signature = None
+                metrics.grid_levels_active.set(0)
+            return
+
         # Signature atual da geometria (L + ticks bounds). Usar ticks
         # (ints) em vez de p_a/p_b (raw V3 floats) pra comparação exata e
         # pra `_on_grid_fill` poder extrair ticks direto da signature.
@@ -1392,20 +1436,22 @@ class GridMakerEngine:
         )
 
         # Lighter rejeita ordens além do `maximum pending order count per market`
-        # (validado live 2026-05-13: limit = 16 stops por market em ARB-USD,
-        # code=21720). Pra grade larga (300+ levels) precisamos limitar e
-        # priorizar os levels mais próximos do tick_now (onde fills acontecem
-        # primeiro). Sort por distância ascendente, take os N primeiros.
-        # `max_open_orders` config (default 200) é o cap soft global —
-        # cabe usar pra esse propósito.
-        max_orders = int(getattr(self._settings, "max_open_orders", 200) or 200)
-        if len(new_grid) > max_orders:
-            tick_now_price = tick_to_human_price(
-                tick=tick_now, decimals0=decimals0, decimals1=decimals1,
-            )
-            new_grid = sorted(
-                new_grid, key=lambda lv: abs(lv.price - tick_now_price),
-            )[:max_orders]
+        # (validado 2026-05-13: limit = 16 stops por market em ARB-USD,
+        # code=21720). Distribuir simétrico em torno do tick_now:
+        # `max_open_orders // 2` sells (mais próximos abaixo) + idem buys
+        # (mais próximos acima). Garante banda balanceada que pode trailar.
+        # User spec 2026-05-14: 8+8 centrado em tick_now.
+        max_orders = int(getattr(self._settings, "max_open_orders", 16) or 16)
+        per_side = max_orders // 2
+        sells = sorted(
+            [lv for lv in new_grid if lv.side == "sell"],
+            key=lambda lv: -lv.price,  # descending = closest-to-tick_now first
+        )[:per_side]
+        buys = sorted(
+            [lv for lv in new_grid if lv.side == "buy"],
+            key=lambda lv: lv.price,  # ascending = closest-to-tick_now first
+        )[:per_side]
+        new_grid = sells + buys
 
         # Post each level via SL_MARKET (no $10 min — viable pra grade densa
         # baixo capital). Anticipation buffer ajusta trigger pra capturar
@@ -1469,113 +1515,223 @@ class GridMakerEngine:
     async def _on_grid_fill(
         self, *, cloid: int, fill_price: float, fill_size: float, side: str,
     ) -> None:
-        """Chamado quando uma ordem da grade predictive v2 fillha.
+        """Trailing grid handler — user spec 2026-05-14.
 
-        Posta um novo level no proximo tick adjacente (away from mid):
-          - Sell fillou em tick T -> proximo sell em T - tick_spacing
-          - Buy  fillou em tick T -> proximo buy  em T + tick_spacing
+        Quando uma ordem da grade fillha, a banda inteira "anda junto" com o
+        mercado pra manter sempre 8 ordens acima + 8 abaixo de tick_now:
 
-        Mantem densidade constante da grade apos fills sucessivos.
+        BUY fillou (mercado subiu):
+          1. Estende buy band: posta nova BUY 1 tick acima do highest_buy
+          2. Trail sell band: cancela lowest_sell + posta nova SELL 1 tick acima do highest_sell
+          (Total continua 16: 7 buys → 8, 8 sells → 7 → 8)
 
-        No-op se PREDICTIVE_GRID_V2 desligado OU se cloid nao corresponde
-        a uma stop order da grade (ex: ordem manual ou legacy).
+        SELL fillou (mercado caiu): simétrico.
+          1. Estende sell band: posta nova SELL 1 tick abaixo do lowest_sell
+          2. Trail buy band: cancela highest_buy + posta nova BUY 1 tick abaixo do lowest_buy
+
+        Out-of-range: se o tick novo cairia fora do range Beefy, skip aquele
+        post (mantém grade incompleta até _maintain_grid full rebuild).
+
+        Best-effort com retry: cancel/post falha → loga + segue. Próxima fill
+        ou o reconciler eventualmente recupera.
         """
         if not self._settings.predictive_grid_v2:
             return
 
-        # Lookup do level fillado
-        row = await self._db.get_grid_order(cloid)
-        if row is None or not row.get("is_stop_order"):
-            return
-
         metrics.grid_stops_filled_total.inc()
-        # Fill latency: tempo entre placed_at e fill atual (smoke critério Phase D)
-        try:
-            placed_at = float(row.get("placed_at") or 0)
-            if placed_at > 0:
-                latency_ms = (time.time() - placed_at) * 1000.0
-                metrics.grid_fill_latency_ms.observe(latency_ms)
-        except Exception:
-            pass
-
         gh = self._hub.grid_health_metrics
         gh["stops_filled_total"] = gh.get("stops_filled_total", 0) + 1
 
-        # Marca como filled no DB (best-effort)
+        # Latency tracking (best-effort — DB tem o placed_at)
         try:
+            row = await self._db.get_grid_order(cloid)
+            if row and row.get("placed_at"):
+                latency_ms = (time.time() - float(row["placed_at"])) * 1000.0
+                metrics.grid_fill_latency_ms.observe(latency_ms)
             await self._db.mark_grid_order_filled(cloid, int(time.time()))
         except Exception as e:
-            logger.warning(f"mark_grid_order_filled failed: {e}")
+            logger.warning(f"_on_grid_fill DB ops failed: {e}")
 
-        # Calcula proximo tick adjacente
+        # Setup math
         from math import log, floor
         from engine.curve import tick_to_human_price
 
         decimals0 = self._settings.token0_decimals
         decimals1 = self._settings.token1_decimals
         decimal_factor = 10 ** (decimals0 - decimals1)
-
-        filled_price = row["target_price"]
-        # math.floor pra ticks negativos (ver comentário em _maintain_grid)
-        filled_tick = floor(log(filled_price / decimal_factor) / log(1.0001))
-
         fee_tier = self._settings.uniswap_v3_pool_fee
         tick_spacing_map = {500: 10, 3000: 60, 10000: 200}
         tick_spacing = tick_spacing_map.get(fee_tier, 10)
-
-        if side == "sell":
-            next_tick = filled_tick - tick_spacing  # mais abaixo
-        else:
-            next_tick = filled_tick + tick_spacing  # mais acima
-
-        # Verifica que proximo tick ainda esta dentro do range posted.
+        buffer = float(getattr(self._settings, "grid_anticipation_buffer", 0.0) or 0.0)
+        price_decimals = 5  # ARB-USD Lighter (TODO: source from market meta)
+        size_decimals = 1
+        symbol = self._settings.dydx_symbol_token0
         sig = getattr(self, "_posted_grid_signature", None)
         if sig is None:
-            return  # nada posted; _maintain_grid vai cuidar na proxima iter
+            return  # grade não posted ainda; _maintain_grid vai fazer initial
+        _L, tick_lower_range, tick_upper_range = sig
 
-        # Signature stores raw V3 ticks (ints) directly — see _maintain_grid.
-        _L, tick_lower, tick_upper = sig
-
-        if not (tick_lower <= next_tick <= tick_upper):
-            return  # fora do range; deixa _maintain_grid lidar na proxima iter
-
-        # Compute price do proximo tick (round pro tick Lighter)
-        new_price = round(
-            tick_to_human_price(
-                tick=next_tick, decimals0=decimals0, decimals1=decimals1,
-            ),
-            5,  # ARB-USD price_decimals=5
-        )
-
-        # Aplicar anticipation buffer (mesmo deslocamento simétrico do
-        # _maintain_grid — SELL trigger acima do tick, BUY abaixo).
-        buffer = float(getattr(self._settings, "grid_anticipation_buffer", 0.0) or 0.0)
-        if side == "sell":
-            new_trigger = new_price + buffer
-        else:  # "buy"
-            new_trigger = new_price - buffer
-
-        # Post novo stop_market (size = mesmo do filled — aproximacao MVP)
-        symbol = self._settings.dydx_symbol_token0
-        new_cloid = self._next_cloid_for_leg(symbol)
+        # Query estado live na Lighter (autoritativo — DB pode estar dessincronizado)
         try:
-            await self._exchange.place_stop_market(
-                symbol=symbol, side=side, size=row["size"],
-                trigger_price=new_trigger, cloid_int=new_cloid,
+            live_orders = await self._exchange.get_open_orders(symbol)
+        except Exception as e:
+            logger.warning(f"_on_grid_fill: get_open_orders failed: {e}")
+            return
+        live_sells = sorted(
+            [o for o in live_orders if o["side"] == "sell"],
+            key=lambda o: o["trigger_price"],
+        )  # ascending price; sells[0] = lowest, sells[-1] = highest
+        live_buys = sorted(
+            [o for o in live_orders if o["side"] == "buy"],
+            key=lambda o: o["trigger_price"],
+        )  # ascending price; buys[0] = lowest, buys[-1] = highest
+
+        def price_to_tick(p_human: float) -> int:
+            return floor(log(p_human / decimal_factor) / log(1.0001))
+
+        def tick_in_range(t: int) -> bool:
+            return tick_lower_range <= t <= tick_upper_range
+
+        async def post_new(*, new_side: str, new_tick: int, size: float):
+            """Posta um stop_market novo no `new_tick`. No-op se fora do range."""
+            if not tick_in_range(new_tick):
+                return
+            new_price = round(
+                tick_to_human_price(
+                    tick=new_tick, decimals0=decimals0, decimals1=decimals1,
+                ), price_decimals,
             )
-            metrics.grid_stops_placed_total.inc()
-            metrics.grid_rebuild_total.labels(reason="fill").inc()
+            new_trigger = new_price + buffer if new_side == "sell" else new_price - buffer
+            new_cloid_int = self._next_cloid_for_leg(symbol)
             try:
-                await self._db.insert_grid_order(
-                    cloid=str(new_cloid), side=side, target_price=new_price,
-                    size=row["size"], placed_at=time.time(),
-                    trigger_price=new_trigger, is_stop_order=1,
-                    operation_id=self._hub.current_operation_id,
+                await self._exchange.place_stop_market(
+                    symbol=symbol, side=new_side, size=size,
+                    trigger_price=new_trigger, cloid_int=new_cloid_int,
+                )
+                metrics.grid_stops_placed_total.inc()
+                try:
+                    await self._db.insert_grid_order(
+                        cloid=str(new_cloid_int), side=new_side,
+                        target_price=new_price, size=size, placed_at=time.time(),
+                        trigger_price=new_trigger, is_stop_order=1,
+                        operation_id=self._hub.current_operation_id,
+                    )
+                except Exception as e:
+                    logger.warning(f"trailing db insert failed: {e}")
+            except Exception as e:
+                logger.warning(f"trailing place_stop_market failed @{new_trigger}: {e}")
+
+        async def cancel_one(order_index: int, order_cloid: str):
+            try:
+                await self._exchange.cancel_stop_order(
+                    symbol=symbol, order_index=order_index,
+                )
+                metrics.grid_stops_cancelled_total.inc()
+                try:
+                    await self._db.mark_grid_order_cancelled(order_cloid, time.time())
+                except Exception as e:
+                    logger.warning(f"trailing db cancel mark failed: {e}")
+            except Exception as e:
+                logger.warning(f"trailing cancel_stop_order failed: {e}")
+
+        # Trail
+        default_size = float(fill_size) if fill_size else 1.0
+        if side == "buy":
+            # 1) Extend buy band UP: post new buy at highest_buy + tick_spacing
+            if live_buys:
+                highest_buy_tick = price_to_tick(live_buys[-1]["trigger_price"])
+                await post_new(
+                    new_side="buy", new_tick=highest_buy_tick + tick_spacing,
+                    size=default_size,
+                )
+            # 2) Shift sell band UP: cancel lowest sell + post new sell at highest_sell + tick_spacing
+            if live_sells:
+                lowest_sell = live_sells[0]
+                highest_sell_tick = price_to_tick(live_sells[-1]["trigger_price"])
+                await cancel_one(lowest_sell["order_index"], lowest_sell["cloid"])
+                await post_new(
+                    new_side="sell", new_tick=highest_sell_tick + tick_spacing,
+                    size=default_size,
+                )
+        else:  # sell
+            # 1) Extend sell band DOWN: post new sell at lowest_sell - tick_spacing
+            if live_sells:
+                lowest_sell_tick = price_to_tick(live_sells[0]["trigger_price"])
+                await post_new(
+                    new_side="sell", new_tick=lowest_sell_tick - tick_spacing,
+                    size=default_size,
+                )
+            # 2) Shift buy band DOWN: cancel highest buy + post new buy at lowest_buy - tick_spacing
+            if live_buys:
+                highest_buy = live_buys[-1]
+                lowest_buy_tick = price_to_tick(live_buys[0]["trigger_price"])
+                await cancel_one(highest_buy["order_index"], highest_buy["cloid"])
+                await post_new(
+                    new_side="buy", new_tick=lowest_buy_tick - tick_spacing,
+                    size=default_size,
+                )
+
+        metrics.grid_rebuild_total.labels(reason="fill").inc()
+
+    async def _maybe_correct_drift(
+        self, *, beefy_pos, p_now: float,
+        positions: list, symbols: list[str], targets: dict[str, float],
+    ) -> None:
+        """User spec 2026-05-14: under predictive_grid_v2, mesmo com a grade
+        ativa, comparar posição short atual (Lighter actual) com o predicted
+        pela V3 (`targets`). Se |diff_usd| > min_rebalance_notional_usd
+        (default $0.50), dispara taker pra corrigir o desvio.
+
+        Não mexe nas stops triggers do grid — só compensa rebalances Beefy
+        que aconteceram entre fills, fills perdidos no WS, etc.
+        """
+        threshold_usd = float(
+            getattr(self._settings, "min_rebalance_notional_usd", 1.0) or 1.0
+        )
+        for idx, sym in enumerate(symbols):
+            pos = positions[idx] if idx < len(positions) else None
+            current = abs(pos.size) if pos else 0.0
+            target = float(targets.get(sym, 0.0))
+            ref_price = float(self._hub.dydx_quote_prices.get(sym, 0.0)) if hasattr(self._hub, "dydx_quote_prices") else 0.0
+            if ref_price <= 0:
+                # Fallback: usar p_now pra token0 (USD-pair). Cross-pair seria
+                # diferente per leg, mas v2 atual é single-leg.
+                ref_price = p_now if idx == 0 else 0.0
+            if ref_price <= 0:
+                continue
+            drift_arb = target - current  # quanto adicional short queremos
+            drift_usd = abs(drift_arb) * ref_price
+            if drift_usd < threshold_usd:
+                continue
+            # Direção:
+            #   drift_arb > 0 → precisa MAIS short → SELL drift_arb
+            #   drift_arb < 0 → precisa MENOS short → BUY abs(drift_arb)
+            corr_side = "sell" if drift_arb > 0 else "buy"
+            corr_size = abs(drift_arb)
+            cross_price = ref_price * (0.999 if corr_side == "sell" else 1.001)
+            try:
+                await self._exchange.place_long_term_order(
+                    symbol=sym, side=corr_side, size=corr_size,
+                    price=cross_price,
+                    cloid_int=self._next_cloid_for_leg(sym),
+                    ttl_seconds=60,
+                )
+                metrics.aggressive_corrections_total.inc()
+                try:
+                    await self._db.insert_order_log(
+                        timestamp=time.time(), exchange=self._exchange.name,
+                        action="place", side=corr_side, size=corr_size,
+                        price=cross_price, reason=f"drift_correction_{sym}",
+                        operation_id=self._hub.current_operation_id,
+                    )
+                except Exception:
+                    pass
+                logger.info(
+                    f"drift_correction: {sym} {corr_side} {corr_size:.3f} "
+                    f"(drift=${drift_usd:.2f} target={target:.3f} actual={current:.3f})"
                 )
             except Exception as e:
-                logger.warning(f"db insert_grid_order failed: {e}")
-        except Exception as e:
-            logger.warning(f"_on_grid_fill repost failed: {e}")
+                logger.warning(f"drift_correction taker failed: {e}")
 
     async def _maybe_rebalance_leg(
         self, *, symbol: str, target: float, current: float,
