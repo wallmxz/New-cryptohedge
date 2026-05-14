@@ -1391,17 +1391,28 @@ class GridMakerEngine:
             lighter_size_decimals=1,
         )
 
-        # Post each level
+        # Post each level via SL_MARKET (no $10 min — viable pra grade densa
+        # baixo capital). Anticipation buffer ajusta trigger pra capturar
+        # spread implícito do book Lighter:
+        #   SELL: fires um pouco acima do tick → executa próximo do tick
+        #   BUY:  fires um pouco abaixo do tick → executa próximo do tick
         symbol = self._settings.dydx_symbol_token0
+        buffer = float(getattr(self._settings, "grid_anticipation_buffer", 0.0) or 0.0)
         placed_count = 0
         for lv in new_grid:
             cloid = self._next_cloid_for_leg(symbol)
+            # Aplicar buffer pra antecipação simétrica
+            base_trigger = lv.trigger_price
+            if lv.side == "sell":
+                trigger = base_trigger + buffer
+            else:  # "buy"
+                trigger = base_trigger - buffer
             try:
-                await self._exchange.place_stop_limit_order(
+                await self._exchange.place_stop_market(
                     symbol=symbol,
                     side=lv.side,
                     size=lv.size,
-                    trigger_price=lv.trigger_price,
+                    trigger_price=trigger,
                     cloid_int=cloid,
                 )
                 metrics.grid_stops_placed_total.inc()
@@ -1414,14 +1425,14 @@ class GridMakerEngine:
                         size=lv.size,
                         placed_at=time.time(),
                         operation_id=self._hub.current_operation_id,
-                        trigger_price=lv.trigger_price,
+                        trigger_price=trigger,
                         is_stop_order=1,
                     )
                 except Exception as e:
                     logger.warning(f"db insert_grid_order failed: {e}")
             except Exception as e:
                 logger.warning(
-                    f"place_stop_limit_order failed for level @{lv.price}: {e}",
+                    f"place_stop_market failed for level @{lv.price}: {e}",
                 )
 
         metrics.grid_levels_active.set(placed_count)
@@ -1520,13 +1531,21 @@ class GridMakerEngine:
             5,  # ARB-USD price_decimals=5
         )
 
-        # Post novo stop (size = mesmo do filled — aproximacao MVP)
+        # Aplicar anticipation buffer (mesmo deslocamento simétrico do
+        # _maintain_grid — SELL trigger acima do tick, BUY abaixo).
+        buffer = float(getattr(self._settings, "grid_anticipation_buffer", 0.0) or 0.0)
+        if side == "sell":
+            new_trigger = new_price + buffer
+        else:  # "buy"
+            new_trigger = new_price - buffer
+
+        # Post novo stop_market (size = mesmo do filled — aproximacao MVP)
         symbol = self._settings.dydx_symbol_token0
         new_cloid = self._next_cloid_for_leg(symbol)
         try:
-            await self._exchange.place_stop_limit_order(
+            await self._exchange.place_stop_market(
                 symbol=symbol, side=side, size=row["size"],
-                trigger_price=new_price, cloid_int=new_cloid,
+                trigger_price=new_trigger, cloid_int=new_cloid,
             )
             metrics.grid_stops_placed_total.inc()
             metrics.grid_rebuild_total.labels(reason="fill").inc()
@@ -1534,7 +1553,7 @@ class GridMakerEngine:
                 await self._db.insert_grid_order(
                     cloid=str(new_cloid), side=side, target_price=new_price,
                     size=row["size"], placed_at=time.time(),
-                    trigger_price=new_price, is_stop_order=1,
+                    trigger_price=new_trigger, is_stop_order=1,
                     operation_id=self._hub.current_operation_id,
                 )
             except Exception as e:

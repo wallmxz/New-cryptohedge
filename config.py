@@ -57,8 +57,18 @@ class Settings:
 
     # Feature flag pra ativar o novo predictive grid v2.
     # False (default): mantém path legacy taker chase (_maybe_rebalance_leg).
-    # True: usa _maintain_grid com stop-limit orders alinhadas aos ticks da pool.
+    # True: usa _maintain_grid com stop-market orders alinhadas aos ticks da pool.
     predictive_grid_v2: bool = False
+
+    # Anticipation buffer (em unidades human price) aplicado ao trigger de
+    # cada stop-market do grid v2:
+    #   SELL trigger = tick_price + buffer  (anticipa queda de preço)
+    #   BUY  trigger = tick_price - buffer  (anticipa subida de preço)
+    # Captura o spread implícito do book Lighter (~$0.00005-$0.0002 observado
+    # em ARB-USD) e a latência de input pequena, garantindo execução próxima
+    # ao tick desejado. Default $0.00005 (= 5 Lighter price ticks @
+    # price_decimals=5 pra ARB-USD).
+    grid_anticipation_buffer: float = 0.00005
 
     @property
     def dydx_symbol(self) -> str:
@@ -127,4 +137,7 @@ class Settings:
             predictive_grid_v2=os.environ.get(
                 "PREDICTIVE_GRID_V2", "false",
             ).lower() in ("true", "1", "yes"),
+            grid_anticipation_buffer=float(
+                os.environ.get("GRID_ANTICIPATION_BUFFER", "0.00005"),
+            ),
         )
