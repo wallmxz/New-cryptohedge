@@ -60,3 +60,30 @@ def test_cloid_fits_in_int64():
     engine._cloid_seq = 10_000_000  # exercise high seq values
     c = engine._next_cloid_for_leg("ARB-USD")
     assert 0 <= c < 2**63, f"cloid {c} exceeds int64 range"
+
+
+def test_next_cloid_for_leg_fits_in_int32():
+    """Cloid must fit in unsigned int32 — Lighter SDK truncates
+    client_order_index to 32 bits when sending the SL order. If we
+    let the engine store the untruncated value in _local_grid, the
+    reconciler will never match cloids returned by get_open_orders.
+    Regression for the 2026-05-15 bug where _local_grid kept 64-bit
+    cloids (run_id<<32 | leg<<24 | seq) while Lighter returned only
+    the low 32 bits, causing _safety_reconcile to treat every live
+    order as orphan + every local cloid as filled.
+    """
+    engine = _make_engine()
+    engine._cloid_seq = 10_000_000  # exercise high seq values
+    for _ in range(100):
+        c = engine._next_cloid_for_leg("ARB-USD")
+        assert 0 <= c < 2**32, f"cloid {c} ({c:#x}) does not fit in uint32"
+
+
+def test_next_cloid_fits_in_int32():
+    """Same invariant for the level-based `_next_cloid` used by non-grid
+    paths (legacy rebalance taker, ttl orders)."""
+    engine = _make_engine()
+    engine._cloid_seq = 10_000_000
+    for i in range(100):
+        c = engine._next_cloid(level_idx=i % 16)
+        assert 0 <= c < 2**32, f"_next_cloid {c} ({c:#x}) does not fit in uint32"

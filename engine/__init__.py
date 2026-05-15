@@ -2059,13 +2059,15 @@ class GridMakerEngine:
         """Generate a cloid scoped per leg so concurrent fires from different
         legs never collide.
 
-        Layout (64 bits): run_id (32) | leg_byte (8) | seq (24).
-        See `_next_cloid` for the rationale on the 24-bit seq window.
+        Layout (32 bits): leg_byte (8) | seq (24). The Lighter SDK truncates
+        client_order_index to 32 bits on the wire; storing more than that in
+        `_local_grid` makes the reconciler unable to match the values
+        returned by `get_open_orders`. See spec
+        `docs/superpowers/specs/2026-05-15-cloid-32bit-truncation-fix-design.md`.
         """
         self._cloid_seq += 1
         leg_byte = 0xA0 if symbol == self._settings.dydx_symbol_token0 else 0xA1
         return (
-            ((self._run_id & 0xFFFFFFFF) << 32) |
             (leg_byte << 24) |
             (self._cloid_seq & 0xFFFFFF)
         )
