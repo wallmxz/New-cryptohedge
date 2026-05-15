@@ -480,3 +480,81 @@ async def test_engine_stop_cancels_both_tasks():
     # Both should be cancelled (or done)
     assert main_task.cancelled() or main_task.done()
     assert grid_task.cancelled() or grid_task.done()
+
+
+@pytest.mark.asyncio
+async def test_drift_correction_updates_last_known_position():
+    """After _maybe_correct_drift dispatches a taker on the primary leg,
+    _last_known_position must be updated to the post-correction position so
+    the grid event loop doesn't misinterpret the position change as a fill."""
+    engine = _make_engine()
+    engine._exchange = MagicMock()
+    engine._exchange.name = "lighter"
+    engine._exchange.place_long_term_order = AsyncMock()
+    # Mock the post-correction position the engine should record
+    new_pos = MagicMock(symbol="ARB-USD", side="short", size=20.0, entry_price=0.135)
+    engine._exchange.get_position = AsyncMock(return_value=new_pos)
+
+    # Pre-state: last_known is something else (size=10)
+    old_pos = MagicMock(symbol="ARB-USD", side="short", size=10.0)
+    engine._last_known_position = old_pos
+    engine._db.insert_order_log = AsyncMock()
+    engine._next_cloid_for_leg = MagicMock(return_value=99999)
+
+    # Configure: hub.dydx_quote_prices for ref_price
+    engine._hub.dydx_quote_prices = {"ARB-USD": 0.135}
+    engine._hub.current_operation_id = 29
+    engine._settings.min_rebalance_notional_usd = 0.5
+
+    # beefy_pos arg is unused for this test path; pass MagicMock
+    beefy_pos = MagicMock()
+    p_now = 0.135
+
+    # symbols + targets — drift = target - current = 20 - 10 = 10 ARB → $1.35 USD > $0.50 threshold
+    positions = [MagicMock(side="short", size=10.0)]
+    symbols = ["ARB-USD"]
+    targets = {"ARB-USD": 20.0}
+
+    await engine._maybe_correct_drift(
+        beefy_pos=beefy_pos, p_now=p_now,
+        positions=positions, symbols=symbols, targets=targets,
+    )
+
+    # _last_known_position should now be the new post-correction read
+    assert engine._last_known_position is new_pos
+
+
+@pytest.mark.asyncio
+async def test_drift_correction_only_updates_for_primary_leg():
+    """If drift correction fires on a secondary leg (token1), _last_known_position
+    should NOT be updated (grid is on token0; token1 position is irrelevant)."""
+    engine = _make_engine()
+    engine._settings.dydx_symbol_token0 = "ARB-USD"  # primary
+    engine._settings.dydx_symbol_token1 = "ETH-USD"  # secondary
+    engine._exchange = MagicMock()
+    engine._exchange.name = "lighter"
+    engine._exchange.place_long_term_order = AsyncMock()
+    # get_position should NOT be called for ETH-USD path
+    engine._exchange.get_position = AsyncMock()
+
+    old_pos = MagicMock(symbol="ARB-USD", side="short", size=10.0)
+    engine._last_known_position = old_pos
+    engine._db.insert_order_log = AsyncMock()
+    engine._next_cloid_for_leg = MagicMock(return_value=99999)
+    engine._hub.dydx_quote_prices = {"ETH-USD": 3500.0}
+    engine._hub.current_operation_id = 29
+    engine._settings.min_rebalance_notional_usd = 0.5
+
+    positions = [MagicMock(side="short", size=0.005)]
+    symbols = ["ETH-USD"]  # secondary leg only
+    targets = {"ETH-USD": 0.010}  # drift = 0.005 ETH * 3500 = $17.50, > $0.50 threshold
+
+    await engine._maybe_correct_drift(
+        beefy_pos=MagicMock(), p_now=0.135,
+        positions=positions, symbols=symbols, targets=targets,
+    )
+
+    # Last known position untouched (still the old one)
+    assert engine._last_known_position is old_pos
+    # get_position never called for the secondary leg
+    engine._exchange.get_position.assert_not_called()

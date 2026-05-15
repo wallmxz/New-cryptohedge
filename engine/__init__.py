@@ -2077,6 +2077,15 @@ class GridMakerEngine:
                     f"drift_correction: {sym} {corr_side} {corr_size:.3f} "
                     f"(drift=${drift_usd:.2f} target={target:.3f} actual={current:.3f})"
                 )
+                # Update _last_known_position so _grid_event_loop doesn't misinterpret
+                # this drift-correction-driven position change as a stop fill.
+                # Only relevant for the primary (token0) leg — that's the leg the
+                # event-driven grid tracks.
+                if sym == self._settings.dydx_symbol_token0:
+                    try:
+                        self._last_known_position = await self._exchange.get_position(sym)
+                    except Exception:
+                        pass  # next _grid_event_iter will re-read; non-fatal
             except Exception as e:
                 logger.warning(f"drift_correction taker failed: {e}")
 
