@@ -607,3 +607,45 @@ async def test_maintain_grid_still_cancels_on_range_change():
     )
 
     exchange.cancel_all_stops.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_local_grid_keys_intersect_live_cloids_after_post():
+    """Regression: after `_post_initial_grid` (or any place_stop_market
+    flow), the cloid stored in `_local_grid` must equal the cloid that
+    `get_open_orders` returns. Pre-fix the engine kept 64-bit values
+    locally while Lighter stored only the low 32 bits, so
+    `set(_local_grid) & live_cloids` was always empty.
+
+    This is a regression guard for the spec
+    `docs/superpowers/specs/2026-05-15-cloid-32bit-truncation-fix-design.md`.
+    """
+    engine = _make_engine()
+
+    # Simulate the engine generating a cloid the same way _post_initial_grid does.
+    cloid = engine._next_cloid_for_leg("ARB-USD")
+
+    # Simulate the engine storing in _local_grid (what _post_initial_grid does).
+    engine._local_grid[cloid] = GridStop(cloid, "sell", 0.130, 3.0)
+
+    # Simulate Lighter returning what it actually persisted: the 32-bit truncated cloid.
+    lighter_persisted_cloid = cloid & 0xFFFFFFFF
+    live_by_cloid = {lighter_persisted_cloid: {
+        "cloid": str(lighter_persisted_cloid), "side": "sell",
+        "trigger_price": 0.130, "size": 3.0, "order_index": 999,
+    }}
+
+    # Reconciler's set logic:
+    local_cloids = set(engine._local_grid.keys())
+    live_cloids = set(live_by_cloid.keys())
+    orphans = live_cloids - local_cloids
+    missing = local_cloids - live_cloids
+
+    assert orphans == set(), (
+        f"reconciler should see zero orphans; got {orphans}. "
+        f"local={local_cloids} live={live_cloids}"
+    )
+    assert missing == set(), (
+        f"reconciler should see zero missing; got {missing}. "
+        f"local={local_cloids} live={live_cloids}"
+    )
