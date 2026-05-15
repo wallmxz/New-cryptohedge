@@ -57,7 +57,6 @@ class GridMakerEngine:
         self._grid_task: asyncio.Task | None = None
         self._running = False
         self._cloid_seq = 0
-        self._run_id = int(time.time())  # unique per process run
         self._reconciler: Reconciler | None = None
         self._iter_count = 0
         self.RECONCILE_EVERY_N_ITERATIONS = 30  # ~30s
