@@ -38,14 +38,19 @@ async def test_single_sell_fill_triggers_3_writes():
         201: GridStop(201, "buy", 0.128, 3.0),   # lowest buy
     }
     step = 0.002  # arbitrary fixed step for the test
+    live_by_cloid = {
+        101: {"cloid": "101", "side": "sell", "trigger_price": 0.142, "size": 3.0, "order_index": 5101},
+        200: {"cloid": "200", "side": "buy", "trigger_price": 0.130, "size": 3.0, "order_index": 5200},
+        201: {"cloid": "201", "side": "buy", "trigger_price": 0.128, "size": 3.0, "order_index": 5201},
+    }
 
-    await engine._apply_fills_to_grid(filled_cloids={100}, step=step)
+    await engine._apply_fills_to_grid(filled_cloids={100}, step=step, live_by_cloid=live_by_cloid)
 
     # Assertions
     assert engine._exchange.cancel_stop_order.call_count == 1
     cancel_call = engine._exchange.cancel_stop_order.call_args
-    # lowest buy should be cancelled (cloid 201)
-    assert cancel_call.kwargs.get("cloid_int") == 201
+    # lowest buy should be cancelled (cloid 201 → order_index 5201)
+    assert cancel_call.kwargs.get("order_index") == 5201
 
     assert engine._exchange.place_stop_market.call_count == 2
     posts = engine._exchange.place_stop_market.call_args_list
@@ -87,8 +92,13 @@ async def test_local_grid_not_corrupted_when_post_fails():
         201: GridStop(201, "buy", 0.128, 3.0),
     }
     step = 0.002
+    live_by_cloid = {
+        101: {"cloid": "101", "side": "sell", "trigger_price": 0.142, "size": 3.0, "order_index": 5101},
+        200: {"cloid": "200", "side": "buy", "trigger_price": 0.130, "size": 3.0, "order_index": 5200},
+        201: {"cloid": "201", "side": "buy", "trigger_price": 0.128, "size": 3.0, "order_index": 5201},
+    }
 
-    await engine._apply_fills_to_grid(filled_cloids={100}, step=step)
+    await engine._apply_fills_to_grid(filled_cloids={100}, step=step, live_by_cloid=live_by_cloid)
 
     # Old filled sell was removed
     assert 100 not in engine._local_grid
@@ -116,8 +126,13 @@ async def test_skip_fill_when_step_is_zero():
         200: GridStop(200, "buy", 0.130, 3.0),
         201: GridStop(201, "buy", 0.128, 3.0),
     }
+    live_by_cloid = {
+        101: {"cloid": "101", "side": "sell", "trigger_price": 0.142, "size": 3.0, "order_index": 5101},
+        200: {"cloid": "200", "side": "buy", "trigger_price": 0.130, "size": 3.0, "order_index": 5200},
+        201: {"cloid": "201", "side": "buy", "trigger_price": 0.128, "size": 3.0, "order_index": 5201},
+    }
 
-    await engine._apply_fills_to_grid(filled_cloids={100}, step=0.0)
+    await engine._apply_fills_to_grid(filled_cloids={100}, step=0.0, live_by_cloid=live_by_cloid)
 
     # No writes when step is 0 — safety net will fix later
     engine._exchange.cancel_stop_order.assert_not_called()
@@ -142,8 +157,13 @@ async def test_single_buy_fill_triggers_3_writes():
         201: GridStop(201, "buy", 0.128, 3.0),   # bottom buy
     }
     step = 0.002
+    live_by_cloid = {
+        100: {"cloid": "100", "side": "sell", "trigger_price": 0.140, "size": 3.0, "order_index": 5100},
+        101: {"cloid": "101", "side": "sell", "trigger_price": 0.142, "size": 3.0, "order_index": 5101},
+        201: {"cloid": "201", "side": "buy", "trigger_price": 0.128, "size": 3.0, "order_index": 5201},
+    }
 
-    await engine._apply_fills_to_grid(filled_cloids={200}, step=step)
+    await engine._apply_fills_to_grid(filled_cloids={200}, step=step, live_by_cloid=live_by_cloid)
 
     assert engine._exchange.cancel_stop_order.call_count == 1
     posts = engine._exchange.place_stop_market.call_args_list
@@ -184,8 +204,14 @@ async def test_two_sells_filled_same_iter_processed_in_order():
         202: GridStop(202, "buy", 0.126, 3.0),  # lowest buy (farthest from market)
     }
     step = 0.002
+    live_by_cloid = {
+        102: {"cloid": "102", "side": "sell", "trigger_price": 0.144, "size": 3.0, "order_index": 5102},
+        200: {"cloid": "200", "side": "buy", "trigger_price": 0.130, "size": 3.0, "order_index": 5200},
+        201: {"cloid": "201", "side": "buy", "trigger_price": 0.128, "size": 3.0, "order_index": 5201},
+        202: {"cloid": "202", "side": "buy", "trigger_price": 0.126, "size": 3.0, "order_index": 5202},
+    }
 
-    await engine._apply_fills_to_grid(filled_cloids={100, 101}, step=step)
+    await engine._apply_fills_to_grid(filled_cloids={100, 101}, step=step, live_by_cloid=live_by_cloid)
 
     # 2 cancels + 4 posts = 6 writes
     assert engine._exchange.cancel_stop_order.call_count == 2
@@ -203,8 +229,9 @@ async def test_two_sells_filled_same_iter_processed_in_order():
     cancels = engine._exchange.cancel_stop_order.call_args_list
     posts = engine._exchange.place_stop_market.call_args_list
 
-    cancel_cloids = [c.kwargs.get("cloid_int") for c in cancels]
-    assert cancel_cloids == [202, 201]
+    cancel_order_indexes = [c.kwargs.get("order_index") for c in cancels]
+    # cloid 202 → order_index 5202; cloid 201 → order_index 5201
+    assert cancel_order_indexes == [5202, 5201]
 
     post_prices = [(p.kwargs["side"], p.kwargs["trigger_price"]) for p in posts]
     assert post_prices[0] == ("buy", 0.140)
@@ -221,9 +248,9 @@ async def test_safety_reconcile_bootstrap_populates_local_grid_from_lighter():
     engine._exchange = MagicMock()
     # Lighter returns 3 live orders
     engine._exchange.get_open_orders = AsyncMock(return_value=[
-        {"cloid": "5001", "side": "sell", "trigger_price": 0.140, "size": 3.0},
-        {"cloid": "5002", "side": "sell", "trigger_price": 0.142, "size": 3.0},
-        {"cloid": "6001", "side": "buy", "trigger_price": 0.130, "size": 3.0},
+        {"cloid": "5001", "side": "sell", "trigger_price": 0.140, "size": 3.0, "order_index": 70001},
+        {"cloid": "5002", "side": "sell", "trigger_price": 0.142, "size": 3.0, "order_index": 70002},
+        {"cloid": "6001", "side": "buy", "trigger_price": 0.130, "size": 3.0, "order_index": 70003},
     ])
     engine._exchange.cancel_stop_order = AsyncMock()  # should NOT be called
 
@@ -243,3 +270,70 @@ async def test_safety_reconcile_bootstrap_populates_local_grid_from_lighter():
 
     # No cancel calls during bootstrap
     engine._exchange.cancel_stop_order.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cancel_uses_order_index_not_cloid_int():
+    """Regression: cancel_stop_order was being called with cloid_int=, but the
+    real adapter signature requires order_index=. Verify we now pass order_index
+    looked up from live_by_cloid map."""
+    engine = _make_engine()
+    engine._exchange = MagicMock()
+    engine._exchange.cancel_stop_order = AsyncMock()
+    engine._exchange.place_stop_market = AsyncMock()
+    engine._next_cloid_for_leg = MagicMock(side_effect=[9001, 9002])
+
+    engine._local_grid = {
+        100: GridStop(100, "sell", 0.140, 3.0),  # filled
+        101: GridStop(101, "sell", 0.142, 3.0),
+        200: GridStop(200, "buy", 0.130, 3.0),
+        201: GridStop(201, "buy", 0.128, 3.0),  # to cancel
+    }
+    # live_by_cloid contains all stops EXCEPT the filled one. Each has a synthetic order_index.
+    live_by_cloid = {
+        101: {"cloid": "101", "side": "sell", "trigger_price": 0.142, "size": 3.0, "order_index": 5101},
+        200: {"cloid": "200", "side": "buy", "trigger_price": 0.130, "size": 3.0, "order_index": 5200},
+        201: {"cloid": "201", "side": "buy", "trigger_price": 0.128, "size": 3.0, "order_index": 5201},
+    }
+
+    await engine._apply_fills_to_grid(
+        filled_cloids={100}, step=0.002, live_by_cloid=live_by_cloid,
+    )
+
+    # Cancel was called with order_index=5201 (NOT cloid_int=201)
+    assert engine._exchange.cancel_stop_order.call_count == 1
+    call = engine._exchange.cancel_stop_order.call_args
+    assert call.kwargs.get("order_index") == 5201
+    assert "cloid_int" not in call.kwargs  # explicit: don't use cloid_int
+
+
+@pytest.mark.asyncio
+async def test_cancel_skipped_when_cloid_not_in_live_but_local_grid_pops_anyway():
+    """If opp.cloid isn't in live_by_cloid (cancelled by external means or race),
+    skip the cancel call but still remove from local_grid."""
+    engine = _make_engine()
+    engine._exchange = MagicMock()
+    engine._exchange.cancel_stop_order = AsyncMock()
+    engine._exchange.place_stop_market = AsyncMock()
+    engine._next_cloid_for_leg = MagicMock(side_effect=[9001, 9002])
+
+    engine._local_grid = {
+        100: GridStop(100, "sell", 0.140, 3.0),
+        101: GridStop(101, "sell", 0.142, 3.0),
+        200: GridStop(200, "buy", 0.130, 3.0),
+        201: GridStop(201, "buy", 0.128, 3.0),  # NOT in live_by_cloid
+    }
+    live_by_cloid = {
+        101: {"cloid": "101", "side": "sell", "trigger_price": 0.142, "size": 3.0, "order_index": 5101},
+        200: {"cloid": "200", "side": "buy", "trigger_price": 0.130, "size": 3.0, "order_index": 5200},
+        # 201 missing
+    }
+
+    await engine._apply_fills_to_grid(
+        filled_cloids={100}, step=0.002, live_by_cloid=live_by_cloid,
+    )
+
+    # No cancel call (skipped)
+    engine._exchange.cancel_stop_order.assert_not_called()
+    # But 201 still removed from local_grid
+    assert 201 not in engine._local_grid

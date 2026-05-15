@@ -1626,6 +1626,7 @@ class GridMakerEngine:
 
     async def _apply_fills_to_grid(
         self, *, filled_cloids: set[int], step: float,
+        live_by_cloid: dict[int, dict],
     ) -> None:
         """Process detected fills: for each filled cloid, cancel the opposite
         side's farthest stop and post 2 replacements (1 near market at fill
@@ -1634,11 +1635,44 @@ class GridMakerEngine:
         Multi-fill handling: process fills in order of distance-from-market
         (closest first), so each iteration sees a coherent local_grid.
 
+        `live_by_cloid` maps cloid -> live order dict (from `get_open_orders`),
+        used to look up the Lighter `order_index` required by the real
+        `cancel_stop_order(symbol, order_index)` adapter signature. cloids
+        missing from this map are assumed already-cancelled-or-filled by
+        external means and the cancel call is skipped (with warning), but
+        the entry is still popped from local_grid.
+
         Spec: docs/superpowers/specs/2026-05-15-event-driven-grid-design.md
         """
         from engine.grid_state import GridStop, lowest_buy, top_sell, highest_sell, bottom_buy
 
         symbol = self._settings.dydx_symbol_token0
+
+        async def _cancel_via_live(opp_cloid: int) -> None:
+            """Resolve order_index from live_by_cloid and cancel; skip+warn if missing."""
+            live_order = live_by_cloid.get(opp_cloid)
+            if live_order is None:
+                logger.warning(
+                    f"event-driven cancel skipped: cloid={opp_cloid} not in live "
+                    f"(already cancelled or filled?). Popping from local_grid."
+                )
+                return
+            order_index = live_order.get("order_index", 0)
+            if not order_index:
+                logger.warning(
+                    f"event-driven cancel skipped: cloid={opp_cloid} has no "
+                    f"order_index in live response. Popping from local_grid."
+                )
+                return
+            try:
+                await self._exchange.cancel_stop_order(
+                    symbol=symbol, order_index=order_index,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"event-driven cancel failed cloid={opp_cloid} "
+                    f"order_index={order_index}: {e}"
+                )
 
         # Sort filled cloids by distance from extremes (closest to market first).
         # For a sell fill, "closest to market" = lowest trigger price among sells.
@@ -1678,10 +1712,7 @@ class GridMakerEngine:
                     continue  # malformed grid; safety net will recover
                 # Cancel lowest buy (always pop opp from local_grid afterwards:
                 # Lighter either cancelled it or it was already gone).
-                try:
-                    await self._exchange.cancel_stop_order(symbol=symbol, cloid_int=opp.cloid)
-                except Exception as e:
-                    logger.warning(f"event-driven cancel failed cloid={opp.cloid}: {e}")
+                await _cancel_via_live(opp.cloid)
                 # Post replacement buy at filled sell's trigger price (closest to market)
                 new_buy_cloid = self._next_cloid_for_leg(symbol)
                 buy_posted = False
@@ -1728,10 +1759,7 @@ class GridMakerEngine:
                 tip = bottom_buy(self._local_grid)
                 if opp is None or tip is None:
                     continue
-                try:
-                    await self._exchange.cancel_stop_order(symbol=symbol, cloid_int=opp.cloid)
-                except Exception as e:
-                    logger.warning(f"event-driven cancel failed cloid={opp.cloid}: {e}")
+                await _cancel_via_live(opp.cloid)
                 new_sell_cloid = self._next_cloid_for_leg(symbol)
                 sell_posted = False
                 try:
@@ -1813,17 +1841,35 @@ class GridMakerEngine:
         # Orphans on Lighter (not in local) → cancel
         orphans = live_cloids - local_cloids
         for cloid in orphans:
+            live_order = live_by_cloid.get(cloid, {})
+            order_index = live_order.get("order_index", 0)
+            if not order_index:
+                logger.warning(
+                    f"_safety_reconcile orphan cancel skipped: cloid={cloid} "
+                    f"has no order_index in live response"
+                )
+                continue
             try:
-                await self._exchange.cancel_stop_order(symbol=symbol, cloid_int=cloid)
-                logger.info(f"_safety_reconcile cancelled orphan cloid={cloid}")
+                await self._exchange.cancel_stop_order(
+                    symbol=symbol, order_index=order_index,
+                )
+                logger.info(
+                    f"_safety_reconcile cancelled orphan cloid={cloid} "
+                    f"order_index={order_index}"
+                )
             except Exception as e:
-                logger.warning(f"_safety_reconcile orphan cancel failed cloid={cloid}: {e}")
+                logger.warning(
+                    f"_safety_reconcile orphan cancel failed cloid={cloid} "
+                    f"order_index={order_index}: {e}"
+                )
 
         # Missing on Lighter (in local but not live) → assumed filled
         missing = local_cloids - live_cloids
         if missing:
             step = self._estimate_grid_step()
-            await self._apply_fills_to_grid(filled_cloids=missing, step=step)
+            await self._apply_fills_to_grid(
+                filled_cloids=missing, step=step, live_by_cloid=live_by_cloid,
+            )
 
     def _estimate_grid_step(self) -> float:
         """Estimate grid step from existing _local_grid (diff between consecutive same-side prices).
