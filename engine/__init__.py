@@ -1891,6 +1891,77 @@ class GridMakerEngine:
             return buys[0] - buys[1]
         return 0.0
 
+    async def _grid_event_iter(self) -> None:
+        """One iteration of the event-driven grid loop. Public for testing.
+
+        - get_position (cheap read)
+        - if changed since last iter → query open_orders, identify filled cloids,
+          apply fills (3 writes per fill)
+        - every 90s, safety_reconcile audit
+        """
+        symbol = self._settings.dydx_symbol_token0
+
+        # Safety net (90s)
+        now = time.time()
+        if now - self._last_safety_reconcile_at > 90.0:
+            await self._safety_reconcile()
+            self._last_safety_reconcile_at = now
+
+        # Position read
+        try:
+            pos_now = await self._exchange.get_position(symbol)
+        except Exception as e:
+            logger.warning(f"_grid_event_iter: get_position failed: {e}")
+            return
+
+        # Position-equality short-circuit
+        if self._position_equal(pos_now, self._last_known_position):
+            return
+
+        # Position changed — query open_orders, identify filled cloids
+        try:
+            live = await self._exchange.get_open_orders(symbol)
+        except Exception as e:
+            logger.warning(f"_grid_event_iter: get_open_orders failed: {e}")
+            return
+        live_by_cloid = {int(o["cloid"]): o for o in live}
+        live_cloids = set(live_by_cloid.keys())
+        filled = set(self._local_grid.keys()) - live_cloids
+
+        if filled:
+            step = self._estimate_grid_step()
+            await self._apply_fills_to_grid(
+                filled_cloids=filled, step=step, live_by_cloid=live_by_cloid,
+            )
+
+        self._last_known_position = pos_now
+
+    @staticmethod
+    def _position_equal(a, b) -> bool:
+        """Compare two Position-ish objects by side + size (entry_price/PnL change frequently)."""
+        if a is None and b is None:
+            return True
+        if a is None or b is None:
+            return False
+        return (
+            getattr(a, "side", None) == getattr(b, "side", None)
+            and abs(getattr(a, "size", 0.0) - getattr(b, "size", 0.0)) < 1e-9
+        )
+
+    async def _grid_event_loop(self) -> None:
+        """Long-running task: event-driven grid maintenance at 100ms cadence."""
+        period = 0.1  # 100ms
+        while self._running:
+            t0 = time.monotonic()
+            try:
+                await self._grid_event_iter()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.exception(f"_grid_event_loop iter error: {e}")
+            elapsed = time.monotonic() - t0
+            await asyncio.sleep(max(0.0, period - elapsed))
+
     async def _on_grid_fill(
         self, *, cloid: int, fill_price: float, fill_size: float, side: str,
     ) -> None:

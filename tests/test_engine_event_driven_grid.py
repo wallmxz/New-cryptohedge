@@ -395,3 +395,27 @@ async def test_safety_reconcile_steady_state_detects_missing_as_fill():
         + engine._exchange.place_stop_market.call_count
     )
     assert total_calls >= 1
+
+
+@pytest.mark.asyncio
+async def test_grid_event_loop_iter_no_position_change_no_writes():
+    """One iter of the event loop with pos_now == last_known_position -> 0 writes."""
+    engine = _make_engine()
+    engine._exchange = MagicMock()
+    pos = MagicMock(symbol="ARB-USD", side="short", size=10.0, entry_price=0.135, unrealized_pnl=0.0)
+    engine._exchange.get_position = AsyncMock(return_value=pos)
+    engine._exchange.get_open_orders = AsyncMock()
+    engine._exchange.cancel_stop_order = AsyncMock()
+    engine._exchange.place_stop_market = AsyncMock()
+
+    engine._last_known_position = pos
+    engine._local_grid = {1: GridStop(1, "sell", 0.140, 3.0)}
+    engine._last_safety_reconcile_at = 9999999999.0  # far future, so safety net doesn't fire
+
+    await engine._grid_event_iter()
+
+    # No writes
+    engine._exchange.cancel_stop_order.assert_not_called()
+    engine._exchange.place_stop_market.assert_not_called()
+    # No open_orders read either (only on position change or safety net)
+    engine._exchange.get_open_orders.assert_not_called()
