@@ -1,33 +1,52 @@
 # WORKING_ON
 
-**Última atualização:** 2026-05-15 01:43 UTC — Bot LIVE pós-fix triplo (cloid wraparound + Alchemy→Ankr + Lighter key slot 67). Op #29 hedgeando normal.
+**Última atualização:** 2026-05-15 05:14 UTC — Bot LIVE com event-driven grid em master `c8edc64`. Rate limit Lighter ELIMINADO. Op #29 hedgeando.
 
 ## Foco atual
 
-**Master `f5debca` deployed em produção (DO Frankfurt).** Hoje resolvemos 3 problemas concorrentes:
-1. **Cloid 256-wraparound** — `_next_cloid_for_leg` mascarava `_cloid_seq & 0xFF` → só 256 cloids únicos por (run, leg). Após 256 stops, todo INSERT colidia com row antiga em `grid_orders.cloid` (UNIQUE). Fix: layout 64-bit run_id (32) | leg (8) | seq (24) = 16M únicos. Commit `1c7c126`, merge `f5debca`. Tests em `tests/test_engine_cloid.py` (4 novos).
-2. **Alchemy free tier exausto** — abuse de 18h queimou 30M/30M CUs do mês. Trocamos `ARBITRUM_RPC_URL` pra Ankr Freemium (whitelist IP `104.248.44.6`).
-3. **Lighter API key broken** — slot 2 não batia mais com server. User regerou em **slot 67** (`LIGHTER_API_KEY_INDEX=67`).
+**Master `c8edc64` deployed em produção (DO Frankfurt).** Sessão 2026-05-15 entregou 4 grandes fixes/features:
 
-**Estado live do bot (verificado 2026-05-15 01:43 UTC):**
+### Tarde — Event-driven grid reconciler (substituição completa do "self-healing")
+
+Spec: `docs/superpowers/specs/2026-05-15-event-driven-grid-design.md`. Plan: `docs/superpowers/plans/2026-05-15-event-driven-grid.md`.
+
+- **`_grid_event_loop` (100ms cadence)**: get_position; if changed, query open_orders, identify filled cloids via diff vs `_local_grid`, cancel opposite extreme + post 2 replacements (3 writes/fill)
+- **`_safety_reconcile` (90s cadence)**: bootstrap path popula `_local_grid` pós-restart; steady-state cancela orphans + re-trigger fill detection pra missing cloids
+- **`_post_initial_grid`**: placement inicial 8+8 populando `_local_grid` + `_last_known_position`
+- **`_apply_fills_to_grid`**: algoritmo central, post-only-on-success (sem phantom cloids), `step<=0` guard
+- **Drift correction** atualiza `_last_known_position` pós-taker pra grid loop não interpretar como fill
+- **Métricas novas**: `bot_position_polls_total`, `bot_grid_writes_total{reason=fill|safety|drift|initial}`
+
+Pipeline: brainstorm → spec → plan → 14 subagent-driven tasks (TDD + 2-stage review). Reviews pegaram 3 bugs: phantom cloid corruption (T3), `cancel_stop_order` signature mismatch (cloid_int vs order_index), step=0 edge case. Tests: 408 passing.
+
+### Manhã — 3 fixes emergenciais
+
+1. **Cloid 256-wraparound** — `_cloid_seq & 0xFF` só dava 256 únicos. Fix: 64-bit layout (32 run | 8 leg | 24 seq). Commit `1c7c126`.
+2. **Alchemy free tier exausto** — 30M/30M CUs queimados. Trocamos pra Ankr Freemium.
+3. **Lighter API key broken** — slot 2 quebrou. User regerou em slot 67.
+**Estado live do bot (verificado 2026-05-15 05:14 UTC):**
 
 | | |
 |---|---|
-| Service | `active` (restart 01:42 UTC) |
+| Service | `active` |
 | Op #29 | active, baseline pool $199.75 |
-| Net PnL | -$0.09 |
-| Pool $ | +$0.10 |
-| Hedge PnL | -$0.21 (realized +$0.14, unrealized -$0.35) |
-| Funding | +$0.017 |
-| Stops live na Lighter | **15** (7 sells $0.13040-$0.13119 + 8 buys $0.13135-$0.13227) — desfalcado em 1 sell |
-| Errors last 60s | 0 UNIQUE / 0 invalid sig / 0 Lighter 429 / 0 Alchemy 429 |
+| Errors críticos last 5min | **0/0/0/0** (UNIQUE / Lighter ratelimit / invalid sig / Alchemy) ✅ |
+| Position polls | ~8.6/sec (target 10) ✅ |
+| Lighter live | 16 stops (mas desequilibrado: 16 sells / 0 buys após cascata de buy fills com ARB caindo 2%) |
+| Net PnL | -$0.09 (≈ neutro) |
+| Pool $ | -$0.86 |
+| Hedge PnL | +$0.74 |
+| Funding | +$0.02 |
 
 ## Bugs remanescentes (post-fix)
 
-1. ⚠️ **1 sell faltando no grid (15/16)** — reconciler tentando postar @ $0.13127 (entre sells e buys, próximo do market) → safety clamp empurrando trigger past market → Lighter rejeita silencioso. Edge-case do bug #4 do handoff. Não bloqueia.
+1. ⚠️ **Cascading fill imbalance** (NOVO observado 05:14 UTC) — quando preço cai rápido (2%/min), buys fillam em cascata. O algoritmo deveria repostar buys a cada fill, mas Lighter rejeita silenciosamente alguns reposts (price moved past trigger). Resultado: grid fica 16 sells / 0 buys. Safety_reconcile a cada 90s deveria recuperar via missing→fill detection com step=`_estimate_grid_step()`, mas se step=0 (poucos buys restantes) o T3 fix faz skip. **Investigar:** melhor fallback pra repor buys quando cascade acontece.
 2. ⚠️ **Hedge model status: warming_up / verify_diverging:100%** (predict mistura RAW V3 com HUMAN p_now)
 3. ⚠️ **LP fees attribution = 0** (Beefy Harvest listener — user disse "não precisa")
 4. ⚠️ **engine.pair_factory rebuild lifecycle a cada HTTP request** (log spam + possível aiohttp leak)
+5. ⚠️ **Loop latency 2-3k ms total** (`Saúde do loop` no UI). Suspeita: `_grid_event_loop` em I/O concorrente roubando event loop dos outros tasks. Investigar.
+6. ⚠️ **Curve/grid chart na UI** pesando rendering — remover ou simplificar.
+7. ⚠️ **`bot_grid_orders_open` gauge não wired** ao `_local_grid` count (sempre 0). Não bloqueia.
 
 ## PRs / commits da sessão 2026-05-13/14 (todos em master)
 
