@@ -1624,6 +1624,115 @@ class GridMakerEngine:
             gh["stops_placed_total"] = gh.get("stops_placed_total", 0) + posted_count
             # Reconcile que mexeu em algo conta como "rebuild" leve
 
+    async def _apply_fills_to_grid(
+        self, *, filled_cloids: set[int], step: float,
+    ) -> None:
+        """Process detected fills: for each filled cloid, cancel the opposite
+        side's farthest stop and post 2 replacements (1 near market at fill
+        trigger, 1 extending the same-side range).
+
+        Multi-fill handling: process fills in order of distance-from-market
+        (closest first), so each iteration sees a coherent local_grid.
+
+        Spec: docs/superpowers/specs/2026-05-15-event-driven-grid-design.md
+        """
+        from engine.grid_state import GridStop, lowest_buy, top_sell, highest_sell, bottom_buy
+
+        symbol = self._settings.dydx_symbol_token0
+
+        # Sort filled cloids by distance from extremes (closest to market first).
+        # For a sell fill, "closest to market" = lowest trigger price among sells.
+        # For a buy fill, "closest to market" = highest trigger price among buys.
+        # We can't know the market price here without re-reading, so use a
+        # heuristic: sells sorted ASC by trigger (lowest = was closest to market),
+        # buys sorted DESC by trigger (highest = was closest to market).
+        ordered = sorted(
+            filled_cloids,
+            key=lambda c: (
+                self._local_grid[c].trigger_price
+                if self._local_grid[c].side == "sell"
+                else -self._local_grid[c].trigger_price
+            ),
+        )
+
+        for cloid in ordered:
+            stop = self._local_grid.get(cloid)
+            if stop is None:
+                continue  # already processed (race)
+
+            if stop.side == "sell":
+                opp = lowest_buy(self._local_grid)
+                tip = top_sell(self._local_grid)
+                if opp is None or tip is None:
+                    continue  # malformed grid; safety net will recover
+                # Cancel lowest buy
+                try:
+                    await self._exchange.cancel_stop_order(symbol=symbol, cloid_int=opp.cloid)
+                except Exception as e:
+                    logger.warning(f"event-driven cancel failed: {e}")
+                # Post replacement buy at filled sell's trigger price (closest to market)
+                new_buy_cloid = self._next_cloid_for_leg(symbol)
+                try:
+                    await self._exchange.place_stop_market(
+                        symbol=symbol, side="buy", size=stop.size,
+                        trigger_price=stop.trigger_price, cloid_int=new_buy_cloid,
+                    )
+                except Exception as e:
+                    logger.warning(f"event-driven post buy failed: {e}")
+                # Post new sell extending the top
+                new_sell_price = tip.trigger_price + step
+                new_sell_cloid = self._next_cloid_for_leg(symbol)
+                try:
+                    await self._exchange.place_stop_market(
+                        symbol=symbol, side="sell", size=stop.size,
+                        trigger_price=new_sell_price, cloid_int=new_sell_cloid,
+                    )
+                except Exception as e:
+                    logger.warning(f"event-driven post sell failed: {e}")
+                # Update local_grid
+                self._local_grid.pop(cloid, None)
+                self._local_grid.pop(opp.cloid, None)
+                self._local_grid[new_buy_cloid] = GridStop(
+                    new_buy_cloid, "buy", stop.trigger_price, stop.size,
+                )
+                self._local_grid[new_sell_cloid] = GridStop(
+                    new_sell_cloid, "sell", new_sell_price, stop.size,
+                )
+            else:  # buy filled
+                opp = highest_sell(self._local_grid)
+                tip = bottom_buy(self._local_grid)
+                if opp is None or tip is None:
+                    continue
+                try:
+                    await self._exchange.cancel_stop_order(symbol=symbol, cloid_int=opp.cloid)
+                except Exception as e:
+                    logger.warning(f"event-driven cancel failed: {e}")
+                new_sell_cloid = self._next_cloid_for_leg(symbol)
+                try:
+                    await self._exchange.place_stop_market(
+                        symbol=symbol, side="sell", size=stop.size,
+                        trigger_price=stop.trigger_price, cloid_int=new_sell_cloid,
+                    )
+                except Exception as e:
+                    logger.warning(f"event-driven post sell failed: {e}")
+                new_buy_price = tip.trigger_price - step
+                new_buy_cloid = self._next_cloid_for_leg(symbol)
+                try:
+                    await self._exchange.place_stop_market(
+                        symbol=symbol, side="buy", size=stop.size,
+                        trigger_price=new_buy_price, cloid_int=new_buy_cloid,
+                    )
+                except Exception as e:
+                    logger.warning(f"event-driven post buy failed: {e}")
+                self._local_grid.pop(cloid, None)
+                self._local_grid.pop(opp.cloid, None)
+                self._local_grid[new_sell_cloid] = GridStop(
+                    new_sell_cloid, "sell", stop.trigger_price, stop.size,
+                )
+                self._local_grid[new_buy_cloid] = GridStop(
+                    new_buy_cloid, "buy", new_buy_price, stop.size,
+                )
+
     async def _on_grid_fill(
         self, *, cloid: int, fill_price: float, fill_size: float, side: str,
     ) -> None:
