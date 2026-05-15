@@ -95,6 +95,14 @@ class GridMakerEngine:
         # or is still running, which is fine — refresh_cache is
         # idempotent and short-lived).
         self._refresh_task: asyncio.Task | None = None
+        # Event-driven grid state (spec 2026-05-15-event-driven-grid-design).
+        # _last_known_position: Position | None — last seen, compared against
+        #   pos_now in _grid_event_loop to detect fills.
+        # _local_grid: dict[cloid, GridStop] — snapshot of stops we posted.
+        # _last_safety_reconcile_at: timestamp of last full audit (90s cadence).
+        self._last_known_position = None
+        self._local_grid: dict[int, "GridStop"] = {}
+        self._last_safety_reconcile_at: float = 0.0
 
     def _ensure_reconciler(self):
         if self._reconciler is None and self._exchange is not None:
