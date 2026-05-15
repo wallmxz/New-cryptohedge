@@ -65,3 +65,62 @@ async def test_single_sell_fill_triggers_3_writes():
     assert 9002 in engine._local_grid
     assert engine._local_grid[9002].side == "sell"
     assert abs(engine._local_grid[9002].trigger_price - 0.144) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_local_grid_not_corrupted_when_post_fails():
+    """If place_stop_market raises, the new cloid must NOT be inserted into _local_grid.
+    Otherwise the bot mis-tracks state and the safety net masks the bug for up to 90s."""
+    engine = _make_engine()
+    engine._exchange = MagicMock()
+    engine._exchange.cancel_stop_order = AsyncMock()  # cancel succeeds
+    # Buy post succeeds, sell post FAILS
+    engine._exchange.place_stop_market = AsyncMock(
+        side_effect=[None, Exception("rate limit")],
+    )
+    engine._next_cloid_for_leg = MagicMock(side_effect=[9001, 9002])
+
+    engine._local_grid = {
+        100: GridStop(100, "sell", 0.140, 3.0),
+        101: GridStop(101, "sell", 0.142, 3.0),
+        200: GridStop(200, "buy", 0.130, 3.0),
+        201: GridStop(201, "buy", 0.128, 3.0),
+    }
+    step = 0.002
+
+    await engine._apply_fills_to_grid(filled_cloids={100}, step=step)
+
+    # Old filled sell was removed
+    assert 100 not in engine._local_grid
+    # Cancelled buy was removed (cancel succeeded)
+    assert 201 not in engine._local_grid
+    # New buy succeeded — should be in local_grid
+    assert 9001 in engine._local_grid
+    assert engine._local_grid[9001].side == "buy"
+    # New sell FAILED — should NOT be in local_grid (phantom cloid prevention)
+    assert 9002 not in engine._local_grid
+
+
+@pytest.mark.asyncio
+async def test_skip_fill_when_step_is_zero():
+    """When step=0 (sparse grid path), don't post replacement at colliding price."""
+    engine = _make_engine()
+    engine._exchange = MagicMock()
+    engine._exchange.cancel_stop_order = AsyncMock()
+    engine._exchange.place_stop_market = AsyncMock()
+    engine._next_cloid_for_leg = MagicMock(side_effect=[9001, 9002])
+
+    engine._local_grid = {
+        100: GridStop(100, "sell", 0.140, 3.0),
+        101: GridStop(101, "sell", 0.142, 3.0),
+        200: GridStop(200, "buy", 0.130, 3.0),
+        201: GridStop(201, "buy", 0.128, 3.0),
+    }
+
+    await engine._apply_fills_to_grid(filled_cloids={100}, step=0.0)
+
+    # No writes when step is 0 — safety net will fix later
+    engine._exchange.cancel_stop_order.assert_not_called()
+    engine._exchange.place_stop_market.assert_not_called()
+    # local_grid unchanged
+    assert 100 in engine._local_grid
