@@ -1498,6 +1498,7 @@ class GridMakerEngine:
                     trigger_price=trigger, cloid_int=cloid,
                 )
                 metrics.grid_stops_placed_total.inc()
+                metrics.grid_writes_total.labels(reason="initial").inc()
                 posted_count += 1
                 self._local_grid[cloid] = GridStop(
                     cloid=cloid, side=lv.side,
@@ -1581,6 +1582,7 @@ class GridMakerEngine:
                 await self._exchange.cancel_stop_order(
                     symbol=symbol, order_index=order_index,
                 )
+                metrics.grid_writes_total.labels(reason="fill").inc()
             except Exception as e:
                 logger.warning(
                     f"event-driven cancel failed cloid={opp_cloid} "
@@ -1635,6 +1637,7 @@ class GridMakerEngine:
                         trigger_price=stop.trigger_price, cloid_int=new_buy_cloid,
                     )
                     buy_posted = True
+                    metrics.grid_writes_total.labels(reason="fill").inc()
                 except Exception as e:
                     logger.warning(
                         f"event-driven post buy failed cloid={new_buy_cloid} "
@@ -1650,6 +1653,7 @@ class GridMakerEngine:
                         trigger_price=new_sell_price, cloid_int=new_sell_cloid,
                     )
                     sell_posted = True
+                    metrics.grid_writes_total.labels(reason="fill").inc()
                 except Exception as e:
                     logger.warning(
                         f"event-driven post sell failed cloid={new_sell_cloid} "
@@ -1681,6 +1685,7 @@ class GridMakerEngine:
                         trigger_price=stop.trigger_price, cloid_int=new_sell_cloid,
                     )
                     sell_posted = True
+                    metrics.grid_writes_total.labels(reason="fill").inc()
                 except Exception as e:
                     logger.warning(
                         f"event-driven post sell failed cloid={new_sell_cloid} "
@@ -1695,6 +1700,7 @@ class GridMakerEngine:
                         trigger_price=new_buy_price, cloid_int=new_buy_cloid,
                     )
                     buy_posted = True
+                    metrics.grid_writes_total.labels(reason="fill").inc()
                 except Exception as e:
                     logger.warning(
                         f"event-driven post buy failed cloid={new_buy_cloid} "
@@ -1766,6 +1772,7 @@ class GridMakerEngine:
                 await self._exchange.cancel_stop_order(
                     symbol=symbol, order_index=order_index,
                 )
+                metrics.grid_writes_total.labels(reason="safety").inc()
                 logger.info(
                     f"_safety_reconcile cancelled orphan cloid={cloid} "
                     f"order_index={order_index}"
@@ -1826,6 +1833,7 @@ class GridMakerEngine:
         except Exception as e:
             logger.warning(f"_grid_event_iter: get_position failed: {e}")
             return
+        metrics.position_polls_total.inc()
 
         # Position-equality short-circuit
         if self._position_equal(pos_now, self._last_known_position):
@@ -1968,6 +1976,7 @@ class GridMakerEngine:
                     ttl_seconds=60,
                 )
                 metrics.aggressive_corrections_total.inc()
+                metrics.grid_writes_total.labels(reason="drift").inc()
                 try:
                     await self._db.insert_order_log(
                         timestamp=time.time(), exchange=self._exchange.name,
