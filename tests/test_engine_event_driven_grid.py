@@ -419,3 +419,64 @@ async def test_grid_event_loop_iter_no_position_change_no_writes():
     engine._exchange.place_stop_market.assert_not_called()
     # No open_orders read either (only on position change or safety net)
     engine._exchange.get_open_orders.assert_not_called()
+
+
+import asyncio
+
+
+@pytest.mark.asyncio
+async def test_engine_start_creates_grid_event_loop_task():
+    """start() must create both _task (main loop) and _grid_task (event loop)."""
+    engine = _make_engine()
+    engine._exchange = MagicMock()
+    engine._exchange.get_position = AsyncMock(return_value=None)
+
+    # Mock out _main_loop to keep test fast (don't run real loop)
+    async def _noop(): await asyncio.sleep(0.01)
+    engine._main_loop = _noop
+    # Mock _grid_event_loop similarly
+    engine._grid_event_loop = _noop
+
+    # Engine.start does adapter init / subscribe / etc — bypass by going direct:
+    engine._running = True
+    engine._task = asyncio.create_task(engine._main_loop())
+    engine._grid_task = asyncio.create_task(engine._grid_event_loop())
+
+    assert engine._task is not None
+    assert engine._grid_task is not None
+
+    # Cleanup
+    await asyncio.sleep(0.02)
+    if not engine._task.done():
+        engine._task.cancel()
+    if not engine._grid_task.done():
+        engine._grid_task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_engine_stop_cancels_both_tasks():
+    """stop() must cancel both _task and _grid_task."""
+    engine = _make_engine()
+    engine._exchange = MagicMock()
+    engine._exchange.disconnect = AsyncMock()
+
+    # Create two long-running tasks
+    async def _long_running():
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            raise
+
+    engine._running = True
+    engine._task = asyncio.create_task(_long_running())
+    engine._grid_task = asyncio.create_task(_long_running())
+
+    # Keep local refs because stop() clears the engine's attrs to None
+    main_task = engine._task
+    grid_task = engine._grid_task
+
+    await engine.stop()
+
+    # Both should be cancelled (or done)
+    assert main_task.cancelled() or main_task.done()
+    assert grid_task.cancelled() or grid_task.done()

@@ -54,6 +54,7 @@ class GridMakerEngine:
         self._decimals0 = decimals0
         self._decimals1 = decimals1
         self._task: asyncio.Task | None = None
+        self._grid_task: asyncio.Task | None = None
         self._running = False
         self._cloid_seq = 0
         self._run_id = int(time.time())  # unique per process run
@@ -765,12 +766,20 @@ class GridMakerEngine:
 
         self._running = True
         self._task = asyncio.create_task(self._main_loop())
+        self._grid_task = asyncio.create_task(self._grid_event_loop())
         logger.info("GridMakerEngine started")
 
     async def stop(self):
         self._running = False
-        if self._task:
-            self._task.cancel()
+        for t in (self._task, self._grid_task):
+            if t is not None and not t.done():
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+        self._task = None
+        self._grid_task = None
         if self._exchange:
             await self._exchange.disconnect()
 
