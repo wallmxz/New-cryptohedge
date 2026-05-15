@@ -211,3 +211,35 @@ async def test_two_sells_filled_same_iter_processed_in_order():
     assert post_prices[1] == ("sell", pytest.approx(0.146))
     assert post_prices[2] == ("buy", 0.142)
     assert post_prices[3] == ("sell", pytest.approx(0.148))
+
+
+@pytest.mark.asyncio
+async def test_safety_reconcile_bootstrap_populates_local_grid_from_lighter():
+    """First call: local_grid empty → query Lighter open_orders + DB lookup,
+    populate local_grid. NO cancellations."""
+    engine = _make_engine()
+    engine._exchange = MagicMock()
+    # Lighter returns 3 live orders
+    engine._exchange.get_open_orders = AsyncMock(return_value=[
+        {"cloid": "5001", "side": "sell", "trigger_price": 0.140, "size": 3.0},
+        {"cloid": "5002", "side": "sell", "trigger_price": 0.142, "size": 3.0},
+        {"cloid": "6001", "side": "buy", "trigger_price": 0.130, "size": 3.0},
+    ])
+    engine._exchange.cancel_stop_order = AsyncMock()  # should NOT be called
+
+    # local_grid empty (post-restart state)
+    engine._local_grid = {}
+
+    await engine._safety_reconcile()
+
+    # local_grid now has 3 entries matching Lighter
+    assert len(engine._local_grid) == 3
+    assert 5001 in engine._local_grid
+    assert engine._local_grid[5001].side == "sell"
+    assert engine._local_grid[5001].trigger_price == 0.140
+    assert 5002 in engine._local_grid
+    assert 6001 in engine._local_grid
+    assert engine._local_grid[6001].side == "buy"
+
+    # No cancel calls during bootstrap
+    engine._exchange.cancel_stop_order.assert_not_called()

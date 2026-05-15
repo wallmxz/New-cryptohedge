@@ -1770,6 +1770,81 @@ class GridMakerEngine:
                         new_buy_cloid, "buy", new_buy_price, stop.size,
                     )
 
+    async def _safety_reconcile(self) -> None:
+        """Periodic full audit (90s cadence). Behavior depends on local_grid state.
+
+        Bootstrap path (local_grid empty after restart): query Lighter live
+        orders, populate local_grid from them. NO cancellations.
+
+        Steady-state path (local_grid populated): bidirectional diff.
+          - Orders on Lighter not in local_grid → orphan, cancel.
+          - Cloids in local_grid not on Lighter → assumed filled, re-trigger
+            fill detection via _apply_fills_to_grid (idempotent).
+        """
+        from engine.grid_state import GridStop
+
+        symbol = self._settings.dydx_symbol_token0
+        try:
+            live = await self._exchange.get_open_orders(symbol)
+        except Exception as e:
+            logger.warning(f"_safety_reconcile: get_open_orders failed: {e}")
+            return
+
+        live_by_cloid = {int(o["cloid"]): o for o in live}
+
+        if not self._local_grid:
+            # Bootstrap path
+            for cloid, o in live_by_cloid.items():
+                self._local_grid[cloid] = GridStop(
+                    cloid=cloid, side=o["side"],
+                    trigger_price=float(o["trigger_price"]),
+                    size=float(o.get("size", 0.0)),
+                )
+            logger.info(
+                f"_safety_reconcile bootstrap: populated local_grid with "
+                f"{len(self._local_grid)} stops"
+            )
+            return
+
+        # Steady-state path
+        local_cloids = set(self._local_grid.keys())
+        live_cloids = set(live_by_cloid.keys())
+
+        # Orphans on Lighter (not in local) → cancel
+        orphans = live_cloids - local_cloids
+        for cloid in orphans:
+            try:
+                await self._exchange.cancel_stop_order(symbol=symbol, cloid_int=cloid)
+                logger.info(f"_safety_reconcile cancelled orphan cloid={cloid}")
+            except Exception as e:
+                logger.warning(f"_safety_reconcile orphan cancel failed cloid={cloid}: {e}")
+
+        # Missing on Lighter (in local but not live) → assumed filled
+        missing = local_cloids - live_cloids
+        if missing:
+            step = self._estimate_grid_step()
+            await self._apply_fills_to_grid(filled_cloids=missing, step=step)
+
+    def _estimate_grid_step(self) -> float:
+        """Estimate grid step from existing _local_grid (diff between consecutive same-side prices).
+
+        Used by _safety_reconcile when applying fills detected outside the normal flow.
+        Falls back to 0.0 if grid too sparse (1 stop will be added at fill price; safety net
+        next iter will fix any imbalance).
+        """
+        sells = sorted(
+            (s.trigger_price for s in self._local_grid.values() if s.side == "sell"),
+        )
+        if len(sells) >= 2:
+            return sells[1] - sells[0]
+        buys = sorted(
+            (s.trigger_price for s in self._local_grid.values() if s.side == "buy"),
+            reverse=True,
+        )
+        if len(buys) >= 2:
+            return buys[0] - buys[1]
+        return 0.0
+
     async def _on_grid_fill(
         self, *, cloid: int, fill_price: float, fill_size: float, side: str,
     ) -> None:
