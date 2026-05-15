@@ -816,17 +816,17 @@ class GridMakerEngine:
             await asyncio.sleep(max(0.0, period - elapsed))
 
     def _next_cloid(self, level_idx: int) -> int:
-        """Generate unique cloid as int (dYdX/Lighter accept int64).
+        """Generate unique cloid as int.
 
-        Layout (64 bits): run_id (32) | level_idx (8) | seq (24).
-        24-bit seq = 16M unique cloids per (run, level) — effectively
-        unlimited within a single bot run. Pre-2026-05-15 used 8-bit seq,
-        which wrapped at 256 and collided with prior `grid_orders` rows
-        (UNIQUE constraint), causing infinite reconciler retry loops.
+        Layout (32 bits): level_idx (8) | seq (24). Truncated to match what
+        the Lighter SDK actually stores (client_order_index is 32 bits on
+        the wire). 24-bit seq = 16M unique cloids per (level) per run —
+        effectively unlimited. The 256-cloid wraparound that motivated the
+        2026-05-15-morning fix is still resolved here: seq is 24 bits, not
+        8. Only the inert `run_id<<32` was dropped.
         """
         self._cloid_seq += 1
         return (
-            ((self._run_id & 0xFFFFFFFF) << 32) |
             ((level_idx & 0xFF) << 24) |
             (self._cloid_seq & 0xFFFFFF)
         )
