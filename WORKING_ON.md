@@ -1,10 +1,48 @@
 # WORKING_ON
 
-**Última atualização:** 2026-05-15 05:14 UTC — Bot LIVE com event-driven grid em master `c8edc64`. Rate limit Lighter ELIMINADO. Op #29 hedgeando.
+**Última atualização:** 2026-05-15 22:18 UTC — Bot LIVE com cloid 32-bit fix em master `435f02c`. Op #29 hedgeando. Grade preservada (não há mais cascata de orphan-cancels a cada 90s).
 
 ## Foco atual
 
-**Master `c8edc64` deployed em produção (DO Frankfurt).** Sessão 2026-05-15 entregou 4 grandes fixes/features:
+**Master `435f02c` deployed em produção (DO Frankfurt).** Sessão 2026-05-15 noite entregou hot-fix do bug crítico que destruía a grade.
+
+### Noite — Cloid 32-bit truncation fix (ROOT CAUSE do grid imbalance)
+
+Spec: `docs/superpowers/specs/2026-05-15-cloid-32bit-truncation-fix-design.md`. Plan: `docs/superpowers/plans/2026-05-15-cloid-32bit-truncation-fix.md`.
+
+**Root cause:** `_next_cloid` / `_next_cloid_for_leg` geravam cloids 64-bit (`run_id<<32 | leg<<24 | seq`). Mas `LighterAdapter.place_stop_market` faz `client_order_index = cloid_int & 0xFFFFFFFF` — **truncado pra 32 bits no wire**. `_local_grid` guardava 64-bit, `get_open_orders` retornava 32-bit, e a intersecção de sets sempre dava vazio:
+
+- `orphans = live - local` = TODAS ordens vivas → canceladas cada 90s pelo `_safety_reconcile`
+- `missing = local - live` = TODOS cloids locais → fake-fills processados, cancelando opposite extremes
+
+Sintoma em prod (~02:30 UTC): grade ficava com 5 sells / 0 buys, 16 sells / 0 buys, cloids 32-bit do reconciler nuke (cloids como `2684354xxx`). `bot_grid_writes_total{reason="fill"} = 62` enquanto `bot_grid_stops_filled_total = 0`.
+
+**Fix (5 commits em master):**
+- `5d3de95` fix(engine): truncate `_next_cloid_for_leg` to 32 bits — layout `leg_byte(8) | seq(24)` = 32 bits
+- `db95800` fix(engine): truncate `_next_cloid` to 32 bits — mesma transformação
+- `96d8739` test(engine): regression guard for cloid set intersection
+- `501b754` feat(engine): `cancel_all_stops` on engine.start when op active (gate em connected_exchange, try/except)
+- `435f02c` chore(engine): remove dead `_run_id` field
+
+**Pipeline:** brainstorm → spec → plan → 5 commits via subagent-driven (implementer + spec reviewer + code quality reviewer per block) + final cross-cutting review. Tests: 411 passed + 1 pre-existing pollution (test_settings_defaults). Branch fast-forwarded para master via `git push origin <branch>:master` porque main worktree estava locked.
+
+**Estado live pós-deploy (verificado 2026-05-15 22:17 UTC):**
+
+| | |
+|---|---|
+| Service | `active` |
+| Op #29 | active, baseline pool $199.75 |
+| Lighter live | 14 stops (5 sells + 9 buys, balanceado around p_now), todos cloids 32-bit `0xA000XXXX` |
+| Position polls | ~10/sec ✅ |
+| `bot_grid_stops_cancelled_total` | **0** (pré-fix crescia ~20/min) ✅ |
+| `bot_grid_writes_total{reason="safety"}` | **3 em 5min** (pré-fix: 21 em ~30s) ✅ |
+| `bot_grid_writes_total{reason="initial"}` | 16 ✅ |
+| `bot_grid_writes_total{reason="fill"}` | 24 (alguns durante startup race entre `_post_initial_grid` lento + `_grid_event_loop` rápido — comportamento benigno) |
+| `bot_grid_writes_total{reason="drift"}` | 1 (taker grande de 77 ARB no boot pra reabrir short do hedge — esperado dado posição flat) |
+
+### Tarde — Event-driven grid reconciler (substituição completa do "self-healing")
+
+Spec: `docs/superpowers/specs/2026-05-15-event-driven-grid-design.md`. Plan: `docs/superpowers/plans/2026-05-15-event-driven-grid.md`.
 
 ### Tarde — Event-driven grid reconciler (substituição completa do "self-healing")
 
@@ -40,13 +78,16 @@ Pipeline: brainstorm → spec → plan → 14 subagent-driven tasks (TDD + 2-sta
 
 ## Bugs remanescentes (post-fix)
 
-1. ⚠️ **Cascading fill imbalance** (NOVO observado 05:14 UTC) — quando preço cai rápido (2%/min), buys fillam em cascata. O algoritmo deveria repostar buys a cada fill, mas Lighter rejeita silenciosamente alguns reposts (price moved past trigger). Resultado: grid fica 16 sells / 0 buys. Safety_reconcile a cada 90s deveria recuperar via missing→fill detection com step=`_estimate_grid_step()`, mas se step=0 (poucos buys restantes) o T3 fix faz skip. **Investigar:** melhor fallback pra repor buys quando cascade acontece.
-2. ⚠️ **Hedge model status: warming_up / verify_diverging:100%** (predict mistura RAW V3 com HUMAN p_now)
-3. ⚠️ **LP fees attribution = 0** (Beefy Harvest listener — user disse "não precisa")
-4. ⚠️ **engine.pair_factory rebuild lifecycle a cada HTTP request** (log spam + possível aiohttp leak)
-5. ⚠️ **Loop latency 2-3k ms total** (`Saúde do loop` no UI). Suspeita: `_grid_event_loop` em I/O concorrente roubando event loop dos outros tasks. Investigar.
-6. ⚠️ **Curve/grid chart na UI** pesando rendering — remover ou simplificar.
-7. ⚠️ **`bot_grid_orders_open` gauge não wired** ao `_local_grid` count (sempre 0). Não bloqueia.
+1. ⚠️ **`cancel_all_stops` no engine.start usa symbol stale** — `self._settings.dydx_symbol_token0` é "ETH-USD" (placeholder do .env). O `pair_factory.refresh_vault_readers` muda pra "ARB-USD" SÓ depois de o engine.start completar. Sintoma: log mostra `cleared pre-existing stops for ETH-USD` quando deveria ser ARB-USD. Não destrói nada (não há ordens em ETH-USD), mas anula a feature em runs onde haja resíduo em ARB. **Fix:** mover cancel_all_stops pra DEPOIS do primeiro refresh do pair_factory, OU query lifecycle.active_symbol antes. Follow-up de baixa prioridade.
+2. ⚠️ **`exchanges/lighter.py::cancel_all_stops` não é symbol-scoped** — cancela ALL account orders. Single-pair seguro hoje; cross-pair (Phase 3.x) vai precisar fix. Flag pra documentação.
+3. ⚠️ **`engine/lifecycle.py::_next_cloid`** é função SEPARADA (não a do engine) com algoritmo diferente. Out-of-scope do hot-fix mas confunde. Consolidar quando convier.
+4. ⚠️ **Cascading fill imbalance** — comportamento original observado pré-cloid-fix; agora resolved como sintoma do bug 64-bit. Reavaliar se ainda aparece em prod ao longo de horas.
+5. ⚠️ **Race condition `_post_initial_grid` lento (1 ord/seg) vs `_grid_event_loop` rápido (100ms)** — durante o startup, alguns "event-driven cancel skipped" / "skip fill step=0" logs aparecem. Resultado em prod: 14/16 ordens vivas (2 "orphans" criadas via apply_fills com post falhando silenciosamente). Self-correcting via safety_reconcile mas log noisy.
+6. ⚠️ **Hedge model status: warming_up / verify_diverging:100%** (predict mistura RAW V3 com HUMAN p_now)
+7. ⚠️ **LP fees attribution = 0** (Beefy Harvest listener — user disse "não precisa")
+8. ⚠️ **engine.pair_factory rebuild lifecycle a cada HTTP request** (log spam + possível aiohttp leak)
+9. ⚠️ **Loop latency 2-3k ms total** (`Saúde do loop` no UI). Suspeita: `_grid_event_loop` em I/O concorrente roubando event loop dos outros tasks. Investigar.
+10. ⚠️ **`bot_grid_orders_open` gauge não wired** ao `_local_grid` count (sempre 0). Não bloqueia.
 
 ## PRs / commits da sessão 2026-05-13/14 (todos em master)
 
