@@ -100,7 +100,7 @@ class GridMakerEngine:
         #   pos_now in _grid_event_loop to detect fills.
         # _local_grid: dict[cloid, GridStop] — snapshot of stops we posted.
         # _last_safety_reconcile_at: timestamp of last full audit (90s cadence).
-        self._last_known_position = None
+        self._last_known_position: "Position | None" = None
         self._local_grid: dict[int, "GridStop"] = {}
         self._last_safety_reconcile_at: float = 0.0
 
