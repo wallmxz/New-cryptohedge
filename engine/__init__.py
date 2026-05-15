@@ -750,6 +750,28 @@ class GridMakerEngine:
             self._hub.operation_state = active_op["status"]
             logger.info(f"Restored active operation {active_op['id']} (status={active_op['status']})")
 
+            # Cancel any leftover stop orders from a previous run on the
+            # active symbol. After 2026-05-15's cloid 32-bit fix, the new
+            # run's cloid namespace starts at seq=0 and could collide with
+            # leftovers from a previous run that wasn't cleanly torn down.
+            # No-op when Lighter has nothing live for this symbol.
+            # Best-effort: a network failure here logs warning + proceeds;
+            # _safety_reconcile (90s cadence) adopts whatever survives.
+            if self._hub.connected_exchange:
+                try:
+                    await self._exchange.cancel_all_stops(
+                        symbol=self._settings.dydx_symbol_token0,
+                    )
+                    logger.info(
+                        f"engine.start cancel_all_stops cleared pre-existing "
+                        f"stops for {self._settings.dydx_symbol_token0}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"engine.start cancel_all_stops failed (proceeding; "
+                        f"_safety_reconcile bootstrap will recover): {e}"
+                    )
+
         # subscribe_fills is also best-effort. Same rationale as connect():
         # if the exchange edge is unreachable, we shouldn't kill startup —
         # the user can still recover funds and inspect state.

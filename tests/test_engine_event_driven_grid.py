@@ -649,3 +649,69 @@ async def test_local_grid_keys_intersect_live_cloids_after_post():
         f"reconciler should see zero missing; got {missing}. "
         f"local={local_cloids} live={live_cloids}"
     )
+
+
+@pytest.mark.asyncio
+async def test_engine_start_cancels_existing_stops_when_op_active():
+    """On startup with an active operation, the engine cancels any
+    pre-existing stop orders for the active symbol before launching the
+    grid loops. This prevents the new (post-fix 32-bit) cloid namespace
+    from colliding with leftover stops from a previous run.
+
+    No-op when there is no active operation (engine doesn't own a grid).
+    """
+    engine = _make_engine()
+    engine._exchange = MagicMock()
+    engine._exchange.connect = AsyncMock()
+    engine._exchange.disconnect = AsyncMock()
+    engine._exchange.subscribe_fills = AsyncMock()
+    engine._exchange.cancel_all_stops = AsyncMock()
+    engine._db.get_active_operation = AsyncMock(
+        return_value={"id": 42, "status": "active"},
+    )
+    # Bypass chain readers (engine.start() builds them when None — let
+    # those exist as MagicMocks so the construction branch is skipped).
+    engine._pool_reader = MagicMock()
+    engine._beefy_reader = MagicMock()
+    # Skip the reconciler path (predictive_grid_v2 setting suppresses it).
+    engine._settings.predictive_grid_v2 = True
+
+    # Stub out the long-running loops so start() returns quickly.
+    async def _noop():
+        await asyncio.sleep(0)
+    engine._main_loop = _noop
+    engine._grid_event_loop = _noop
+
+    await engine.start()
+    try:
+        engine._exchange.cancel_all_stops.assert_called_once_with(
+            symbol=engine._settings.dydx_symbol_token0,
+        )
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_engine_start_skips_cancel_when_no_op_active():
+    """No active op -> engine doesn't own a grid, must not touch Lighter."""
+    engine = _make_engine()
+    engine._exchange = MagicMock()
+    engine._exchange.connect = AsyncMock()
+    engine._exchange.disconnect = AsyncMock()
+    engine._exchange.subscribe_fills = AsyncMock()
+    engine._exchange.cancel_all_stops = AsyncMock()
+    engine._db.get_active_operation = AsyncMock(return_value=None)
+    engine._pool_reader = MagicMock()
+    engine._beefy_reader = MagicMock()
+    engine._settings.predictive_grid_v2 = True
+
+    async def _noop():
+        await asyncio.sleep(0)
+    engine._main_loop = _noop
+    engine._grid_event_loop = _noop
+
+    await engine.start()
+    try:
+        engine._exchange.cancel_all_stops.assert_not_called()
+    finally:
+        await engine.stop()
