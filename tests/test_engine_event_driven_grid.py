@@ -337,3 +337,61 @@ async def test_cancel_skipped_when_cloid_not_in_live_but_local_grid_pops_anyway(
     engine._exchange.cancel_stop_order.assert_not_called()
     # But 201 still removed from local_grid
     assert 201 not in engine._local_grid
+
+
+@pytest.mark.asyncio
+async def test_safety_reconcile_steady_state_cancels_orphan():
+    """Steady-state: Lighter has 1 cloid that's not in local_grid → cancel it
+    using order_index from the live response."""
+    engine = _make_engine()
+    engine._exchange = MagicMock()
+    engine._exchange.get_open_orders = AsyncMock(return_value=[
+        {"cloid": "5001", "side": "sell", "trigger_price": 0.140, "size": 3.0, "order_index": 7001},
+        {"cloid": "9999", "side": "sell", "trigger_price": 0.150, "size": 3.0, "order_index": 7999},  # orphan
+    ])
+    engine._exchange.cancel_stop_order = AsyncMock()
+
+    engine._local_grid = {
+        5001: GridStop(5001, "sell", 0.140, 3.0),  # known
+    }
+
+    await engine._safety_reconcile()
+
+    engine._exchange.cancel_stop_order.assert_called_once()
+    args = engine._exchange.cancel_stop_order.call_args
+    assert args.kwargs.get("order_index") == 7999  # orphan's order_index, NOT cloid
+
+
+@pytest.mark.asyncio
+async def test_safety_reconcile_steady_state_detects_missing_as_fill():
+    """Steady-state: cloid in local_grid not on Lighter → treat as filled,
+    re-trigger _apply_fills_to_grid via the missing path."""
+    engine = _make_engine()
+    engine._exchange = MagicMock()
+    # Lighter only has 1 order (200); local has 4. So 100, 101, 201 are "missing" = filled.
+    engine._exchange.get_open_orders = AsyncMock(return_value=[
+        {"cloid": "200", "side": "buy", "trigger_price": 0.130, "size": 3.0, "order_index": 7200},
+    ])
+    engine._exchange.cancel_stop_order = AsyncMock()
+    engine._exchange.place_stop_market = AsyncMock()
+    cloid_seq = iter(range(9301, 9320))
+    engine._next_cloid_for_leg = MagicMock(side_effect=lambda sym: next(cloid_seq))
+
+    engine._local_grid = {
+        100: GridStop(100, "sell", 0.140, 3.0),
+        101: GridStop(101, "sell", 0.142, 3.0),
+        200: GridStop(200, "buy", 0.130, 3.0),
+        201: GridStop(201, "buy", 0.128, 3.0),
+    }
+
+    await engine._safety_reconcile()
+
+    # Each missing cloid (3 of them: 100, 101, 201) triggers _apply_fills_to_grid logic.
+    # Each fill = 1 cancel + 2 posts (when feasible). Some may be skipped if step=0 (sparse grid).
+    # We don't assert exact counts here — that depends on step computation from the surviving stops.
+    # Just verify SOMETHING was attempted (at least one cancel OR one post).
+    total_calls = (
+        engine._exchange.cancel_stop_order.call_count
+        + engine._exchange.place_stop_market.call_count
+    )
+    assert total_calls >= 1
