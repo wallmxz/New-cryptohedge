@@ -124,3 +124,90 @@ async def test_skip_fill_when_step_is_zero():
     engine._exchange.place_stop_market.assert_not_called()
     # local_grid unchanged
     assert 100 in engine._local_grid
+
+
+@pytest.mark.asyncio
+async def test_single_buy_fill_triggers_3_writes():
+    """A buy fills → cancel highest sell + post sell at fill trigger + post buy at bottom-step."""
+    engine = _make_engine()
+    engine._exchange = MagicMock()
+    engine._exchange.cancel_stop_order = AsyncMock()
+    engine._exchange.place_stop_market = AsyncMock()
+    engine._next_cloid_for_leg = MagicMock(side_effect=[9101, 9102])
+
+    engine._local_grid = {
+        100: GridStop(100, "sell", 0.140, 3.0),
+        101: GridStop(101, "sell", 0.142, 3.0),  # highest sell — gets cancelled
+        200: GridStop(200, "buy", 0.130, 3.0),   # this one filled
+        201: GridStop(201, "buy", 0.128, 3.0),   # bottom buy
+    }
+    step = 0.002
+
+    await engine._apply_fills_to_grid(filled_cloids={200}, step=step)
+
+    assert engine._exchange.cancel_stop_order.call_count == 1
+    posts = engine._exchange.place_stop_market.call_args_list
+    assert engine._exchange.place_stop_market.call_count == 2
+    # First post: new sell at filled buy's trigger (0.130)
+    assert posts[0].kwargs["side"] == "sell"
+    assert posts[0].kwargs["trigger_price"] == 0.130
+    # Second post: new buy at bottom - step = 0.128 - 0.002 = 0.126
+    assert posts[1].kwargs["side"] == "buy"
+    assert abs(posts[1].kwargs["trigger_price"] - 0.126) < 1e-9
+
+    assert 200 not in engine._local_grid
+    assert 101 not in engine._local_grid
+    assert engine._local_grid[9101].side == "sell"
+    assert engine._local_grid[9101].trigger_price == 0.130
+    assert engine._local_grid[9102].side == "buy"
+    assert abs(engine._local_grid[9102].trigger_price - 0.126) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_two_sells_filled_same_iter_processed_in_order():
+    """Two sells filled simultaneously → 6 writes (2 cancels + 4 posts).
+    Closest-to-market processed first."""
+    engine = _make_engine()
+    engine._exchange = MagicMock()
+    engine._exchange.cancel_stop_order = AsyncMock()
+    engine._exchange.place_stop_market = AsyncMock()
+    cloid_seq = iter(range(9201, 9210))
+    engine._next_cloid_for_leg = MagicMock(side_effect=lambda sym: next(cloid_seq))
+
+    # 4-stop pre-grid; 2 lowest sells fill
+    engine._local_grid = {
+        100: GridStop(100, "sell", 0.140, 3.0),  # filled (closest to market)
+        101: GridStop(101, "sell", 0.142, 3.0),  # filled
+        102: GridStop(102, "sell", 0.144, 3.0),  # top sell BEFORE fills
+        200: GridStop(200, "buy", 0.130, 3.0),
+        201: GridStop(201, "buy", 0.128, 3.0),  # 2nd lowest
+        202: GridStop(202, "buy", 0.126, 3.0),  # lowest buy (farthest from market)
+    }
+    step = 0.002
+
+    await engine._apply_fills_to_grid(filled_cloids={100, 101}, step=step)
+
+    # 2 cancels + 4 posts = 6 writes
+    assert engine._exchange.cancel_stop_order.call_count == 2
+    assert engine._exchange.place_stop_market.call_count == 4
+
+    # First fill processed (cloid 100, lowest sell at 0.140 = closest to market):
+    #  - cancel lowest buy = 202 at 0.126 (farthest from market below)
+    #  - post buy at 0.140
+    #  - post sell at top (102=0.144) + 0.002 = 0.146
+    # Second fill processed (cloid 101, sell at 0.142):
+    #  - lowest_buy now 201 at 0.128 (since 202 was cancelled); cancel it
+    #  - post buy at 0.142
+    #  - post sell at top (now 9202 at 0.146) + 0.002 = 0.148
+
+    cancels = engine._exchange.cancel_stop_order.call_args_list
+    posts = engine._exchange.place_stop_market.call_args_list
+
+    cancel_cloids = [c.kwargs.get("cloid_int") for c in cancels]
+    assert cancel_cloids == [202, 201]
+
+    post_prices = [(p.kwargs["side"], p.kwargs["trigger_price"]) for p in posts]
+    assert post_prices[0] == ("buy", 0.140)
+    assert post_prices[1] == ("sell", pytest.approx(0.146))
+    assert post_prices[2] == ("buy", 0.142)
+    assert post_prices[3] == ("sell", pytest.approx(0.148))
