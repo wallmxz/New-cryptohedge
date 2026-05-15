@@ -799,13 +799,19 @@ class GridMakerEngine:
             await asyncio.sleep(max(0.0, period - elapsed))
 
     def _next_cloid(self, level_idx: int) -> int:
-        """Generate unique cloid as int (dYdX requires int)."""
+        """Generate unique cloid as int (dYdX/Lighter accept int64).
+
+        Layout (64 bits): run_id (32) | level_idx (8) | seq (24).
+        24-bit seq = 16M unique cloids per (run, level) — effectively
+        unlimited within a single bot run. Pre-2026-05-15 used 8-bit seq,
+        which wrapped at 256 and collided with prior `grid_orders` rows
+        (UNIQUE constraint), causing infinite reconciler retry loops.
+        """
         self._cloid_seq += 1
-        # Combine run_id (low 16 bits) + level_idx (low 8 bits) + seq (low 8 bits)
         return (
-            ((self._run_id & 0xFFFF) << 16) |
-            ((level_idx & 0xFF) << 8) |
-            (self._cloid_seq & 0xFF)
+            ((self._run_id & 0xFFFFFFFF) << 32) |
+            ((level_idx & 0xFF) << 24) |
+            (self._cloid_seq & 0xFFFFFF)
         )
 
     async def _refresh_vault_readers(self) -> None:
@@ -1774,13 +1780,17 @@ class GridMakerEngine:
 
     def _next_cloid_for_leg(self, symbol: str) -> int:
         """Generate a cloid scoped per leg so concurrent fires from different
-        legs never collide. Encodes a byte for the leg identity."""
+        legs never collide.
+
+        Layout (64 bits): run_id (32) | leg_byte (8) | seq (24).
+        See `_next_cloid` for the rationale on the 24-bit seq window.
+        """
         self._cloid_seq += 1
         leg_byte = 0xA0 if symbol == self._settings.dydx_symbol_token0 else 0xA1
         return (
-            ((self._run_id & 0xFFFF) << 16) |
-            (leg_byte << 8) |
-            (self._cloid_seq & 0xFF)
+            ((self._run_id & 0xFFFFFFFF) << 32) |
+            (leg_byte << 24) |
+            (self._cloid_seq & 0xFFFFFF)
         )
 
     async def _on_funding_payment(self, entry) -> None:
