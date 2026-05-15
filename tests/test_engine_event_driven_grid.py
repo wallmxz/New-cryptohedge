@@ -558,3 +558,52 @@ async def test_drift_correction_only_updates_for_primary_leg():
     assert engine._last_known_position is old_pos
     # get_position never called for the secondary leg
     engine._exchange.get_position.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_maintain_grid_still_cancels_on_range_change():
+    """Range change (Beefy rebalance) detected -> cancel_all_stops still fires.
+    The event-driven loop handles fills; _maintain_grid handles structural changes."""
+    from engine import GridMakerEngine
+
+    settings = MagicMock()
+    settings.predictive_grid_v2 = True
+    settings.dydx_symbol_token0 = "ARB-USD"
+    settings.dydx_symbol_token1 = ""
+    settings.token0_decimals = 18
+    settings.token1_decimals = 6
+    settings.uniswap_v3_pool_fee = 500
+    settings.alert_webhook_url = ""
+
+    db = MagicMock()
+    db.get_active_grid_orders = AsyncMock(return_value=[])
+    db.mark_grid_order_cancelled = AsyncMock()
+
+    exchange = MagicMock()
+    exchange.cancel_all_stops = AsyncMock()
+
+    engine = GridMakerEngine(
+        settings=settings, hub=MagicMock(), db=db, exchange=exchange,
+    )
+    # Simulate: previously posted with sig X, now cache shows different sig.
+    # Use ticks around -100/100 so p_now=1e-12 (~1.0001^0 / 10^12) is in range.
+    engine._posted_grid_signature = (1.0, -100, 100)
+    cache = MagicMock()
+    cache.L_main = 2.0  # different L → range change
+    cache.tick_lower_main = -100
+    cache.tick_upper_main = 100
+    engine._hedge_model = MagicMock()
+    engine._hedge_model._cache = cache
+
+    beefy_pos = MagicMock(share=1.0)
+
+    # p_now within range. tick_to_human_price with d0=18, d1=6:
+    # p_a (tick=-100) ~= 1.0001^-100 * 10^12 ~= 0.99 * 10^12; p_b ~= 1.01 * 10^12.
+    # So p_now in that range:
+    p_now = 1.0e12
+
+    await engine._maintain_grid(
+        beefy_pos=beefy_pos, p_now=p_now, oracle_prices={},
+    )
+
+    exchange.cancel_all_stops.assert_called()

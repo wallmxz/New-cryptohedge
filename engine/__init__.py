@@ -1353,46 +1353,33 @@ class GridMakerEngine:
     async def _maintain_grid(
         self, *, beefy_pos, p_now: float, oracle_prices: dict[str, float],
     ) -> None:
-        """Mantém grade de stop-limit orders alinhada aos ticks ativos da Beefy.
+        """Mantém estrutura da grade — out-of-range guard + range change detection
+        + initial placement. Mutações fill-driven são responsabilidade do
+        _grid_event_loop (100ms cadence).
 
-        Implementa o lifecycle event-driven descrito no spec
-        (docs/superpowers/specs/2026-05-12-predictive-grid-v2-design.md, Sec 6):
-          - Detecta mudança de range (tick_lower/upper) e L_main do HedgeModel
-            cache → cancel-all + rebuild
-          - Detecta drift de composição → rebuild
-          - Detecta preço fora do range → cancel-all + idle
-          - Insere próximo nível quando ordem fillha (handler separado em
-            _on_grid_fill, Task B5)
-
-        No-op se feature flag PREDICTIVE_GRID_V2 desligada (default).
-        Implementação completa em B4.
+        Spec: docs/superpowers/specs/2026-05-15-event-driven-grid-design.md
+        (replaces self-healing reconciler from 2026-05-13 — that path caused
+        19k UNIQUE failures + Lighter 429 saturation by re-posting on every tick).
         """
         if not self._settings.predictive_grid_v2:
             return
         if self._hedge_model is None or self._hedge_model._cache is None:
-            # Cache cold — sem L_main / ticks confiáveis. Skipa silenciosamente;
-            # próxima iter (com refresh feito) pega.
             return
 
-        from engine.curve import compute_grid_from_pool_ticks, tick_to_human_price
-        from math import log, floor
+        from engine.curve import tick_to_human_price
 
         cache = self._hedge_model._cache
-
-        # Out-of-range guard (user spec 2026-05-14): se o preço atual está
-        # fora do range Beefy, "para de mexer" — cancela grade ativa e fica
-        # idle. Próximo rebalance Beefy vai reposicionar e o engine reinicia
-        # a grade quando o preço voltar pro range novo.
         decimals0 = self._settings.token0_decimals
         decimals1 = self._settings.token1_decimals
-        p_a_human = tick_to_human_price(
+        p_a = tick_to_human_price(
             tick=cache.tick_lower_main, decimals0=decimals0, decimals1=decimals1,
         )
-        p_b_human = tick_to_human_price(
+        p_b = tick_to_human_price(
             tick=cache.tick_upper_main, decimals0=decimals0, decimals1=decimals1,
         )
-        if not (p_a_human <= p_now <= p_b_human):
-            # Fora do range. Cancela grade ativa se existir e sai.
+
+        # Out-of-range guard: cancel + idle. Event loop will rebuild when back.
+        if not (p_a <= p_now <= p_b):
             if getattr(self, "_posted_grid_signature", None) is not None:
                 try:
                     await self._exchange.cancel_all_stops(
@@ -1401,16 +1388,14 @@ class GridMakerEngine:
                 except Exception as e:
                     logger.warning(f"out-of-range cancel_all_stops failed: {e}")
                 self._posted_grid_signature = None
+                self._local_grid.clear()  # event loop will repopulate when in range
                 metrics.grid_levels_active.set(0)
             return
 
-        # Signature atual da geometria (L + ticks bounds). Detecta Beefy
-        # rebalance: quando muda, cancela tudo + rebuild fresh.
         current_sig = (cache.L_main, cache.tick_lower_main, cache.tick_upper_main)
         posted_sig = getattr(self, "_posted_grid_signature", None)
 
-        # Range change (Beefy rebalanceou) → cancel-all + DB cleanup, depois
-        # cai pro reconcile que vai postar grade nova.
+        # Range change → cancel all + clear local_grid; safety_reconcile populates fresh.
         if posted_sig is not None and posted_sig != current_sig:
             metrics.beefy_range_change_total.inc()
             try:
@@ -1425,59 +1410,43 @@ class GridMakerEngine:
                     await self._db.mark_grid_order_cancelled(
                         row["cloid"], time.time(),
                     )
-                    metrics.grid_stops_cancelled_total.inc()
             except Exception as e:
                 logger.warning(f"range_change db cleanup failed: {e}")
-            self._posted_grid_signature = None  # força reconcile inicial
+            self._posted_grid_signature = None
+            self._local_grid.clear()
+            self._last_safety_reconcile_at = 0.0  # force immediate safety reconcile
 
-        # Sempre reconcilia (self-healing): computa desired 8+8 ao redor de
-        # tick_now atual, compara com live na Lighter, posta missing,
-        # cancela extras. Idempotente. Trailing emerge naturalmente quando
-        # tick_now anda — diff cancela extremo distante + posta extremo novo.
-        # Crucial: fills ASSÍNCRONOS dos SL_MARKETs não disparam fill
-        # callback no SDK (só `place_long_term_order` faz inline confirm).
-        # Reconcile cada iter recupera de fills perdidos sem depender de WS.
-        # Validado bug live 2026-05-14: sells fillaram, position cresceu 31 ARB,
-        # bot_grid_stops_filled_total = 0 (WS callback nunca chamado).
-        rebuild_reason = "initial" if posted_sig is None else "reconcile"
-        await self._reconcile_grid(
-            beefy_pos=beefy_pos, p_now=p_now, cache=cache,
-            rebuild_reason=rebuild_reason,
-        )
-        self._posted_grid_signature = current_sig
+        # Initial placement: if no signature posted yet AND in range, post the
+        # initial 8+8 grid via _post_initial_grid (extracted from old _reconcile_grid).
+        if posted_sig is None:
+            await self._post_initial_grid(beefy_pos=beefy_pos, p_now=p_now, cache=cache)
+            self._posted_grid_signature = current_sig
 
-    async def _reconcile_grid(
-        self, *, beefy_pos, p_now: float, cache, rebuild_reason: str,
+    async def _post_initial_grid(
+        self, *, beefy_pos, p_now: float, cache,
     ) -> None:
-        """Self-healing: compara desired 8+8 com live Lighter, posta missing,
-        cancela extras. Trailing emerge naturalmente da mudança de tick_now.
+        """Initial grid placement: 8 sells + 8 buys aligned to V3 ticks around p_now.
+        Populates _local_grid and _last_known_position so the event loop has a
+        baseline to detect fills against.
 
-        Spec design 2026-05-14: substituiu o fill-callback-driven trailing,
-        que não funcionava pra SL_MARKETs (fills assíncronos não disparam
-        callback no SDK). Idempotente, recupera de fills perdidos.
+        Extracted from old _reconcile_grid posting branch (2026-05-13). Differs
+        only in: (a) populates _local_grid as it posts, (b) sets _last_known_position
+        after, (c) only runs once per signature (caller checks posted_sig is None).
         """
         from math import log, floor
-        from engine.curve import (
-            compute_grid_from_pool_ticks, tick_to_human_price,
-        )
+        from engine.curve import compute_grid_from_pool_ticks
+        from engine.grid_state import GridStop
 
         decimals0 = self._settings.token0_decimals
         decimals1 = self._settings.token1_decimals
         decimal_factor = 10 ** (decimals0 - decimals1)
         tick_now = floor(log(p_now / decimal_factor) / log(1.0001))
-
         fee_tier = self._settings.uniswap_v3_pool_fee
-        tick_spacing_map = {500: 10, 3000: 60, 10000: 200}
-        tick_spacing = tick_spacing_map.get(fee_tier, 10)
-
+        tick_spacing = {500: 10, 3000: 60, 10000: 200}.get(fee_tier, 10)
         hedge_ratio = (
             getattr(self._hub, "hedge_ratio", None)
             or self._settings.hedge_ratio
         )
-        # cache.L_main é RAW V3 strategy-total. Para retornar tokens em
-        # human units com prices em human units, escalar por
-        # 1/10^((d0+d1)/2) e aplicar share. (See full comment in earlier
-        # commit message for ARB-USDC.e math.)
         l_decimal_factor = 10 ** ((decimals0 + decimals1) / 2)
         share = float(getattr(beefy_pos, "share", 1.0) or 1.0)
         L_for_grid = float(cache.L_main) / l_decimal_factor * share
@@ -1491,103 +1460,35 @@ class GridMakerEngine:
             decimals0=decimals0,
             decimals1=decimals1,
             hedge_ratio=hedge_ratio,
-            lighter_price_decimals=5,  # ARB-USD on Lighter (TODO: source from meta)
+            lighter_price_decimals=5,
             lighter_size_decimals=1,
         )
 
-        # 8+8 closest a tick_now (max_open_orders default 16)
         max_orders = int(getattr(self._settings, "max_open_orders", 16) or 16)
         per_side = max_orders // 2
-        desired_sells = sorted(
+        sells = sorted(
             [lv for lv in full_grid if lv.side == "sell"],
             key=lambda lv: -lv.price,
         )[:per_side]
-        desired_buys = sorted(
+        buys = sorted(
             [lv for lv in full_grid if lv.side == "buy"],
             key=lambda lv: lv.price,
         )[:per_side]
-        desired = desired_sells + desired_buys
 
-        # Get live orders na Lighter (authoritativo — DB pode estar dessincronizado)
         symbol = self._settings.dydx_symbol_token0
-        try:
-            live_orders = await self._exchange.get_open_orders(symbol)
-        except Exception as e:
-            logger.warning(f"reconcile: get_open_orders failed: {e}")
-            return
-
         buffer = float(getattr(self._settings, "grid_anticipation_buffer", 0.0) or 0.0)
-        price_decimals = 5  # TODO source from meta
-
-        # Build live map: (side, recovered_tick_price) → order
-        # Recover tick_price desfazendo o buffer: para sell, trigger = tick + buffer
-        # → tick = trigger - buffer; para buy, tick = trigger + buffer.
-        live_by_key: dict[tuple[str, float], dict] = {}
-        for o in live_orders:
-            if o["side"] == "sell":
-                recovered = o["trigger_price"] - buffer
-            else:
-                recovered = o["trigger_price"] + buffer
-            key = (o["side"], round(recovered, price_decimals))
-            live_by_key[key] = o
-
-        # Desired key set
-        desired_keys = {
-            (lv.side, round(lv.price, price_decimals)) for lv in desired
-        }
-
-        # Cancel extras (live mas não desired). Order indexes opcionais
-        # — alguns adapters não preenchem; nesse caso skip (cancel_all_stops
-        # já tratou no range_change path).
-        extras_keys = set(live_by_key.keys()) - desired_keys
-        for key in extras_keys:
-            o = live_by_key[key]
-            oi = o.get("order_index", 0)
-            if not oi:
-                continue
-            try:
-                await self._exchange.cancel_stop_order(
-                    symbol=symbol, order_index=oi,
-                )
-                metrics.grid_stops_cancelled_total.inc()
-                try:
-                    await self._db.mark_grid_order_cancelled(
-                        o["cloid"], time.time(),
-                    )
-                except Exception:
-                    pass
-                logger.info(
-                    f"reconcile cancel {key[0]} @ ${key[1]:.5f} (cloid {o['cloid']})"
-                )
-            except Exception as e:
-                logger.warning(f"reconcile cancel failed: {e}")
-
-        # Post missing (desired mas não live)
-        # CRITICAL guard 2026-05-14: o buffer pode empurrar o trigger PRA
-        # ALÉM do market quando o tick está muito próximo (within ~1 V3
-        # spacing). Resultado: SL_SELL com trigger > market → Lighter
-        # aceita o tx mas rejeita silenciosamente no settlement zk-rollup
-        # (sells "somem" depois de 200ms). Validado live 2026-05-14:
-        # buffer $0.00005 → 4 sells closest dead; $0.00010 → 8 sells dead.
-        # Solution: dynamic clamp do trigger pra ficar do lado correto do
-        # market (com safety margin ~1 V3 tick = 0.01%).
-        safety_frac = 0.0001  # 0.01% safety margin (~1 V3 tick em 0.05% pool)
+        safety_frac = 0.0001  # 0.01% (~1 V3 tick em 0.05% pool)
         posted_count = 0
-        skipped_too_close = 0
-        for lv in desired:
-            key = (lv.side, round(lv.price, price_decimals))
-            if key in live_by_key:
-                continue  # já no book
+
+        for lv in sells + buys:
             if lv.side == "sell":
                 max_trigger = p_now * (1 - safety_frac)
                 if lv.price >= max_trigger:
-                    skipped_too_close += 1
-                    continue  # tick mesmo já tá em ou acima da safety bound
+                    continue
                 trigger = min(lv.price + buffer, max_trigger)
-            else:  # buy
+            else:
                 min_trigger = p_now * (1 + safety_frac)
                 if lv.price <= min_trigger:
-                    skipped_too_close += 1
                     continue
                 trigger = max(lv.price - buffer, min_trigger)
             cloid = self._next_cloid_for_leg(symbol)
@@ -1598,6 +1499,10 @@ class GridMakerEngine:
                 )
                 metrics.grid_stops_placed_total.inc()
                 posted_count += 1
+                self._local_grid[cloid] = GridStop(
+                    cloid=cloid, side=lv.side,
+                    trigger_price=trigger, size=lv.size,
+                )
                 try:
                     await self._db.insert_grid_order(
                         cloid=str(cloid), side=lv.side,
@@ -1607,31 +1512,30 @@ class GridMakerEngine:
                         trigger_price=trigger, is_stop_order=1,
                     )
                 except Exception as e:
-                    logger.warning(f"reconcile db insert failed: {e}")
+                    logger.warning(f"initial grid db insert failed: {e}")
                 logger.info(
-                    f"reconcile post {lv.side} @ ${lv.price:.5f} trigger ${trigger:.5f}"
+                    f"initial post {lv.side} @ ${lv.price:.5f} trigger ${trigger:.5f}"
                 )
             except Exception as e:
                 logger.warning(
-                    f"reconcile place_stop_market failed @ {lv.price}: {e}"
+                    f"initial grid place_stop_market failed @ {lv.price}: {e}"
                 )
 
-        # Final count: live kept + posted
-        kept_count = sum(1 for k in desired_keys if k in live_by_key)
-        final_active = kept_count + posted_count
-        metrics.grid_levels_active.set(final_active)
-        metrics.grid_rebuild_total.labels(reason=rebuild_reason).inc()
-
+        metrics.grid_levels_active.set(posted_count)
+        metrics.grid_rebuild_total.labels(reason="initial").inc()
         gh = self._hub.grid_health_metrics
-        gh["levels_active"] = final_active
-        gh["last_rebuild_reason"] = rebuild_reason
+        gh["levels_active"] = posted_count
+        gh["last_rebuild_reason"] = "initial"
         gh["last_rebuild_ts"] = time.time()
-        if rebuild_reason == "initial":
-            gh["stops_placed_total"] = gh.get("stops_placed_total", 0) + posted_count
-            gh["rebuilds_total"] = gh.get("rebuilds_total", 0) + 1
-        elif posted_count > 0 or extras_keys:
-            gh["stops_placed_total"] = gh.get("stops_placed_total", 0) + posted_count
-            # Reconcile que mexeu em algo conta como "rebuild" leve
+        gh["stops_placed_total"] = gh.get("stops_placed_total", 0) + posted_count
+        gh["rebuilds_total"] = gh.get("rebuilds_total", 0) + 1
+
+        # Set last_known_position to current so the event loop doesn't misinterpret
+        # the initial post as a fill event.
+        try:
+            self._last_known_position = await self._exchange.get_position(symbol)
+        except Exception:
+            pass
 
     async def _apply_fills_to_grid(
         self, *, filled_cloids: set[int], step: float,
@@ -1974,15 +1878,15 @@ class GridMakerEngine:
     async def _on_grid_fill(
         self, *, cloid: int, fill_price: float, fill_size: float, side: str,
     ) -> None:
-        """Fast-path tracking ONLY (metrics + db mark) — trailing logic vive em
-        `_reconcile_grid` que roda toda iter.
+        """Fast-path tracking ONLY (metrics + db mark) — trailing logic vive
+        em `_grid_event_loop` (event-driven, 100ms cadence).
 
         Spec 2026-05-14: o callback `_fill_callback` na adapter SÓ é
         disparado dentro de `place_long_term_order` (após inline confirm).
         Stop-market orders que disparam ASSINCRONAMENTE (mark cruza trigger
         depois) NÃO chegam aqui. Por isso a fonte autoritativa do estado
-        da grade é `get_open_orders` query (em `_reconcile_grid`), não
-        eventos de fill.
+        da grade é position-change detection no `_grid_event_loop` +
+        safety_reconcile via `get_open_orders`, não eventos de fill.
 
         Este handler fica como best-effort latency tracking quando o
         callback acontece (ex: place_taker drift correction).

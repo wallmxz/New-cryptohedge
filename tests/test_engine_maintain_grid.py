@@ -41,6 +41,8 @@ async def test_maintain_grid_caps_at_max_open_orders_centered_on_tick_now():
     engine._hub.hedge_ratio = 1.0
     engine._next_cloid_for_leg = MagicMock(side_effect=lambda sym: 1)
     engine._posted_grid_signature = None
+    engine._local_grid = {}
+    engine._last_known_position = None
 
     tick_lo, tick_hi = -297890, -294890  # 3000-tick range, spacing 10 → 300 levels
     cache = HedgeModelCache(
@@ -116,6 +118,8 @@ async def test_maintain_grid_applies_anticipation_buffer_to_triggers():
     engine._hub.hedge_ratio = 1.0
     engine._next_cloid_for_leg = MagicMock(return_value=1)
     engine._posted_grid_signature = None
+    engine._local_grid = {}
+    engine._last_known_position = None
 
     tick_lo, tick_hi = -297890, -294890
     cache = HedgeModelCache(
@@ -203,6 +207,8 @@ async def test_maintain_grid_scales_raw_L_by_decimal_factor_and_share():
     engine._hub.hedge_ratio = 1.0
     engine._next_cloid_for_leg = MagicMock(return_value=1)
     engine._posted_grid_signature = None
+    engine._local_grid = {}
+    engine._last_known_position = None
 
     # Realistic ARB/USDC.e shape (from live op #29):
     tick_lo, tick_hi = -297890, -294890
@@ -285,6 +291,8 @@ async def test_maintain_grid_uses_real_pool_ticks_not_log_of_raw_price():
     engine._hub.hedge_ratio = 1.0
     engine._next_cloid_for_leg = MagicMock(side_effect=lambda sym: 1)
     engine._posted_grid_signature = None
+    engine._local_grid = {}
+    engine._last_known_position = None
 
     # Real cache shape: RAW V3 prices (from math.pow(1.0001, tick)), plus
     # the cached ticks themselves so _maintain_grid can use them directly.
@@ -398,6 +406,8 @@ async def test_maintain_grid_rebuilds_when_no_grid_posted():
 
     # Estado inicial: sem grade posted
     engine._posted_grid_signature = None
+    engine._local_grid = {}
+    engine._last_known_position = None
 
     await engine._maintain_grid(
         beefy_pos=MagicMock(),
@@ -571,230 +581,25 @@ def _trailing_engine(side: str, *, live_orders: list[dict],
     return engine
 
 
-@pytest.mark.asyncio
-async def test_reconcile_posts_missing_levels_when_grid_has_gaps():
-    """Quando alguns levels do desired estão missing no live (ex: sells
-    fillaram async sem callback), reconcile detecta + posta. Self-healing.
-
-    Spec 2026-05-14: substitui o fill-callback trailing — agora trailing
-    emerge da reconciliação cada iter."""
-    from engine import GridMakerEngine
-    from engine.hedge_model import HedgeModelCache
-    from engine.curve import compute_grid_from_pool_ticks
-    import time as time_mod
-    from math import log, floor
-
-    engine = GridMakerEngine.__new__(GridMakerEngine)
-    engine._settings = MagicMock()
-    engine._settings.grid_anticipation_buffer = 0.0
-    engine._settings.max_open_orders = 16
-    engine._settings.min_rebalance_notional_usd = 1.0
-    engine._settings.predictive_grid_v2 = True
-    engine._settings.token0_decimals = 18
-    engine._settings.token1_decimals = 6
-    engine._settings.dydx_symbol_token0 = "ARB-USD"
-    engine._settings.hedge_ratio = 1.0
-    engine._settings.uniswap_v3_pool_fee = 500
-    engine._db = AsyncMock()
-    engine._db.get_active_grid_orders = AsyncMock(return_value=[])
-    engine._hub = MagicMock()
-    engine._hub.current_operation_id = 1
-    engine._hub.hedge_ratio = 1.0
-    engine._next_cloid_for_leg = MagicMock(side_effect=range(100, 200))
-
-    tick_lo, tick_hi = -299580, -292650
-    cache = HedgeModelCache(
-        L_main=int(2.74e17),
-        p_a_main=math.pow(1.0001, tick_lo),
-        p_b_main=math.pow(1.0001, tick_hi),
-        L_alt=None, p_a_alt=None, p_b_alt=None,
-        refreshed_at=time_mod.monotonic(),
-        tick_lower_main=tick_lo, tick_upper_main=tick_hi,
-    )
-    hm = MagicMock()
-    hm._cache = cache
-    engine._hedge_model = hm
-
-    # Compute the desired grid, then simulate "only buys live, sells fillaram"
-    p_now = 0.14
-    decimal_factor = 10 ** 12
-    l_factor = 10 ** 12
-    L_for_grid = float(int(2.74e17)) / l_factor * 0.0079
-    tick_now = floor(log(p_now / decimal_factor) / log(1.0001))
-    full = compute_grid_from_pool_ticks(
-        L=L_for_grid, tick_lower=tick_lo, tick_upper=tick_hi,
-        tick_spacing=10, tick_now=tick_now,
-        decimals0=18, decimals1=6, hedge_ratio=1.0,
-        lighter_price_decimals=5, lighter_size_decimals=1,
-    )
-    sells = sorted([lv for lv in full if lv.side == "sell"], key=lambda lv: -lv.price)[:8]
-    buys = sorted([lv for lv in full if lv.side == "buy"], key=lambda lv: lv.price)[:8]
-    # Live: somente os 8 buys (sells fillaram fora do nosso conhecimento)
-    live_orders = [
-        {"side": "buy", "cloid": f"b{i}", "order_index": 100 + i,
-         "trigger_price": lv.price, "size": lv.size, "type": "stop-loss"}
-        for i, lv in enumerate(buys)
-    ]
-    engine._exchange = AsyncMock()
-    engine._exchange.place_stop_market = AsyncMock()
-    engine._exchange.cancel_stop_order = AsyncMock()
-    engine._exchange.cancel_all_stops = AsyncMock()
-    engine._exchange.get_open_orders = AsyncMock(return_value=live_orders)
-
-    engine._posted_grid_signature = (int(2.74e17), tick_lo, tick_hi)
-    beefy_pos = MagicMock()
-    beefy_pos.share = 0.0079
-
-    await engine._maintain_grid(
-        beefy_pos=beefy_pos, p_now=p_now,
-        oracle_prices={"ARB-USD": p_now},
-    )
-
-    # Deve postar exatamente os 8 sells faltantes (buys já estão live).
-    calls = engine._exchange.place_stop_market.call_args_list
-    posted_sides = [c.kwargs["side"] for c in calls]
-    assert posted_sides.count("sell") == 8, (
-        f"expected 8 sells posted, got {posted_sides.count('sell')}; full={posted_sides}"
-    )
-    assert posted_sides.count("buy") == 0
-    # E nada cancelado (todos os buys live estão dentro do desired)
-    engine._exchange.cancel_stop_order.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_reconcile_clamps_trigger_to_safety_margin_from_market():
-    """Spec 2026-05-14: o anticipation buffer pode empurrar trigger pra além
-    do market quando o tick é too-close. Lighter rejeita silenciosamente
-    no settlement. Reconcile deve clampar OU pular esses levels."""
-    from engine import GridMakerEngine
-    from engine.hedge_model import HedgeModelCache
-    import time as time_mod
-
-    engine = GridMakerEngine.__new__(GridMakerEngine)
-    engine._settings = MagicMock()
-    engine._settings.grid_anticipation_buffer = 0.00010  # might cross
-    engine._settings.max_open_orders = 16
-    engine._settings.min_rebalance_notional_usd = 1.0
-    engine._settings.predictive_grid_v2 = True
-    engine._settings.token0_decimals = 18
-    engine._settings.token1_decimals = 6
-    engine._settings.dydx_symbol_token0 = "ARB-USD"
-    engine._settings.hedge_ratio = 1.0
-    engine._settings.uniswap_v3_pool_fee = 500
-    engine._db = AsyncMock()
-    engine._db.get_active_grid_orders = AsyncMock(return_value=[])
-    engine._hub = MagicMock()
-    engine._hub.current_operation_id = 1
-    engine._hub.hedge_ratio = 1.0
-    engine._next_cloid_for_leg = MagicMock(side_effect=range(100, 200))
-
-    tick_lo, tick_hi = -299580, -292650
-    cache = HedgeModelCache(
-        L_main=int(2.74e17),
-        p_a_main=math.pow(1.0001, tick_lo),
-        p_b_main=math.pow(1.0001, tick_hi),
-        L_alt=None, p_a_alt=None, p_b_alt=None,
-        refreshed_at=time_mod.monotonic(),
-        tick_lower_main=tick_lo, tick_upper_main=tick_hi,
-    )
-    hm = MagicMock()
-    hm._cache = cache
-    engine._hedge_model = hm
-
-    # Nothing live — full reconcile from scratch
-    engine._exchange = AsyncMock()
-    engine._exchange.place_stop_market = AsyncMock()
-    engine._exchange.cancel_stop_order = AsyncMock()
-    engine._exchange.cancel_all_stops = AsyncMock()
-    engine._exchange.get_open_orders = AsyncMock(return_value=[])
-
-    engine._posted_grid_signature = (int(2.74e17), tick_lo, tick_hi)
-    beefy_pos = MagicMock()
-    beefy_pos.share = 0.0079
-    p_now = 0.14
-    await engine._maintain_grid(
-        beefy_pos=beefy_pos, p_now=p_now,
-        oracle_prices={"ARB-USD": p_now},
-    )
-
-    # Cada trigger posted DEVE ficar do lado correto do market:
-    #   SELL trigger < p_now * (1 - 0.0001) = 0.13986
-    #   BUY  trigger > p_now * (1 + 0.0001) = 0.14014
-    calls = engine._exchange.place_stop_market.call_args_list
-    assert len(calls) > 0
-    max_sell = p_now * (1 - 0.0001)
-    min_buy = p_now * (1 + 0.0001)
-    for c in calls:
-        side = c.kwargs["side"]
-        trig = c.kwargs["trigger_price"]
-        if side == "sell":
-            assert trig <= max_sell, f"SELL trigger {trig} > max_safe {max_sell}"
-        else:
-            assert trig >= min_buy, f"BUY trigger {trig} < min_safe {min_buy}"
-
-
-@pytest.mark.asyncio
-async def test_reconcile_cancels_live_orders_outside_desired_set():
-    """Live tem ordens em ticks fora da faixa desired (ex: tick_now moveu
-    e as antigas viraram extras). Reconcile cancela."""
-    from engine import GridMakerEngine
-    from engine.hedge_model import HedgeModelCache
-    import time as time_mod
-
-    engine = GridMakerEngine.__new__(GridMakerEngine)
-    engine._settings = MagicMock()
-    engine._settings.grid_anticipation_buffer = 0.0
-    engine._settings.max_open_orders = 16
-    engine._settings.min_rebalance_notional_usd = 1.0
-    engine._settings.predictive_grid_v2 = True
-    engine._settings.token0_decimals = 18
-    engine._settings.token1_decimals = 6
-    engine._settings.dydx_symbol_token0 = "ARB-USD"
-    engine._settings.hedge_ratio = 1.0
-    engine._settings.uniswap_v3_pool_fee = 500
-    engine._db = AsyncMock()
-    engine._db.get_active_grid_orders = AsyncMock(return_value=[])
-    engine._hub = MagicMock()
-    engine._hub.current_operation_id = 1
-    engine._hub.hedge_ratio = 1.0
-    engine._next_cloid_for_leg = MagicMock(side_effect=range(100, 200))
-
-    tick_lo, tick_hi = -299580, -292650
-    cache = HedgeModelCache(
-        L_main=int(2.74e17),
-        p_a_main=math.pow(1.0001, tick_lo),
-        p_b_main=math.pow(1.0001, tick_hi),
-        L_alt=None, p_a_alt=None, p_b_alt=None,
-        refreshed_at=time_mod.monotonic(),
-        tick_lower_main=tick_lo, tick_upper_main=tick_hi,
-    )
-    hm = MagicMock()
-    hm._cache = cache
-    engine._hedge_model = hm
-
-    # Live tem uma ordem em preço $0.05 (longe do desired centrado em ~$0.14)
-    live_orders = [
-        {"side": "sell", "cloid": "x1", "order_index": 999,
-         "trigger_price": 0.05000, "size": 3.0, "type": "stop-loss"},
-    ]
-    engine._exchange = AsyncMock()
-    engine._exchange.place_stop_market = AsyncMock()
-    engine._exchange.cancel_stop_order = AsyncMock()
-    engine._exchange.cancel_all_stops = AsyncMock()
-    engine._exchange.get_open_orders = AsyncMock(return_value=live_orders)
-
-    engine._posted_grid_signature = (int(2.74e17), tick_lo, tick_hi)
-    beefy_pos = MagicMock()
-    beefy_pos.share = 0.0079
-    await engine._maintain_grid(
-        beefy_pos=beefy_pos, p_now=0.14,
-        oracle_prices={"ARB-USD": 0.14},
-    )
-
-    # A ordem em $0.05 deve ter sido cancelada
-    engine._exchange.cancel_stop_order.assert_called_once()
-    cc = engine._exchange.cancel_stop_order.call_args
-    assert cc.kwargs["order_index"] == 999
+# --- DELETED 2026-05-15 (event-driven grid refactor) ----------------------
+# The following tests covered the OLD self-healing per-iter reconciler
+# (_reconcile_grid), which was deleted in Task 11. Per-iter diff-and-post
+# behavior caused 19k UNIQUE failures + Lighter 429 saturation in production.
+#
+# Replacement coverage:
+#   - test_reconcile_posts_missing_levels_when_grid_has_gaps:
+#     The "fills detected by missing-from-live" path now lives in
+#     _safety_reconcile + _grid_event_iter (test_safety_reconcile_steady_state_*
+#     in test_engine_event_driven_grid.py).
+#   - test_reconcile_clamps_trigger_to_safety_margin_from_market:
+#     The safety-frac clamp logic is preserved in _post_initial_grid;
+#     covered indirectly by test_maintain_grid_applies_anticipation_buffer_to_triggers.
+#   - test_reconcile_cancels_live_orders_outside_desired_set:
+#     Orphan-cancel is now in _safety_reconcile
+#     (test_safety_reconcile_steady_state_cancels_orphan).
+#
+# See: docs/superpowers/specs/2026-05-15-event-driven-grid-design.md
+# --------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
