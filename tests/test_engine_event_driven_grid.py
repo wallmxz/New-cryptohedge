@@ -723,3 +723,81 @@ async def test_safety_reconcile_missing_drops_phantoms_without_calling_apply_fil
     # Also: no extra place_stop_market or cancel_stop_order from the missing branch.
     # (Orphan branch may still cancel — but there are no orphans here.)
     engine._exchange.place_stop_market.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_initial_grid_drops_phantoms_after_verify():
+    """Spec D4: after _post_initial_grid posts N stops, it verifies via
+    get_open_orders 500ms later and drops cloids that didn't land
+    (Lighter silent-rejections). Without this, phantoms sit in _local_grid
+    and trigger fake-fill processing in _safety_reconcile or _grid_event_loop.
+
+    Spec: docs/superpowers/specs/2026-05-15-phantom-cloid-cleanup-design.md D4
+    """
+    from unittest.mock import patch
+
+    engine = _make_engine()
+    engine._exchange = MagicMock()
+    # All 5 place_stop_market calls "succeed" (SDK doesn't raise).
+    engine._exchange.place_stop_market = AsyncMock()
+    engine._exchange.get_position = AsyncMock(return_value=None)
+    # But Lighter actually persisted only 2 of them (cloids 9101 and 9105).
+    engine._exchange.get_open_orders = AsyncMock(return_value=[
+        {"cloid": "9101", "side": "sell", "trigger_price": 0.130, "size": 3.0, "order_index": 1},
+        {"cloid": "9105", "side": "buy", "trigger_price": 0.142, "size": 3.0, "order_index": 5},
+    ])
+    engine._db = MagicMock()
+    engine._db.insert_grid_order = AsyncMock()
+
+    # Stub _next_cloid_for_leg to deterministic values matching the live response.
+    cloid_seq = iter([9101, 9102, 9103, 9104, 9105])
+    engine._next_cloid_for_leg = MagicMock(side_effect=lambda sym: next(cloid_seq))
+
+    # Stub compute_grid_from_pool_ticks to return a simple 3 sells + 2 buys grid.
+    class FakeLevel:
+        def __init__(self, side, price, size):
+            self.side = side
+            self.price = price
+            self.size = size
+
+    # Note: stop-market semantics require sell triggers BELOW p_now (0.135)
+    # and buy triggers ABOVE p_now, else _post_initial_grid's safety filter
+    # skips them (would fire immediately). Sort: sells iterated price-desc,
+    # buys iterated price-asc, so cloids 9101..9103 = sells (0.134→0.132),
+    # 9104..9105 = buys (0.140→0.142).
+    fake_grid = [
+        FakeLevel("sell", 0.134, 3.0),
+        FakeLevel("sell", 0.133, 3.0),
+        FakeLevel("sell", 0.132, 3.0),
+        FakeLevel("buy", 0.140, 3.0),
+        FakeLevel("buy", 0.142, 3.0),
+    ]
+
+    # Mock cache + beefy_pos sufficient for _post_initial_grid to run.
+    cache = MagicMock()
+    cache.L_main = 1e18
+    cache.tick_lower_main = -100
+    cache.tick_upper_main = 100
+    beefy_pos = MagicMock(share=1.0)
+    engine._settings.token0_decimals = 18
+    engine._settings.token1_decimals = 6
+    engine._settings.uniswap_v3_pool_fee = 500
+    engine._settings.hedge_ratio = 1.0
+    engine._settings.dydx_symbol_token0 = "ARB-USD"
+    engine._settings.max_open_orders = 10
+    engine._settings.grid_anticipation_buffer = 0.0
+    engine._hub.hedge_ratio = 1.0
+    engine._hub.current_operation_id = 42
+    engine._hub.grid_health_metrics = {}
+
+    # Patch the grid-math helper to return our fake levels.
+    with patch("engine.curve.compute_grid_from_pool_ticks", return_value=fake_grid):
+        # Patch asyncio.sleep so the test doesn't actually wait 500ms.
+        with patch("engine.asyncio.sleep", new=AsyncMock()):
+            await engine._post_initial_grid(beefy_pos=beefy_pos, p_now=0.135, cache=cache)
+
+    # After post-verify: _local_grid should only contain 9101 and 9105 (the survivors).
+    # Phantoms 9102, 9103, 9104 should have been dropped.
+    assert set(engine._local_grid.keys()) == {9101, 9105}, (
+        f"expected only live cloids in local_grid after verify, got {set(engine._local_grid.keys())}"
+    )

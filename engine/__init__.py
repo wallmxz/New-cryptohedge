@@ -1552,6 +1552,34 @@ class GridMakerEngine:
         gh["stops_placed_total"] = gh.get("stops_placed_total", 0) + posted_count
         gh["rebuilds_total"] = gh.get("rebuilds_total", 0) + 1
 
+        # Post-verify (spec D4): some place_stop_market calls may have been
+        # silently rejected by Lighter (trigger past market, etc) despite the
+        # SDK returning err=None. Wait briefly for Lighter to settle, then
+        # reconcile _local_grid against live and drop cloids that didn't land.
+        # Without this, phantoms cause fake-fill cascades in _safety_reconcile
+        # / _grid_event_loop. Best-effort: a verify failure logs warning and
+        # proceeds (_safety_reconcile next cycle pops phantoms via D3).
+        await asyncio.sleep(0.5)
+        try:
+            live = await self._exchange.get_open_orders(symbol)
+            live_cloids = {int(o["cloid"]) for o in live}
+            phantoms = set(self._local_grid.keys()) - live_cloids
+            if phantoms:
+                for c in phantoms:
+                    self._local_grid.pop(c, None)
+                logger.warning(
+                    f"_post_initial_grid dropped {len(phantoms)} phantom "
+                    f"cloid(s) (Lighter silent-rejected): {sorted(phantoms)}"
+                )
+                # Adjust the levels_active metric to reflect reality.
+                metrics.grid_levels_active.set(len(self._local_grid))
+                gh["levels_active"] = len(self._local_grid)
+        except Exception as e:
+            logger.warning(
+                f"_post_initial_grid verify failed ({e!r}); proceeding. "
+                f"_safety_reconcile next cycle will clean up any phantoms."
+            )
+
         # Set last_known_position to current so the event loop doesn't misinterpret
         # the initial post as a fill event.
         try:
