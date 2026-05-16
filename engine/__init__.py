@@ -1804,12 +1804,18 @@ class GridMakerEngine:
                     f"order_index={order_index}: {e}"
                 )
 
-        # Missing on Lighter (in local but not live) → assumed filled
+        # Missing on Lighter (in local but not live) → either phantoms from
+        # Lighter silent-rejections OR real fills already caught by
+        # _grid_event_loop via position-delta. Don't process as fills here;
+        # just drop from local_grid. Spec D3 in
+        # docs/superpowers/specs/2026-05-15-phantom-cloid-cleanup-design.md.
         missing = local_cloids - live_cloids
+        for cloid in missing:
+            self._local_grid.pop(cloid, None)
         if missing:
-            step = self._estimate_grid_step()
-            await self._apply_fills_to_grid(
-                filled_cloids=missing, step=step, live_by_cloid=live_by_cloid,
+            logger.info(
+                f"_safety_reconcile dropped {len(missing)} missing cloid(s) from "
+                f"local_grid (phantoms or already-processed fills)"
             )
 
     def _estimate_grid_step(self) -> float:

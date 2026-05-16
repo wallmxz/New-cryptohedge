@@ -680,3 +680,46 @@ async def test_engine_start_skips_cancel_when_no_op_active():
         engine._exchange.cancel_all_stops.assert_not_called()
     finally:
         await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_safety_reconcile_missing_drops_phantoms_without_calling_apply_fills():
+    """Spec D3: missing cloids (in local_grid but not on Lighter) are treated
+    as phantoms (silent-rejections from Lighter) or fills-already-caught by
+    _grid_event_loop. Either way, _safety_reconcile must NOT call
+    _apply_fills_to_grid (which would post fake replacements). Just pop them
+    from _local_grid.
+
+    Spec: docs/superpowers/specs/2026-05-15-phantom-cloid-cleanup-design.md
+    """
+    engine = _make_engine()
+    engine._exchange = MagicMock()
+    # Lighter has only 2 orders live (cloid 200, 300); local has 5 (100, 101, 200, 201, 300).
+    # So 100, 101, 201 are "missing" (phantoms or already-processed fills).
+    engine._exchange.get_open_orders = AsyncMock(return_value=[
+        {"cloid": "200", "side": "buy", "trigger_price": 0.130, "size": 3.0, "order_index": 7200},
+        {"cloid": "300", "side": "sell", "trigger_price": 0.135, "size": 3.0, "order_index": 7300},
+    ])
+    engine._exchange.cancel_stop_order = AsyncMock()
+    engine._exchange.place_stop_market = AsyncMock()
+    # Patch _apply_fills_to_grid as an AsyncMock so we can detect any invocation.
+    engine._apply_fills_to_grid = AsyncMock()
+
+    engine._local_grid = {
+        100: GridStop(100, "sell", 0.140, 3.0),
+        101: GridStop(101, "sell", 0.142, 3.0),
+        200: GridStop(200, "buy", 0.130, 3.0),
+        201: GridStop(201, "buy", 0.128, 3.0),
+        300: GridStop(300, "sell", 0.135, 3.0),
+    }
+
+    await engine._safety_reconcile()
+
+    # The new behavior: missing cloids are popped, _apply_fills_to_grid not called.
+    engine._apply_fills_to_grid.assert_not_called()
+    assert set(engine._local_grid.keys()) == {200, 300}, (
+        f"expected only live cloids in local_grid, got {set(engine._local_grid.keys())}"
+    )
+    # Also: no extra place_stop_market or cancel_stop_order from the missing branch.
+    # (Orphan branch may still cancel — but there are no orphans here.)
+    engine._exchange.place_stop_market.assert_not_called()
