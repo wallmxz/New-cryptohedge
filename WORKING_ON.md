@@ -1,12 +1,44 @@
 # WORKING_ON
 
-**Última atualização:** 2026-05-15 22:18 UTC — Bot LIVE com cloid 32-bit fix em master `435f02c`. Op #29 hedgeando. Grade preservada (não há mais cascata de orphan-cancels a cada 90s).
+**Última atualização:** 2026-05-16 02:18 UTC — Bot LIVE com phantom-cloid cleanup em master `9455177`. Op #29 hedgeando. Grade ESTÁVEL (13 stops, 5 sells + 8 buys, sem cascata).
 
 ## Foco atual
 
-**Master `435f02c` deployed em produção (DO Frankfurt).** Sessão 2026-05-15 noite entregou hot-fix do bug crítico que destruía a grade.
+**Master `9455177` deployed em produção (DO Frankfurt).** Sessão 2026-05-15/16 noite entregou 2 fixes críticos em sequência: cloid 32-bit truncation + phantom-cloid cleanup.
 
-### Noite — Cloid 32-bit truncation fix (ROOT CAUSE do grid imbalance)
+### Madrugada — Phantom cloid cleanup (segundo bug, pós cloid 32-bit fix)
+
+Spec: `docs/superpowers/specs/2026-05-15-phantom-cloid-cleanup-design.md`. Plan: `docs/superpowers/plans/2026-05-15-phantom-cloid-cleanup.md`.
+
+**Root cause:** Após o fix de cloid 32-bit, a grade ainda vazava de forma diferente — buys subiam em cascata a cada 90s, sells ficavam fixos. Causa: `_post_initial_grid` adicionava cloid ao `_local_grid` sempre que SDK não levantava exception, mas Lighter silently-rejeitava stops com trigger muito perto do mercado (gate "trigger past market"). Esses **phantoms** em `_local_grid` viravam "missing" no `_safety_reconcile` (cada 90s), que chamava `_apply_fills_to_grid` processando-os como fake-fills → cancel+post de reposições → mais phantoms → cascata sem fim.
+
+**Fix (3 commits em master, branch `claude/clever-liskov-0bbd80`):**
+- `a9f27c7` test(engine): remove test validating phantom-as-fill behavior
+- `41e7cc2` fix(engine): `_safety_reconcile::missing` pop-only (sem `_apply_fills_to_grid`)
+- `9455177` feat(engine): `_post_initial_grid` verify-after-batch drops phantoms
+
+**Design:**
+- D1: Lighter é source-of-truth; `_local_grid` é cache
+- D2: position-delta é o fill signal autoritativo (não local-vs-live diff)
+- D3: `_safety_reconcile::missing` → só POP do `_local_grid`, sem fake-fill processing
+- D4: `_post_initial_grid` → após post, aguarda 500ms, query `get_open_orders`, drop phantoms
+
+**Estado live pós-deploy (verificado 2026-05-16 02:18 UTC):**
+
+| | |
+|---|---|
+| Service | `active` |
+| Op #29 | active, baseline pool $199.75 |
+| Lighter live | **13 stops** (5 sells 0.12392-0.12442 / 8 buys 0.12482-0.1257), cloids 32-bit sequenciais `0xA0000004..0xA0000010` |
+| Posição | ~575 ARB short (re-aberto via drift_correction taker no boot anterior) |
+| `bot_grid_levels_active` | 14 ✅ (16 posted - 2 phantoms detectados pelo verify) |
+| `bot_grid_writes_total{reason="safety"}` | **0** após 3 min uptime (pré-fix #2: ~5/min) ✅ |
+| `bot_grid_writes_total{reason="fill"}` | **0** (pré-fix #2: ~25/5min sem fills reais) ✅ |
+| Log único de phantom drop | `_post_initial_grid dropped 2 phantom cloid(s) (Lighter silent-rejected): [2684354561, 2684354562]` ✅ |
+
+Pipeline: brainstorm (D1+D2+Approach C) → spec → plan → 2 blocks via subagent-driven (Block A: pop-only + obsolete test removal; Block B: post-verify) + final cross-cutting review. Tests: 80/80 no escopo crítico.
+
+### Noite — Cloid 32-bit truncation fix (primeiro bug)
 
 Spec: `docs/superpowers/specs/2026-05-15-cloid-32bit-truncation-fix-design.md`. Plan: `docs/superpowers/plans/2026-05-15-cloid-32bit-truncation-fix.md`.
 
@@ -78,16 +110,17 @@ Pipeline: brainstorm → spec → plan → 14 subagent-driven tasks (TDD + 2-sta
 
 ## Bugs remanescentes (post-fix)
 
-1. ⚠️ **`cancel_all_stops` no engine.start usa symbol stale** — `self._settings.dydx_symbol_token0` é "ETH-USD" (placeholder do .env). O `pair_factory.refresh_vault_readers` muda pra "ARB-USD" SÓ depois de o engine.start completar. Sintoma: log mostra `cleared pre-existing stops for ETH-USD` quando deveria ser ARB-USD. Não destrói nada (não há ordens em ETH-USD), mas anula a feature em runs onde haja resíduo em ARB. **Fix:** mover cancel_all_stops pra DEPOIS do primeiro refresh do pair_factory, OU query lifecycle.active_symbol antes. Follow-up de baixa prioridade.
-2. ⚠️ **`exchanges/lighter.py::cancel_all_stops` não é symbol-scoped** — cancela ALL account orders. Single-pair seguro hoje; cross-pair (Phase 3.x) vai precisar fix. Flag pra documentação.
-3. ⚠️ **`engine/lifecycle.py::_next_cloid`** é função SEPARADA (não a do engine) com algoritmo diferente. Out-of-scope do hot-fix mas confunde. Consolidar quando convier.
-4. ⚠️ **Cascading fill imbalance** — comportamento original observado pré-cloid-fix; agora resolved como sintoma do bug 64-bit. Reavaliar se ainda aparece em prod ao longo de horas.
-5. ⚠️ **Race condition `_post_initial_grid` lento (1 ord/seg) vs `_grid_event_loop` rápido (100ms)** — durante o startup, alguns "event-driven cancel skipped" / "skip fill step=0" logs aparecem. Resultado em prod: 14/16 ordens vivas (2 "orphans" criadas via apply_fills com post falhando silenciosamente). Self-correcting via safety_reconcile mas log noisy.
+1. ⚠️ **DB `UNIQUE constraint failed: grid_orders.cloid` spam no startup** — agora que cloids são 32-bit, o engine reusa cloids `0xA0000001..0xA0000010` em cada novo run. O DB `grid_orders.cloid TEXT UNIQUE` rejeita os inserts (warning silent, não bloqueia engine). Cada `_post_initial_grid` posta 16x → 16x `UNIQUE constraint failed`. **Fix:** ou drop o UNIQUE constraint (cloid não é mais único cross-run), ou prefixar com run timestamp pra log-only, ou migrar pra TEXT-not-unique. Follow-up baixa prioridade.
+2. ⚠️ **`cancel_all_stops` no engine.start usa symbol stale** — `self._settings.dydx_symbol_token0` é "ETH-USD" (placeholder do .env). O `pair_factory.refresh_vault_readers` muda pra "ARB-USD" SÓ depois de o engine.start completar. Sintoma: log mostra `cleared pre-existing stops for ETH-USD` quando deveria ser ARB-USD. Não destrói nada (não há ordens em ETH-USD), mas anula a feature em runs onde haja resíduo em ARB. **Fix:** mover cancel_all_stops pra DEPOIS do primeiro refresh do pair_factory, OU query lifecycle.active_symbol antes. Follow-up de baixa prioridade.
+3. ⚠️ **`exchanges/lighter.py::cancel_all_stops` não é symbol-scoped** — cancela ALL account orders. Single-pair seguro hoje; cross-pair (Phase 3.x) vai precisar fix. Flag pra documentação.
+4. ⚠️ **`engine/lifecycle.py::_next_cloid`** é função SEPARADA (não a do engine) com algoritmo diferente. Out-of-scope do hot-fix mas confunde. Consolidar quando convier.
+5. ⚠️ **`_apply_fills_to_grid` não tem post-verify** — análogo ao bug do `_post_initial_grid` mas pra reposições após fills. Pode criar phantoms se Lighter silent-rejeita um repost. **Mitigação atual:** próximo `_safety_reconcile` (90s) faz pop-only (D3) — phantoms são limpos silenciosamente. Aceitar; follow-up se observed.
 6. ⚠️ **Hedge model status: warming_up / verify_diverging:100%** (predict mistura RAW V3 com HUMAN p_now)
 7. ⚠️ **LP fees attribution = 0** (Beefy Harvest listener — user disse "não precisa")
 8. ⚠️ **engine.pair_factory rebuild lifecycle a cada HTTP request** (log spam + possível aiohttp leak)
 9. ⚠️ **Loop latency 2-3k ms total** (`Saúde do loop` no UI). Suspeita: `_grid_event_loop` em I/O concorrente roubando event loop dos outros tasks. Investigar.
 10. ⚠️ **`bot_grid_orders_open` gauge não wired** ao `_local_grid` count (sempre 0). Não bloqueia.
+11. ⚠️ **`_estimate_grid_step` docstring stale** — diz "Used by `_safety_reconcile`" mas agora só é chamado pelo `_grid_event_iter`. Cosmético.
 
 ## PRs / commits da sessão 2026-05-13/14 (todos em master)
 
