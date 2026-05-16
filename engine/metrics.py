@@ -125,6 +125,28 @@ mark_vs_pool_drift_bps = Gauge(
 )
 
 
+# Event-driven grid (spec 2026-05-15) ----------------------------------
+
+position_polls_total = Counter(
+    "bot_position_polls_total",
+    "Total get_position reads issued by _grid_event_loop (100ms cadence).",
+)
+
+grid_writes_total = Counter(
+    "bot_grid_writes_total",
+    "Total grid mutation writes (place + cancel), labeled by reason.",
+    ["reason"],  # fill | safety | drift | initial
+)
+
+fill_detection_latency = Histogram(
+    "bot_grid_fill_detection_latency_seconds",
+    "Time from position-change detection to grid mutation completion. "
+    "Defined but not wired yet — populate via observe() in _grid_event_iter "
+    "when full latency tracking lands.",
+    buckets=[0.05, 0.1, 0.2, 0.5, 1.0, 2.0],
+)
+
+
 # Helpers ---------------------------------------------------------------
 
 def render_metrics() -> bytes:

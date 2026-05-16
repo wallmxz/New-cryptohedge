@@ -104,11 +104,11 @@
         <!-- Grid Predictive v2 (só renderiza se houver atividade) -->
         {% include "partials/grid_health.html" %}
 
-        <!-- LP Curve + grid de ordens -->
-        {% include "partials/lp_curve.html" %}
-
-        <!-- Chart -->
-        {% include "partials/chart.html" %}
+        <!-- LP Curve + chart removidos 2026-05-15: rendering pesado + /curve
+             endpoint dispara 2 Ankr RPC calls por refresh, contribuindo pra
+             quota burn. Engine não depende do /curve pra operar. -->
+        {# {% include "partials/lp_curve.html" %} #}
+        {# {% include "partials/chart.html" %} #}
     </div>
 
     <!-- Tab: Operacoes -->

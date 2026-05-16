@@ -54,9 +54,9 @@ class GridMakerEngine:
         self._decimals0 = decimals0
         self._decimals1 = decimals1
         self._task: asyncio.Task | None = None
+        self._grid_task: asyncio.Task | None = None
         self._running = False
         self._cloid_seq = 0
-        self._run_id = int(time.time())  # unique per process run
         self._reconciler: Reconciler | None = None
         self._iter_count = 0
         self.RECONCILE_EVERY_N_ITERATIONS = 30  # ~30s
@@ -95,6 +95,14 @@ class GridMakerEngine:
         # or is still running, which is fine — refresh_cache is
         # idempotent and short-lived).
         self._refresh_task: asyncio.Task | None = None
+        # Event-driven grid state (spec 2026-05-15-event-driven-grid-design).
+        # _last_known_position: Position | None — last seen, compared against
+        #   pos_now in _grid_event_loop to detect fills.
+        # _local_grid: dict[cloid, GridStop] — snapshot of stops we posted.
+        # _last_safety_reconcile_at: timestamp of last full audit (90s cadence).
+        self._last_known_position: "Position | None" = None
+        self._local_grid: dict[int, "GridStop"] = {}
+        self._last_safety_reconcile_at: float = 0.0
 
     def _ensure_reconciler(self):
         if self._reconciler is None and self._exchange is not None:
@@ -741,6 +749,28 @@ class GridMakerEngine:
             self._hub.operation_state = active_op["status"]
             logger.info(f"Restored active operation {active_op['id']} (status={active_op['status']})")
 
+            # Cancel any leftover stop orders from a previous run on the
+            # active symbol. After 2026-05-15's cloid 32-bit fix, the new
+            # run's cloid namespace starts at seq=0 and could collide with
+            # leftovers from a previous run that wasn't cleanly torn down.
+            # No-op when Lighter has nothing live for this symbol.
+            # Best-effort: a network failure here logs warning + proceeds;
+            # _safety_reconcile (90s cadence) adopts whatever survives.
+            if self._hub.connected_exchange:
+                try:
+                    await self._exchange.cancel_all_stops(
+                        symbol=self._settings.dydx_symbol_token0,
+                    )
+                    logger.info(
+                        f"engine.start cancel_all_stops cleared pre-existing "
+                        f"stops for {self._settings.dydx_symbol_token0}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"engine.start cancel_all_stops failed (proceeding; "
+                        f"_safety_reconcile bootstrap will recover): {e}"
+                    )
+
         # subscribe_fills is also best-effort. Same rationale as connect():
         # if the exchange edge is unreachable, we shouldn't kill startup —
         # the user can still recover funds and inspect state.
@@ -757,12 +787,20 @@ class GridMakerEngine:
 
         self._running = True
         self._task = asyncio.create_task(self._main_loop())
+        self._grid_task = asyncio.create_task(self._grid_event_loop())
         logger.info("GridMakerEngine started")
 
     async def stop(self):
         self._running = False
-        if self._task:
-            self._task.cancel()
+        for t in (self._task, self._grid_task):
+            if t is not None and not t.done():
+                t.cancel()
+                try:
+                    await t
+                except asyncio.CancelledError:
+                    pass
+        self._task = None
+        self._grid_task = None
         if self._exchange:
             await self._exchange.disconnect()
 
@@ -799,13 +837,19 @@ class GridMakerEngine:
             await asyncio.sleep(max(0.0, period - elapsed))
 
     def _next_cloid(self, level_idx: int) -> int:
-        """Generate unique cloid as int (dYdX requires int)."""
+        """Generate unique cloid as int.
+
+        Layout (32 bits): level_idx (8) | seq (24). Truncated to match what
+        the Lighter SDK actually stores (client_order_index is 32 bits on
+        the wire). 24-bit seq = 16M unique cloids per (level) per run —
+        effectively unlimited. The 256-cloid wraparound that motivated the
+        2026-05-15-morning fix is still resolved here: seq is 24 bits, not
+        8. Only the inert `run_id<<32` was dropped.
+        """
         self._cloid_seq += 1
-        # Combine run_id (low 16 bits) + level_idx (low 8 bits) + seq (low 8 bits)
         return (
-            ((self._run_id & 0xFFFF) << 16) |
-            ((level_idx & 0xFF) << 8) |
-            (self._cloid_seq & 0xFF)
+            ((level_idx & 0xFF) << 24) |
+            (self._cloid_seq & 0xFFFFFF)
         )
 
     async def _refresh_vault_readers(self) -> None:
@@ -1095,6 +1139,25 @@ class GridMakerEngine:
                                     f"get_trade_pnl_since failed: {e}"
                                 )
 
+                        # Pull current unrealized PnL so we can decompose
+                        # hedge_pnl_override into (realized, unrealized).
+                        # Spec 2026-05-14: user wants to see realized+
+                        # unrealized SEPARATELY (matches Lighter UI's
+                        # "Unrealized PnL" while keeping trade_pnl
+                        # cumulative for "closed" portion).
+                        hedge_unrealized_override = None
+                        try:
+                            symbol_t0 = self._settings.dydx_symbol_token0
+                            pos = await self._safe_get_position(symbol_t0)
+                            if pos is not None:
+                                hedge_unrealized_override = float(
+                                    getattr(pos, "unrealized_pnl", 0.0) or 0.0
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                f"get unrealized_pnl for breakdown failed: {e}"
+                                )
+
                         # Funding window override: when the user picked
                         # a start in the UI, sum funding from Lighter
                         # since that ts instead of the DB cumulative
@@ -1133,6 +1196,7 @@ class GridMakerEngine:
                                 hedge_realized_per_symbol=dict(self._hub.hedge_realized_pnls),
                                 hedge_unrealized_per_symbol=dict(self._hub.hedge_unrealized_pnls),
                                 hedge_pnl_aggregate_override=hedge_pnl_override,
+                                hedge_unrealized_override=hedge_unrealized_override,
                                 funding_override=funding_override,
                             )
                         else:
@@ -1143,6 +1207,7 @@ class GridMakerEngine:
                                 hedge_realized_since_baseline=self._hub.hedge_realized_pnl,
                                 hedge_unrealized_since_baseline=self._hub.hedge_unrealized_pnl,
                                 hedge_pnl_aggregate_override=hedge_pnl_override,
+                                hedge_unrealized_override=hedge_unrealized_override,
                                 funding_override=funding_override,
                             )
                 except Exception as e:
@@ -1309,46 +1374,33 @@ class GridMakerEngine:
     async def _maintain_grid(
         self, *, beefy_pos, p_now: float, oracle_prices: dict[str, float],
     ) -> None:
-        """Mantém grade de stop-limit orders alinhada aos ticks ativos da Beefy.
+        """Mantém estrutura da grade — out-of-range guard + range change detection
+        + initial placement. Mutações fill-driven são responsabilidade do
+        _grid_event_loop (100ms cadence).
 
-        Implementa o lifecycle event-driven descrito no spec
-        (docs/superpowers/specs/2026-05-12-predictive-grid-v2-design.md, Sec 6):
-          - Detecta mudança de range (tick_lower/upper) e L_main do HedgeModel
-            cache → cancel-all + rebuild
-          - Detecta drift de composição → rebuild
-          - Detecta preço fora do range → cancel-all + idle
-          - Insere próximo nível quando ordem fillha (handler separado em
-            _on_grid_fill, Task B5)
-
-        No-op se feature flag PREDICTIVE_GRID_V2 desligada (default).
-        Implementação completa em B4.
+        Spec: docs/superpowers/specs/2026-05-15-event-driven-grid-design.md
+        (replaces self-healing reconciler from 2026-05-13 — that path caused
+        19k UNIQUE failures + Lighter 429 saturation by re-posting on every tick).
         """
         if not self._settings.predictive_grid_v2:
             return
         if self._hedge_model is None or self._hedge_model._cache is None:
-            # Cache cold — sem L_main / ticks confiáveis. Skipa silenciosamente;
-            # próxima iter (com refresh feito) pega.
             return
 
-        from engine.curve import compute_grid_from_pool_ticks, tick_to_human_price
-        from math import log, floor
+        from engine.curve import tick_to_human_price
 
         cache = self._hedge_model._cache
-
-        # Out-of-range guard (user spec 2026-05-14): se o preço atual está
-        # fora do range Beefy, "para de mexer" — cancela grade ativa e fica
-        # idle. Próximo rebalance Beefy vai reposicionar e o engine reinicia
-        # a grade quando o preço voltar pro range novo.
         decimals0 = self._settings.token0_decimals
         decimals1 = self._settings.token1_decimals
-        p_a_human = tick_to_human_price(
+        p_a = tick_to_human_price(
             tick=cache.tick_lower_main, decimals0=decimals0, decimals1=decimals1,
         )
-        p_b_human = tick_to_human_price(
+        p_b = tick_to_human_price(
             tick=cache.tick_upper_main, decimals0=decimals0, decimals1=decimals1,
         )
-        if not (p_a_human <= p_now <= p_b_human):
-            # Fora do range. Cancela grade ativa se existir e sai.
+
+        # Out-of-range guard: cancel + idle. Event loop will rebuild when back.
+        if not (p_a <= p_now <= p_b):
             if getattr(self, "_posted_grid_signature", None) is not None:
                 try:
                     await self._exchange.cancel_all_stops(
@@ -1357,208 +1409,556 @@ class GridMakerEngine:
                 except Exception as e:
                     logger.warning(f"out-of-range cancel_all_stops failed: {e}")
                 self._posted_grid_signature = None
+                self._local_grid.clear()  # event loop will repopulate when in range
                 metrics.grid_levels_active.set(0)
             return
 
-        # Signature atual da geometria (L + ticks bounds). Usar ticks
-        # (ints) em vez de p_a/p_b (raw V3 floats) pra comparação exata e
-        # pra `_on_grid_fill` poder extrair ticks direto da signature.
         current_sig = (cache.L_main, cache.tick_lower_main, cache.tick_upper_main)
         posted_sig = getattr(self, "_posted_grid_signature", None)
 
-        if posted_sig == current_sig:
-            # Nada mudou — grade posted ainda é válida
-            return
-
-        # Algo mudou (primeira posta OU range/L mudou). Cancel-all + rebuild.
-        rebuild_reason = "range_change" if posted_sig is not None else "initial"
-        if posted_sig is not None:
-            # Range/L mudou — Beefy reposicionou
+        # Range change → cancel all + clear local_grid; safety_reconcile populates fresh.
+        if posted_sig is not None and posted_sig != current_sig:
             metrics.beefy_range_change_total.inc()
-        try:
-            await self._exchange.cancel_all_stops(
-                symbol=self._settings.dydx_symbol_token0,
-            )
-        except Exception as e:
-            logger.warning(f"cancel_all_stops failed in rebuild: {e}")
-
-        # Limpar grid_orders ativos no DB (best-effort)
-        try:
-            active_orders = await self._db.get_active_grid_orders()
-            for row in active_orders:
-                await self._db.mark_grid_order_cancelled(
-                    row["cloid"], time.time(),
+            try:
+                await self._exchange.cancel_all_stops(
+                    symbol=self._settings.dydx_symbol_token0,
                 )
-                metrics.grid_stops_cancelled_total.inc()
-        except Exception as e:
-            logger.warning(f"db cleanup during rebuild failed: {e}")
+            except Exception as e:
+                logger.warning(f"range_change cancel_all_stops failed: {e}")
+            try:
+                active = await self._db.get_active_grid_orders()
+                for row in active:
+                    await self._db.mark_grid_order_cancelled(
+                        row["cloid"], time.time(),
+                    )
+            except Exception as e:
+                logger.warning(f"range_change db cleanup failed: {e}")
+            self._posted_grid_signature = None
+            self._local_grid.clear()
+            self._last_safety_reconcile_at = 0.0  # force immediate safety reconcile
 
-        # tick_lower / tick_upper come direto do cache (são ints raw V3).
-        # cache.p_a_main / p_b_main armazenam o RAW V3 ratio (= 1.0001^tick),
-        # que `predict()` precisa pra fórmula V3 — mas pra computar tick
-        # diretamente, usar `tick_lower_main` / `tick_upper_main` evita o
-        # bug do double-decimal-factor (cache RAW dividido por decimal_factor
-        # produzia ticks ~2x mais negativos que a realidade).
-        # Verificado live 2026-05-13 op #29 smoke v2 (tick_lower=-574215
-        # quando real era -297890).
+        # Initial placement: if no signature posted yet AND in range, post the
+        # initial 8+8 grid via _post_initial_grid (extracted from old _reconcile_grid).
+        if posted_sig is None:
+            await self._post_initial_grid(beefy_pos=beefy_pos, p_now=p_now, cache=cache)
+            self._posted_grid_signature = current_sig
+
+    async def _post_initial_grid(
+        self, *, beefy_pos, p_now: float, cache,
+    ) -> None:
+        """Initial grid placement: 8 sells + 8 buys aligned to V3 ticks around p_now.
+        Populates _local_grid and _last_known_position so the event loop has a
+        baseline to detect fills against.
+
+        Extracted from old _reconcile_grid posting branch (2026-05-13). Differs
+        only in: (a) populates _local_grid as it posts, (b) sets _last_known_position
+        after, (c) only runs once per signature (caller checks posted_sig is None).
+        """
+        from math import log, floor
+        from engine.curve import compute_grid_from_pool_ticks
+        from engine.grid_state import GridStop
+
         decimals0 = self._settings.token0_decimals
         decimals1 = self._settings.token1_decimals
         decimal_factor = 10 ** (decimals0 - decimals1)
-        tick_lower = cache.tick_lower_main
-        tick_upper = cache.tick_upper_main
-        # p_now é HUMAN price (do read_price). Converter pra tick precisa
-        # do decimal_factor. math.floor (não int()) pra ticks negativos:
-        # int(-296199.7) = -296199 mas o boundary correto é -296200.
         tick_now = floor(log(p_now / decimal_factor) / log(1.0001))
-
-        # tick_spacing depende do fee tier do pool
         fee_tier = self._settings.uniswap_v3_pool_fee
-        tick_spacing_map = {500: 10, 3000: 60, 10000: 200}
-        tick_spacing = tick_spacing_map.get(fee_tier, 10)
-
-        # Build new grid
+        tick_spacing = {500: 10, 3000: 60, 10000: 200}.get(fee_tier, 10)
         hedge_ratio = (
             getattr(self._hub, "hedge_ratio", None)
             or self._settings.hedge_ratio
         )
-        # Convert RAW V3 strategy-total L to OUR position's effective L in
-        # human units.
-        #
-        # cache.L_main is the strategy's full V3 liquidity in raw units
-        # (e.g. 2.74e17 for ARB/USDC.e). For `compute_x(L, p, p_b)` to
-        # return ARB amounts in HUMAN units when called with HUMAN prices,
-        # L must be scaled by 1/10^((d0+d1)/2) (the V3 raw-vs-human L
-        # conversion factor). Then multiply by our share to get OUR
-        # position's L rather than the whole vault.
-        #
-        # Without this scaling, the grid passed L=2.74e17 directly and
-        # produced per-level sizes ~10^15 — far above the Lighter SDK's
-        # 2^48 BaseAmount limit — every place_stop_limit_order failed.
-        # Validated live 2026-05-13 op #29 smoke v2.
         l_decimal_factor = 10 ** ((decimals0 + decimals1) / 2)
         share = float(getattr(beefy_pos, "share", 1.0) or 1.0)
         L_for_grid = float(cache.L_main) / l_decimal_factor * share
-        new_grid = compute_grid_from_pool_ticks(
+
+        full_grid = compute_grid_from_pool_ticks(
             L=L_for_grid,
-            tick_lower=tick_lower,
-            tick_upper=tick_upper,
+            tick_lower=cache.tick_lower_main,
+            tick_upper=cache.tick_upper_main,
             tick_spacing=tick_spacing,
             tick_now=tick_now,
             decimals0=decimals0,
             decimals1=decimals1,
             hedge_ratio=hedge_ratio,
-            lighter_price_decimals=5,  # ARB-USD on Lighter
+            lighter_price_decimals=5,
             lighter_size_decimals=1,
         )
 
-        # Lighter rejeita ordens além do `maximum pending order count per market`
-        # (validado 2026-05-13: limit = 16 stops por market em ARB-USD,
-        # code=21720). Distribuir simétrico em torno do tick_now:
-        # `max_open_orders // 2` sells (mais próximos abaixo) + idem buys
-        # (mais próximos acima). Garante banda balanceada que pode trailar.
-        # User spec 2026-05-14: 8+8 centrado em tick_now.
         max_orders = int(getattr(self._settings, "max_open_orders", 16) or 16)
         per_side = max_orders // 2
         sells = sorted(
-            [lv for lv in new_grid if lv.side == "sell"],
-            key=lambda lv: -lv.price,  # descending = closest-to-tick_now first
+            [lv for lv in full_grid if lv.side == "sell"],
+            key=lambda lv: -lv.price,
         )[:per_side]
         buys = sorted(
-            [lv for lv in new_grid if lv.side == "buy"],
-            key=lambda lv: lv.price,  # ascending = closest-to-tick_now first
+            [lv for lv in full_grid if lv.side == "buy"],
+            key=lambda lv: lv.price,
         )[:per_side]
-        new_grid = sells + buys
 
-        # Post each level via SL_MARKET (no $10 min — viable pra grade densa
-        # baixo capital). Anticipation buffer ajusta trigger pra capturar
-        # spread implícito do book Lighter:
-        #   SELL: fires um pouco acima do tick → executa próximo do tick
-        #   BUY:  fires um pouco abaixo do tick → executa próximo do tick
         symbol = self._settings.dydx_symbol_token0
         buffer = float(getattr(self._settings, "grid_anticipation_buffer", 0.0) or 0.0)
-        placed_count = 0
-        for lv in new_grid:
-            cloid = self._next_cloid_for_leg(symbol)
-            # Aplicar buffer pra antecipação simétrica
-            base_trigger = lv.trigger_price
+        safety_frac = 0.0001  # 0.01% (~1 V3 tick em 0.05% pool)
+        posted_count = 0
+
+        for lv in sells + buys:
             if lv.side == "sell":
-                trigger = base_trigger + buffer
-            else:  # "buy"
-                trigger = base_trigger - buffer
+                max_trigger = p_now * (1 - safety_frac)
+                if lv.price >= max_trigger:
+                    continue
+                trigger = min(lv.price + buffer, max_trigger)
+            else:
+                min_trigger = p_now * (1 + safety_frac)
+                if lv.price <= min_trigger:
+                    continue
+                trigger = max(lv.price - buffer, min_trigger)
+            cloid = self._next_cloid_for_leg(symbol)
             try:
                 await self._exchange.place_stop_market(
-                    symbol=symbol,
-                    side=lv.side,
-                    size=lv.size,
-                    trigger_price=trigger,
-                    cloid_int=cloid,
+                    symbol=symbol, side=lv.side, size=lv.size,
+                    trigger_price=trigger, cloid_int=cloid,
                 )
                 metrics.grid_stops_placed_total.inc()
-                placed_count += 1
+                metrics.grid_writes_total.labels(reason="initial").inc()
+                posted_count += 1
+                self._local_grid[cloid] = GridStop(
+                    cloid=cloid, side=lv.side,
+                    trigger_price=trigger, size=lv.size,
+                )
                 try:
                     await self._db.insert_grid_order(
-                        cloid=str(cloid),
-                        side=lv.side,
-                        target_price=lv.price,
-                        size=lv.size,
+                        cloid=str(cloid), side=lv.side,
+                        target_price=lv.price, size=lv.size,
                         placed_at=time.time(),
                         operation_id=self._hub.current_operation_id,
-                        trigger_price=trigger,
-                        is_stop_order=1,
+                        trigger_price=trigger, is_stop_order=1,
                     )
                 except Exception as e:
-                    logger.warning(f"db insert_grid_order failed: {e}")
+                    logger.warning(f"initial grid db insert failed: {e}")
+                logger.info(
+                    f"initial post {lv.side} @ ${lv.price:.5f} trigger ${trigger:.5f}"
+                )
             except Exception as e:
                 logger.warning(
-                    f"place_stop_market failed for level @{lv.price}: {e}",
+                    f"initial grid place_stop_market failed @ {lv.price}: {e}"
                 )
 
-        metrics.grid_levels_active.set(placed_count)
-        metrics.grid_rebuild_total.labels(reason=rebuild_reason).inc()
-
-        # Atualizar state hub pra dashboard
+        metrics.grid_levels_active.set(posted_count)
+        metrics.grid_rebuild_total.labels(reason="initial").inc()
         gh = self._hub.grid_health_metrics
-        gh["levels_active"] = placed_count
-        gh["stops_placed_total"] = gh.get("stops_placed_total", 0) + placed_count
-        gh["rebuilds_total"] = gh.get("rebuilds_total", 0) + 1
-        gh["last_rebuild_reason"] = rebuild_reason
+        gh["levels_active"] = posted_count
+        gh["last_rebuild_reason"] = "initial"
         gh["last_rebuild_ts"] = time.time()
-        if rebuild_reason == "range_change":
-            gh["range_changes_total"] = gh.get("range_changes_total", 0) + 1
+        gh["stops_placed_total"] = gh.get("stops_placed_total", 0) + posted_count
+        gh["rebuilds_total"] = gh.get("rebuilds_total", 0) + 1
 
-        self._posted_grid_signature = current_sig
+        # Post-verify (spec D4): some place_stop_market calls may have been
+        # silently rejected by Lighter (trigger past market, etc) despite the
+        # SDK returning err=None. Wait briefly for Lighter to settle, then
+        # reconcile _local_grid against live and drop cloids that didn't land.
+        # Without this, phantoms cause fake-fill cascades in _safety_reconcile
+        # / _grid_event_loop. Best-effort: a verify failure logs warning and
+        # proceeds (_safety_reconcile next cycle pops phantoms via D3).
+        await asyncio.sleep(0.5)
+        try:
+            live = await self._exchange.get_open_orders(symbol)
+            live_cloids = {int(o["cloid"]) for o in live}
+            phantoms = set(self._local_grid.keys()) - live_cloids
+            if phantoms:
+                for c in phantoms:
+                    self._local_grid.pop(c, None)
+                logger.warning(
+                    f"_post_initial_grid dropped {len(phantoms)} phantom "
+                    f"cloid(s) (Lighter silent-rejected): {sorted(phantoms)}"
+                )
+                # Adjust the levels_active metric to reflect reality.
+                metrics.grid_levels_active.set(len(self._local_grid))
+                gh["levels_active"] = len(self._local_grid)
+        except Exception as e:
+            logger.warning(
+                f"_post_initial_grid verify failed ({e!r}); proceeding. "
+                f"_safety_reconcile next cycle will clean up any phantoms."
+            )
+
+        # Set last_known_position to current so the event loop doesn't misinterpret
+        # the initial post as a fill event.
+        try:
+            self._last_known_position = await self._exchange.get_position(symbol)
+        except Exception:
+            pass
+
+    async def _apply_fills_to_grid(
+        self, *, filled_cloids: set[int], step: float,
+        live_by_cloid: dict[int, dict],
+    ) -> None:
+        """Process detected fills: for each filled cloid, cancel the opposite
+        side's farthest stop and post 2 replacements (1 near market at fill
+        trigger, 1 extending the same-side range).
+
+        Multi-fill handling: process fills in order of distance-from-market
+        (closest first), so each iteration sees a coherent local_grid.
+
+        `live_by_cloid` maps cloid -> live order dict (from `get_open_orders`),
+        used to look up the Lighter `order_index` required by the real
+        `cancel_stop_order(symbol, order_index)` adapter signature. cloids
+        missing from this map are assumed already-cancelled-or-filled by
+        external means and the cancel call is skipped (with warning), but
+        the entry is still popped from local_grid.
+
+        Spec: docs/superpowers/specs/2026-05-15-event-driven-grid-design.md
+        """
+        from engine.grid_state import GridStop, lowest_buy, top_sell, highest_sell, bottom_buy
+
+        symbol = self._settings.dydx_symbol_token0
+
+        async def _cancel_via_live(opp_cloid: int) -> None:
+            """Resolve order_index from live_by_cloid and cancel; skip+warn if missing."""
+            live_order = live_by_cloid.get(opp_cloid)
+            if live_order is None:
+                logger.warning(
+                    f"event-driven cancel skipped: cloid={opp_cloid} not in live "
+                    f"(already cancelled or filled?). Popping from local_grid."
+                )
+                return
+            order_index = live_order.get("order_index", 0)
+            if not order_index:
+                logger.warning(
+                    f"event-driven cancel skipped: cloid={opp_cloid} has no "
+                    f"order_index in live response. Popping from local_grid."
+                )
+                return
+            try:
+                await self._exchange.cancel_stop_order(
+                    symbol=symbol, order_index=order_index,
+                )
+                metrics.grid_writes_total.labels(reason="fill").inc()
+            except Exception as e:
+                logger.warning(
+                    f"event-driven cancel failed cloid={opp_cloid} "
+                    f"order_index={order_index}: {e}"
+                )
+
+        # Sort filled cloids by distance from extremes (closest to market first).
+        # For a sell fill, "closest to market" = lowest trigger price among sells.
+        # For a buy fill, "closest to market" = highest trigger price among buys.
+        # We can't know the market price here without re-reading, so use a
+        # heuristic: sells sorted ASC by trigger (lowest = was closest to market),
+        # buys sorted DESC by trigger (highest = was closest to market).
+        ordered = sorted(
+            filled_cloids,
+            key=lambda c: (
+                self._local_grid[c].trigger_price
+                if self._local_grid[c].side == "sell"
+                else -self._local_grid[c].trigger_price
+            ),
+        )
+
+        for cloid in ordered:
+            stop = self._local_grid.get(cloid)
+            if stop is None:
+                continue  # already processed (race)
+
+            # step <= 0 path (sparse grid edge case from _estimate_grid_step):
+            # extending by 0 collides with existing extreme. Skip and let the
+            # 90s safety net reconcile.
+            if step <= 0:
+                logger.warning(
+                    f"event-driven skip fill cloid={cloid} side={stop.side}: "
+                    f"step={step}, would collide with existing extreme. "
+                    f"Safety net (90s) will reconcile."
+                )
+                continue
+
+            if stop.side == "sell":
+                opp = lowest_buy(self._local_grid)
+                tip = top_sell(self._local_grid)
+                if opp is None or tip is None:
+                    continue  # malformed grid; safety net will recover
+                # Cancel lowest buy (always pop opp from local_grid afterwards:
+                # Lighter either cancelled it or it was already gone).
+                await _cancel_via_live(opp.cloid)
+                # Post replacement buy at filled sell's trigger price (closest to market)
+                new_buy_cloid = self._next_cloid_for_leg(symbol)
+                buy_posted = False
+                try:
+                    await self._exchange.place_stop_market(
+                        symbol=symbol, side="buy", size=stop.size,
+                        trigger_price=stop.trigger_price, cloid_int=new_buy_cloid,
+                    )
+                    buy_posted = True
+                    metrics.grid_writes_total.labels(reason="fill").inc()
+                except Exception as e:
+                    logger.warning(
+                        f"event-driven post buy failed cloid={new_buy_cloid} "
+                        f"trigger={stop.trigger_price}: {e}"
+                    )
+                # Post new sell extending the top
+                new_sell_price = tip.trigger_price + step
+                new_sell_cloid = self._next_cloid_for_leg(symbol)
+                sell_posted = False
+                try:
+                    await self._exchange.place_stop_market(
+                        symbol=symbol, side="sell", size=stop.size,
+                        trigger_price=new_sell_price, cloid_int=new_sell_cloid,
+                    )
+                    sell_posted = True
+                    metrics.grid_writes_total.labels(reason="fill").inc()
+                except Exception as e:
+                    logger.warning(
+                        f"event-driven post sell failed cloid={new_sell_cloid} "
+                        f"trigger={new_sell_price}: {e}"
+                    )
+                # Update local_grid: only insert cloids that actually landed on
+                # Lighter (phantom cloid prevention). Cancel always pops opp.
+                self._local_grid.pop(cloid, None)
+                self._local_grid.pop(opp.cloid, None)
+                if buy_posted:
+                    self._local_grid[new_buy_cloid] = GridStop(
+                        new_buy_cloid, "buy", stop.trigger_price, stop.size,
+                    )
+                if sell_posted:
+                    self._local_grid[new_sell_cloid] = GridStop(
+                        new_sell_cloid, "sell", new_sell_price, stop.size,
+                    )
+            else:  # buy filled
+                opp = highest_sell(self._local_grid)
+                tip = bottom_buy(self._local_grid)
+                if opp is None or tip is None:
+                    continue
+                await _cancel_via_live(opp.cloid)
+                new_sell_cloid = self._next_cloid_for_leg(symbol)
+                sell_posted = False
+                try:
+                    await self._exchange.place_stop_market(
+                        symbol=symbol, side="sell", size=stop.size,
+                        trigger_price=stop.trigger_price, cloid_int=new_sell_cloid,
+                    )
+                    sell_posted = True
+                    metrics.grid_writes_total.labels(reason="fill").inc()
+                except Exception as e:
+                    logger.warning(
+                        f"event-driven post sell failed cloid={new_sell_cloid} "
+                        f"trigger={stop.trigger_price}: {e}"
+                    )
+                new_buy_price = tip.trigger_price - step
+                new_buy_cloid = self._next_cloid_for_leg(symbol)
+                buy_posted = False
+                try:
+                    await self._exchange.place_stop_market(
+                        symbol=symbol, side="buy", size=stop.size,
+                        trigger_price=new_buy_price, cloid_int=new_buy_cloid,
+                    )
+                    buy_posted = True
+                    metrics.grid_writes_total.labels(reason="fill").inc()
+                except Exception as e:
+                    logger.warning(
+                        f"event-driven post buy failed cloid={new_buy_cloid} "
+                        f"trigger={new_buy_price}: {e}"
+                    )
+                self._local_grid.pop(cloid, None)
+                self._local_grid.pop(opp.cloid, None)
+                if sell_posted:
+                    self._local_grid[new_sell_cloid] = GridStop(
+                        new_sell_cloid, "sell", stop.trigger_price, stop.size,
+                    )
+                if buy_posted:
+                    self._local_grid[new_buy_cloid] = GridStop(
+                        new_buy_cloid, "buy", new_buy_price, stop.size,
+                    )
+
+    async def _safety_reconcile(self) -> None:
+        """Periodic full audit (90s cadence). Behavior depends on local_grid state.
+
+        Bootstrap path (local_grid empty after restart): query Lighter live
+        orders, populate local_grid from them. NO cancellations.
+
+        Steady-state path (local_grid populated): bidirectional diff.
+          - Orders on Lighter not in local_grid → orphan, cancel.
+          - Cloids in local_grid not on Lighter → assumed filled, re-trigger
+            fill detection via _apply_fills_to_grid (idempotent).
+        """
+        from engine.grid_state import GridStop
+
+        symbol = self._settings.dydx_symbol_token0
+        try:
+            live = await self._exchange.get_open_orders(symbol)
+        except Exception as e:
+            logger.warning(f"_safety_reconcile: get_open_orders failed: {e}")
+            return
+
+        live_by_cloid = {int(o["cloid"]): o for o in live}
+
+        if not self._local_grid:
+            # Bootstrap path
+            for cloid, o in live_by_cloid.items():
+                self._local_grid[cloid] = GridStop(
+                    cloid=cloid, side=o["side"],
+                    trigger_price=float(o["trigger_price"]),
+                    size=float(o.get("size", 0.0)),
+                )
+            logger.info(
+                f"_safety_reconcile bootstrap: populated local_grid with "
+                f"{len(self._local_grid)} stops"
+            )
+            return
+
+        # Steady-state path
+        local_cloids = set(self._local_grid.keys())
+        live_cloids = set(live_by_cloid.keys())
+
+        # Orphans on Lighter (not in local) → cancel
+        orphans = live_cloids - local_cloids
+        for cloid in orphans:
+            live_order = live_by_cloid.get(cloid, {})
+            order_index = live_order.get("order_index", 0)
+            if not order_index:
+                logger.warning(
+                    f"_safety_reconcile orphan cancel skipped: cloid={cloid} "
+                    f"has no order_index in live response"
+                )
+                continue
+            try:
+                await self._exchange.cancel_stop_order(
+                    symbol=symbol, order_index=order_index,
+                )
+                metrics.grid_writes_total.labels(reason="safety").inc()
+                logger.info(
+                    f"_safety_reconcile cancelled orphan cloid={cloid} "
+                    f"order_index={order_index}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"_safety_reconcile orphan cancel failed cloid={cloid} "
+                    f"order_index={order_index}: {e}"
+                )
+
+        # Missing on Lighter (in local but not live) → either phantoms from
+        # Lighter silent-rejections OR real fills already caught by
+        # _grid_event_loop via position-delta. Don't process as fills here;
+        # just drop from local_grid. Spec D3 in
+        # docs/superpowers/specs/2026-05-15-phantom-cloid-cleanup-design.md.
+        missing = local_cloids - live_cloids
+        for cloid in missing:
+            self._local_grid.pop(cloid, None)
+        if missing:
+            logger.info(
+                f"_safety_reconcile dropped {len(missing)} missing cloid(s) from "
+                f"local_grid (phantoms or already-processed fills)"
+            )
+
+    def _estimate_grid_step(self) -> float:
+        """Estimate grid step from existing _local_grid (diff between consecutive same-side prices).
+
+        Used by _safety_reconcile when applying fills detected outside the normal flow.
+        Falls back to 0.0 if grid too sparse (1 stop will be added at fill price; safety net
+        next iter will fix any imbalance).
+        """
+        sells = sorted(
+            (s.trigger_price for s in self._local_grid.values() if s.side == "sell"),
+        )
+        if len(sells) >= 2:
+            return sells[1] - sells[0]
+        buys = sorted(
+            (s.trigger_price for s in self._local_grid.values() if s.side == "buy"),
+            reverse=True,
+        )
+        if len(buys) >= 2:
+            return buys[0] - buys[1]
+        return 0.0
+
+    async def _grid_event_iter(self) -> None:
+        """One iteration of the event-driven grid loop. Public for testing.
+
+        - get_position (cheap read)
+        - if changed since last iter → query open_orders, identify filled cloids,
+          apply fills (3 writes per fill)
+        - every 90s, safety_reconcile audit
+        """
+        symbol = self._settings.dydx_symbol_token0
+
+        # Safety net (90s)
+        now = time.time()
+        if now - self._last_safety_reconcile_at > 90.0:
+            await self._safety_reconcile()
+            self._last_safety_reconcile_at = now
+
+        # Position read
+        try:
+            pos_now = await self._exchange.get_position(symbol)
+        except Exception as e:
+            logger.warning(f"_grid_event_iter: get_position failed: {e}")
+            return
+        metrics.position_polls_total.inc()
+
+        # Position-equality short-circuit
+        if self._position_equal(pos_now, self._last_known_position):
+            return
+
+        # Position changed — query open_orders, identify filled cloids
+        try:
+            live = await self._exchange.get_open_orders(symbol)
+        except Exception as e:
+            logger.warning(f"_grid_event_iter: get_open_orders failed: {e}")
+            return
+        live_by_cloid = {int(o["cloid"]): o for o in live}
+        live_cloids = set(live_by_cloid.keys())
+        filled = set(self._local_grid.keys()) - live_cloids
+
+        if filled:
+            step = self._estimate_grid_step()
+            await self._apply_fills_to_grid(
+                filled_cloids=filled, step=step, live_by_cloid=live_by_cloid,
+            )
+
+        self._last_known_position = pos_now
+
+    @staticmethod
+    def _position_equal(a, b) -> bool:
+        """Compare two Position-ish objects by side + size (entry_price/PnL change frequently)."""
+        if a is None and b is None:
+            return True
+        if a is None or b is None:
+            return False
+        return (
+            getattr(a, "side", None) == getattr(b, "side", None)
+            and abs(getattr(a, "size", 0.0) - getattr(b, "size", 0.0)) < 1e-9
+        )
+
+    async def _grid_event_loop(self) -> None:
+        """Long-running task: event-driven grid maintenance at 100ms cadence."""
+        period = 0.1  # 100ms
+        while self._running:
+            t0 = time.monotonic()
+            try:
+                await self._grid_event_iter()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.exception(f"_grid_event_loop iter error: {e}")
+            elapsed = time.monotonic() - t0
+            await asyncio.sleep(max(0.0, period - elapsed))
 
     async def _on_grid_fill(
         self, *, cloid: int, fill_price: float, fill_size: float, side: str,
     ) -> None:
-        """Trailing grid handler — user spec 2026-05-14.
+        """Fast-path tracking ONLY (metrics + db mark) — trailing logic vive
+        em `_grid_event_loop` (event-driven, 100ms cadence).
 
-        Quando uma ordem da grade fillha, a banda inteira "anda junto" com o
-        mercado pra manter sempre 8 ordens acima + 8 abaixo de tick_now:
+        Spec 2026-05-14: o callback `_fill_callback` na adapter SÓ é
+        disparado dentro de `place_long_term_order` (após inline confirm).
+        Stop-market orders que disparam ASSINCRONAMENTE (mark cruza trigger
+        depois) NÃO chegam aqui. Por isso a fonte autoritativa do estado
+        da grade é position-change detection no `_grid_event_loop` +
+        safety_reconcile via `get_open_orders`, não eventos de fill.
 
-        BUY fillou (mercado subiu):
-          1. Estende buy band: posta nova BUY 1 tick acima do highest_buy
-          2. Trail sell band: cancela lowest_sell + posta nova SELL 1 tick acima do highest_sell
-          (Total continua 16: 7 buys → 8, 8 sells → 7 → 8)
-
-        SELL fillou (mercado caiu): simétrico.
-          1. Estende sell band: posta nova SELL 1 tick abaixo do lowest_sell
-          2. Trail buy band: cancela highest_buy + posta nova BUY 1 tick abaixo do lowest_buy
-
-        Out-of-range: se o tick novo cairia fora do range Beefy, skip aquele
-        post (mantém grade incompleta até _maintain_grid full rebuild).
-
-        Best-effort com retry: cancel/post falha → loga + segue. Próxima fill
-        ou o reconciler eventualmente recupera.
+        Este handler fica como best-effort latency tracking quando o
+        callback acontece (ex: place_taker drift correction).
         """
         if not self._settings.predictive_grid_v2:
             return
-
         metrics.grid_stops_filled_total.inc()
         gh = self._hub.grid_health_metrics
         gh["stops_filled_total"] = gh.get("stops_filled_total", 0) + 1
-
-        # Latency tracking (best-effort — DB tem o placed_at)
         try:
             row = await self._db.get_grid_order(cloid)
             if row and row.get("placed_at"):
@@ -1566,128 +1966,7 @@ class GridMakerEngine:
                 metrics.grid_fill_latency_ms.observe(latency_ms)
             await self._db.mark_grid_order_filled(cloid, int(time.time()))
         except Exception as e:
-            logger.warning(f"_on_grid_fill DB ops failed: {e}")
-
-        # Setup math
-        from math import log, floor
-        from engine.curve import tick_to_human_price
-
-        decimals0 = self._settings.token0_decimals
-        decimals1 = self._settings.token1_decimals
-        decimal_factor = 10 ** (decimals0 - decimals1)
-        fee_tier = self._settings.uniswap_v3_pool_fee
-        tick_spacing_map = {500: 10, 3000: 60, 10000: 200}
-        tick_spacing = tick_spacing_map.get(fee_tier, 10)
-        buffer = float(getattr(self._settings, "grid_anticipation_buffer", 0.0) or 0.0)
-        price_decimals = 5  # ARB-USD Lighter (TODO: source from market meta)
-        size_decimals = 1
-        symbol = self._settings.dydx_symbol_token0
-        sig = getattr(self, "_posted_grid_signature", None)
-        if sig is None:
-            return  # grade não posted ainda; _maintain_grid vai fazer initial
-        _L, tick_lower_range, tick_upper_range = sig
-
-        # Query estado live na Lighter (autoritativo — DB pode estar dessincronizado)
-        try:
-            live_orders = await self._exchange.get_open_orders(symbol)
-        except Exception as e:
-            logger.warning(f"_on_grid_fill: get_open_orders failed: {e}")
-            return
-        live_sells = sorted(
-            [o for o in live_orders if o["side"] == "sell"],
-            key=lambda o: o["trigger_price"],
-        )  # ascending price; sells[0] = lowest, sells[-1] = highest
-        live_buys = sorted(
-            [o for o in live_orders if o["side"] == "buy"],
-            key=lambda o: o["trigger_price"],
-        )  # ascending price; buys[0] = lowest, buys[-1] = highest
-
-        def price_to_tick(p_human: float) -> int:
-            return floor(log(p_human / decimal_factor) / log(1.0001))
-
-        def tick_in_range(t: int) -> bool:
-            return tick_lower_range <= t <= tick_upper_range
-
-        async def post_new(*, new_side: str, new_tick: int, size: float):
-            """Posta um stop_market novo no `new_tick`. No-op se fora do range."""
-            if not tick_in_range(new_tick):
-                return
-            new_price = round(
-                tick_to_human_price(
-                    tick=new_tick, decimals0=decimals0, decimals1=decimals1,
-                ), price_decimals,
-            )
-            new_trigger = new_price + buffer if new_side == "sell" else new_price - buffer
-            new_cloid_int = self._next_cloid_for_leg(symbol)
-            try:
-                await self._exchange.place_stop_market(
-                    symbol=symbol, side=new_side, size=size,
-                    trigger_price=new_trigger, cloid_int=new_cloid_int,
-                )
-                metrics.grid_stops_placed_total.inc()
-                try:
-                    await self._db.insert_grid_order(
-                        cloid=str(new_cloid_int), side=new_side,
-                        target_price=new_price, size=size, placed_at=time.time(),
-                        trigger_price=new_trigger, is_stop_order=1,
-                        operation_id=self._hub.current_operation_id,
-                    )
-                except Exception as e:
-                    logger.warning(f"trailing db insert failed: {e}")
-            except Exception as e:
-                logger.warning(f"trailing place_stop_market failed @{new_trigger}: {e}")
-
-        async def cancel_one(order_index: int, order_cloid: str):
-            try:
-                await self._exchange.cancel_stop_order(
-                    symbol=symbol, order_index=order_index,
-                )
-                metrics.grid_stops_cancelled_total.inc()
-                try:
-                    await self._db.mark_grid_order_cancelled(order_cloid, time.time())
-                except Exception as e:
-                    logger.warning(f"trailing db cancel mark failed: {e}")
-            except Exception as e:
-                logger.warning(f"trailing cancel_stop_order failed: {e}")
-
-        # Trail
-        default_size = float(fill_size) if fill_size else 1.0
-        if side == "buy":
-            # 1) Extend buy band UP: post new buy at highest_buy + tick_spacing
-            if live_buys:
-                highest_buy_tick = price_to_tick(live_buys[-1]["trigger_price"])
-                await post_new(
-                    new_side="buy", new_tick=highest_buy_tick + tick_spacing,
-                    size=default_size,
-                )
-            # 2) Shift sell band UP: cancel lowest sell + post new sell at highest_sell + tick_spacing
-            if live_sells:
-                lowest_sell = live_sells[0]
-                highest_sell_tick = price_to_tick(live_sells[-1]["trigger_price"])
-                await cancel_one(lowest_sell["order_index"], lowest_sell["cloid"])
-                await post_new(
-                    new_side="sell", new_tick=highest_sell_tick + tick_spacing,
-                    size=default_size,
-                )
-        else:  # sell
-            # 1) Extend sell band DOWN: post new sell at lowest_sell - tick_spacing
-            if live_sells:
-                lowest_sell_tick = price_to_tick(live_sells[0]["trigger_price"])
-                await post_new(
-                    new_side="sell", new_tick=lowest_sell_tick - tick_spacing,
-                    size=default_size,
-                )
-            # 2) Shift buy band DOWN: cancel highest buy + post new buy at lowest_buy - tick_spacing
-            if live_buys:
-                highest_buy = live_buys[-1]
-                lowest_buy_tick = price_to_tick(live_buys[0]["trigger_price"])
-                await cancel_one(highest_buy["order_index"], highest_buy["cloid"])
-                await post_new(
-                    new_side="buy", new_tick=lowest_buy_tick - tick_spacing,
-                    size=default_size,
-                )
-
-        metrics.grid_rebuild_total.labels(reason="fill").inc()
+            logger.warning(f"_on_grid_fill tracking failed (cosmetic): {e}")
 
     async def _maybe_correct_drift(
         self, *, beefy_pos, p_now: float,
@@ -1752,6 +2031,7 @@ class GridMakerEngine:
                     ttl_seconds=60,
                 )
                 metrics.aggressive_corrections_total.inc()
+                metrics.grid_writes_total.labels(reason="drift").inc()
                 try:
                     await self._db.insert_order_log(
                         timestamp=time.time(), exchange=self._exchange.name,
@@ -1765,6 +2045,15 @@ class GridMakerEngine:
                     f"drift_correction: {sym} {corr_side} {corr_size:.3f} "
                     f"(drift=${drift_usd:.2f} target={target:.3f} actual={current:.3f})"
                 )
+                # Update _last_known_position so _grid_event_loop doesn't misinterpret
+                # this drift-correction-driven position change as a stop fill.
+                # Only relevant for the primary (token0) leg — that's the leg the
+                # event-driven grid tracks.
+                if sym == self._settings.dydx_symbol_token0:
+                    try:
+                        self._last_known_position = await self._exchange.get_position(sym)
+                    except Exception:
+                        pass  # next _grid_event_iter will re-read; non-fatal
             except Exception as e:
                 logger.warning(f"drift_correction taker failed: {e}")
 
@@ -1823,13 +2112,19 @@ class GridMakerEngine:
 
     def _next_cloid_for_leg(self, symbol: str) -> int:
         """Generate a cloid scoped per leg so concurrent fires from different
-        legs never collide. Encodes a byte for the leg identity."""
+        legs never collide.
+
+        Layout (32 bits): leg_byte (8) | seq (24). The Lighter SDK truncates
+        client_order_index to 32 bits on the wire; storing more than that in
+        `_local_grid` makes the reconciler unable to match the values
+        returned by `get_open_orders`. See spec
+        `docs/superpowers/specs/2026-05-15-cloid-32bit-truncation-fix-design.md`.
+        """
         self._cloid_seq += 1
         leg_byte = 0xA0 if symbol == self._settings.dydx_symbol_token0 else 0xA1
         return (
-            ((self._run_id & 0xFFFF) << 16) |
-            (leg_byte << 8) |
-            (self._cloid_seq & 0xFF)
+            (leg_byte << 24) |
+            (self._cloid_seq & 0xFFFFFF)
         )
 
     async def _on_funding_payment(self, entry) -> None:

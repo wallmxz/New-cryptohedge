@@ -151,3 +151,39 @@ def test_compute_grid_sizes_conserve_delta_x():
     actual_total_x = sum(lv.size for lv in grid)
     # Tolerância por rounding step da Lighter:
     assert abs(actual_total_x - expected_total_x) / expected_total_x < 0.05
+
+
+def test_compute_grid_uniform_level_sizes_when_tick_now_misaligned():
+    """Regression 2026-05-14: usuário viu 1 ordem com 0.9 ARB e as outras
+    com 3.0 — o "nível parcial" da fórmula anterior usava x_at_tick_now
+    como referência, fazendo o primeiro level cobrir menos que 1 spacing
+    (delta proporcional ao gap entre tick_now e o primeiro aligned tick).
+
+    Fix: snap o reference de prev_x ao tick aligned vizinho. Todos os
+    levels cobrem exatamente 1 tick_spacing de V3 amount delta → sizes
+    uniformes. Drift correction compensa qualquer over/under-shoot
+    transitório no primeiro fill."""
+    L = 1e15
+    # Pick a tick_now MISALIGNED (entre tick boundaries) pra exercitar o caso problemático
+    # Spacing 100. tick_now = -296157 (não múltiplo de 100).
+    grid = compute_grid_from_pool_ticks(
+        L=L,
+        tick_lower=-297000,
+        tick_upper=-295000,
+        tick_spacing=100,
+        tick_now=-296157,  # misaligned: 43 ticks acima de -296200 (sell side)
+        decimals0=18,
+        decimals1=6,
+        hedge_ratio=1.0,
+        lighter_price_decimals=5,
+        lighter_size_decimals=1,
+    )
+    assert len(grid) > 0
+    sizes = [lv.size for lv in grid if lv.size > 0]
+    # Sizes devem ser todos próximos do mesmo valor (não 30% / 70% / etc.)
+    # Permite variação até 20% por rounding (steps de 0.1 ARB pra ARB)
+    smin, smax = min(sizes), max(sizes)
+    ratio = smax / smin if smin > 0 else float("inf")
+    assert ratio < 1.2, (
+        f"size variation too high: min={smin}, max={smax}, ratio={ratio:.2f}"
+    )

@@ -184,20 +184,31 @@ def compute_grid_from_pool_ticks(
     price_upper = tick_to_human_price(
         tick=tick_upper, decimals0=decimals0, decimals1=decimals1,
     )
-    price_at_tick_now = tick_to_human_price(
-        tick=tick_now, decimals0=decimals0, decimals1=decimals1,
-    )
-    x_at_tick_now = compute_x(L, price_at_tick_now, price_upper)
 
     levels: list[GridLevel] = []
 
-    # Loop DOWN: ticks alinhados < tick_now, side="sell"
-    # Primeiro aligned tick estritamente menor que tick_now
+    # Anchor the grid to the nearest aligned tick — both loops use a
+    # neighbor-tick reference so every level covers EXACTLY one
+    # tick_spacing of V3 amount delta. Previously the first level used
+    # `x_at_tick_now` as the reference, producing a partial size (e.g.,
+    # 0.9 ARB instead of 3.0 when tick_now sat 3 ticks below the first
+    # aligned tick). Drift correction handles the slight over/under on
+    # the first fill; visually uniform levels matter more.
+    # User reported live 2026-05-14: "pq tem uma ordem com 0.9 arb?"
     down_start = (tick_now // tick_spacing) * tick_spacing
     if down_start >= tick_now:
         down_start -= tick_spacing
+    up_start = ((tick_now // tick_spacing) + 1) * tick_spacing
+
+    # Loop DOWN: ticks alinhados ≤ down_start, side="sell".
+    # prev_x starts at the tick ONE SPACING ABOVE the first sell so that
+    # delta on the first iter spans a full tick_spacing.
+    anchor_above_down = down_start + tick_spacing
+    anchor_above_down_price = tick_to_human_price(
+        tick=anchor_above_down, decimals0=decimals0, decimals1=decimals1,
+    )
+    prev_x = compute_x(L, anchor_above_down_price, price_upper)
     t = down_start
-    prev_x = x_at_tick_now
     while t >= tick_lower:
         price_human = tick_to_human_price(
             tick=t, decimals0=decimals0, decimals1=decimals1,
@@ -210,15 +221,19 @@ def compute_grid_from_pool_ticks(
             levels.append(GridLevel(
                 price=price_rounded, size=size, side="sell",
                 target_short=x_at_t * hedge_ratio,
-                trigger_price=price_rounded,  # stop-limit: trigger = price exato
+                trigger_price=price_rounded,
             ))
         prev_x = x_at_t
         t -= tick_spacing
 
-    # Loop UP: ticks alinhados > tick_now, side="buy"
-    up_start = ((tick_now // tick_spacing) + 1) * tick_spacing
+    # Loop UP: ticks alinhados ≥ up_start, side="buy".
+    # prev_x starts at the tick ONE SPACING BELOW the first buy.
+    anchor_below_up = up_start - tick_spacing
+    anchor_below_up_price = tick_to_human_price(
+        tick=anchor_below_up, decimals0=decimals0, decimals1=decimals1,
+    )
+    prev_x = compute_x(L, anchor_below_up_price, price_upper)
     t = up_start
-    prev_x = x_at_tick_now
     while t <= tick_upper:
         price_human = tick_to_human_price(
             tick=t, decimals0=decimals0, decimals1=decimals1,
@@ -231,7 +246,7 @@ def compute_grid_from_pool_ticks(
             levels.append(GridLevel(
                 price=price_rounded, size=size, side="buy",
                 target_short=x_at_t * hedge_ratio,
-                trigger_price=price_rounded,  # stop-limit: trigger = price exato
+                trigger_price=price_rounded,
             ))
         prev_x = x_at_t
         t += tick_spacing
